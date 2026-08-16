@@ -1,2 +1,2 @@
 # Panorama
-Display + Render driver for mali gpus using the valhall architecture, targeting the mali g610 and mali g615
+currently a workspace for two vibe coders to put their code in, soon to be finished(hopefully)
