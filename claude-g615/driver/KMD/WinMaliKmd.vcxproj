@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <!-- x64 exists ONLY as a dev-box compile-test. The RK3588 is aarch64;
+         we never load a x64 .sys on hardware. Keeping x64 lets CI boxes
+         without the ARM64 WDK libs still smoke-test the source. -->
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B1B2C3D4-0001-4E5F-9A0B-001122334455}</ProjectGuid>
+    <TemplateGuid>{497e31cb-056b-4f31-abb8-447fd55ee5a5}</TemplateGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <Configuration>Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">ARM64</Platform>
+    <RootNamespace>WinMaliKmd</RootNamespace>
+    <ProjectName>WinMaliKmd</ProjectName>
+    <!-- See sibling UMD/Mesa projects: kill the Spectre default here in
+         Globals before the WDK platform.props can latch it. -->
+    <SpectreMitigation>false</SpectreMitigation>
+    <!-- Pinned to the 26100 WDK (matches the VS 2022 v143 toolchain +
+         Windows 11 SDK on this box). WindowsKernelModeDriver10.0 picks up
+         displib.lib via $(DDK_LIB_PATH) which resolves against this
+         version (km\arm64\displib.lib + km\x64\displib.lib both ship). -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <!-- Desktop, not Universal: Universal demands the Spectre CRT which a
+         stock x64 dev box usually lacks. -->
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- WinMali.Common.props pins OutDir/IntDir to $(repo)\build\... and
+       disables the WDK packaging tasks (InfVerif/ApiValidator/Inf2Cat/
+       SignTool) that aren't installed on a stock dev box. -->
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+    <Import Project="..\WinMali.Common.props" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <TargetName>WinMaliKmd</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_WIN64;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\Shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <!-- WDDM miniports link against displib.lib (DxgkInitialize / DxgkCb*).
+           $(DDK_LIB_PATH) expands to the right km\<arch> directory inside
+           the active WDK. The dxgkrnl.lib / dxapi.lib pair from legacy XDDM
+           samples is no longer shipped. -->
+      <AdditionalDependencies>$(DDK_LIB_PATH)displib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+    <!--
+      dxgkrnl 26100 validates that the .sys VERSIONINFO FILEVERSION
+      matches the INF DriverVer version
+      (dxgkrnl!DpiFdoValidateKmdAndPnpVersionMatch) and executes
+      brk #0xF000 on mismatch: instant bugcheck/PSCI reset on device
+      start with no trace. So the version is stamped from exactly one
+      pair that MUST stay equal forever:
+
+        * <Inf><TimeStamp> below  -> stamped DriverVer in the .inf
+        * FILEVERSION in WinMaliKmd.rc -> PE version of the .sys
+
+      Bump both together. WinMaliKmd.inx keeps an EMPTY "DriverVer ="
+      placeholder so stampinf writes "<build date>,1.0.0.0" cleanly
+      (with a pre-filled date it PREPENDS, producing a malformed
+      double-date line).
+    -->
+    <Inf>
+      <TimeStamp>1.1.0.3</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClInclude Include="WinMaliKmd.h" />
+    <ClInclude Include="WinMaliVersion.h" />
+    <ClInclude Include="WinMaliLog.h" />
+    <ClInclude Include="WinMaliDxgkInitFill.h" />
+    <ClInclude Include="WinMaliDxgkStubs.h" />
+    <ClInclude Include="WinMaliDxgkStubsWire.h" />
+    <ClInclude Include="WinMaliAlloc.h" />
+    <ClInclude Include="WinMaliMmu.h" />
+    <ClInclude Include="winmali_shader_programs.h" />
+    <ClInclude Include="hw\WinMaliHw.h" />
+    <ClInclude Include="..\Shared\WinMaliEscape.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="WinMaliAlloc.c" />
+    <ClCompile Include="WinMaliBo.c" />
+    <ClCompile Include="WinMaliBringup.c" />
+    <ClCompile Include="WinMaliDdi.c" />
+    <ClCompile Include="WinMaliDriver.c" />
+    <ClCompile Include="WinMaliDxgkInitFill.c" />
+    <ClCompile Include="WinMaliDxgkStubs.c" />
+    <ClCompile Include="WinMaliEscape.c" />
+    <ClCompile Include="WinMaliFw.c" />
+    <ClCompile Include="WinMaliGroup.c" />
+    <ClCompile Include="WinMaliKillSwitch.c" />
+    <ClCompile Include="WinMaliMmu.c" />
+    <ClCompile Include="WinMaliPaging.c" />
+    <ClCompile Include="WinMaliQai.c" />
+    <ClCompile Include="WinMaliSerial.c" />
+    <ClCompile Include="WinMaliSync.c" />
+    <ClCompile Include="WinMaliVidPn.c" />
+    <ClCompile Include="WinMaliVidmm.c" />
+    <ClCompile Include="WinMaliVm.c" />
+    <ClCompile Include="hw\WinMaliHw.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="WinMaliKmd.inx" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="WinMaliKmd.rc" />
+  </ItemGroup>
+  <!--
+    Vulkan loader manifest JSONs - one per process bitness/emulator.
+    These travel into the driver package via the INF's CopyFiles
+    section but they're authored as source-tree files; declaring them
+    here makes the KMD project track them so VS rebuilds the package
+    when the manifests change. CopyToOutputDirectory lands them next
+    to WinMaliKmd.sys / .inf at link time, which is where InfVerif and
+    Inf2cat look.
+  -->
+  <ItemGroup>
+    <None Include="WinMaliVk_icd.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="WinMaliVk_icd_x86.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- WDK's Shared.Props (imported by Microsoft.Cpp.targets) defaults
+       ApiValidator_Enable and EnableInf2cat back to true when empty,
+       which silently overrides the early PropertyGroup. Force the final
+       value AFTER all imports. Override via /p:ApiValidator_Enable=true
+       (etc.) when you really need them. -->
+  <PropertyGroup>
+    <ApiValidator_Enable>$(ApiValidator_Enable)</ApiValidator_Enable>
+    <EnableInf2cat>$(EnableInf2cat)</EnableInf2cat>
+  </PropertyGroup>
+
+</Project>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
