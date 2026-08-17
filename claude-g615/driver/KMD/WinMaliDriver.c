@@ -1553,6 +1553,42 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"QuerySegFlags",         g_WinMaliQaiSegFlags);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QuerySegShape",         g_WinMaliSegmentShape);
+
+                /* ★★★★★ PUBLISH THE DRIVER'S OWN TRACE.
+                 *
+                 * Every DbgPrint here is redirected into the EDK2 log ring
+                 * (WinMaliLog.h -> WinMaliSerial.c), and until now NOTHING could
+                 * read it back: mtkcpufreq's BootLog is a one-shot snapshot from
+                 * its own load time (measured: 25 WinMali lines, ending mid-QAI,
+                 * byte-identical across reads) and mtkcpufreq cannot be
+                 * restarted. So the driver has been narrating to a void, and
+                 * every number we wanted got re-published as its own DWORD -
+                 * including QuerySegFlags, which duplicates a value
+                 * QAI[QUERYSEGMENT3 fill] was already printing.
+                 *
+                 * Throttled hard: this copies 24 KB and hits the registry, so
+                 * once every 64 publish ticks (~2 s at 30 Hz), not per frame. */
+                {
+                    static PUCHAR s_traceBuf   = NULL;
+                    static ULONG  s_traceTick  = 0;
+                    const  ULONG  kTraceBytes  = 24576u;
+
+                    if ((s_traceTick++ % 64u) == 0u) {
+                        if (s_traceBuf == NULL) {
+                            s_traceBuf = (PUCHAR)ExAllocatePoolWithTag(
+                                NonPagedPoolNx, kTraceBytes, 'gLmW');
+                        }
+                        if (s_traceBuf != NULL) {
+                            ULONG got = WinMaliSerialSnapshot(s_traceBuf, kTraceBytes);
+                            if (got != 0) {
+                                (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath,
+                                        L"TraceTail", s_traceBuf, got);
+                                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                        L"TraceTailBytes", got);
+                            }
+                        }
+                    }
+                }
                 {
                     /* One row per qualifying candidate: bo / pid / hits / pages.
                        Named individually so a plain registry read decodes them

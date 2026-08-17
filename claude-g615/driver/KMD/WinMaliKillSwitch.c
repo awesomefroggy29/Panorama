@@ -115,6 +115,7 @@ WinMaliWriteParamsDword(
     return status;
 }
 
+
 /* ⛔★★★★★ FLUSHED VARIANT - USE FOR ANYTHING THAT MUST SURVIVE A HANG.
  *
  * ZwSetValueKey writes the LIVE hive in memory and Windows flushes lazily. If the

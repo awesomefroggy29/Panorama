@@ -146,6 +146,63 @@ WinMaliSerialWrite(_In_z_ const char* Text)
     InterlockedExchange(&g_RingLock, 0);
 }
 
+/*
+ * ★★★★★ READ OUR OWN TRACE BACK. THE WHOLE DRIVER LOG HAS BEEN UNREADABLE.
+ *
+ * Every DbgPrint in this driver is redirected here (WinMaliLog.h) and lands in
+ * the EDK2 ring at 0x48300000. The ring is LIVE, but the only reader we had was
+ * mtkcpufreq's `BootLog` registry value - and that is a ONE-SHOT snapshot taken
+ * when mtkcpufreq loaded, so it contains only the handful of lines we had
+ * emitted by then (measured: 25 WinMali lines, ending mid-QAI) and never
+ * updates. mtkcpufreq also cannot be restarted ("cannot be stopped"), so there
+ * is no way to re-take it.
+ *
+ * Consequence, and it shaped a whole session: with the trace invisible, every
+ * value we wanted had to be re-published as a registry DWORD counter - to the
+ * point of adding QuerySegFlags to read a number the driver was ALREADY
+ * printing in QAI[QUERYSEGMENT3 fill]. This function ends that.
+ *
+ * ⚠ DELIBERATELY LOCK-FREE. Writers can be at DIRQL and take the interlocked
+ * flag; holding it across a 32 KB copy from a PASSIVE thread would make them
+ * spin 500k times and DROP LINES - losing exactly the trace we came for. A torn
+ * byte at the boundary is a cosmetic defect in a log; a dropped line is missing
+ * evidence.
+ */
+ULONG
+WinMaliSerialSnapshot(_Out_writes_bytes_(BufBytes) PUCHAR Buf,
+                      _In_ ULONG BufBytes)
+{
+    volatile const UCHAR* pay;
+    ULONG cur, wrapped, avail, take, start, i;
+
+    if (g_Ring == NULL || Buf == NULL || BufBytes == 0) {
+        return 0;
+    }
+    if (g_Ring[0] != WINMALI_RING_MAGIC) {
+        return 0;                      /* not our ring - never guess */
+    }
+
+    pay     = (volatile const UCHAR*)g_Ring + WINMALI_RING_HDR;
+    cur     = g_Ring[2];
+    wrapped = g_Ring[3];
+    if (cur >= WINMALI_RING_CAP) {
+        cur = 0;
+    }
+
+    avail = wrapped ? WINMALI_RING_CAP : cur;
+    take  = (BufBytes < avail) ? BufBytes : avail;
+    if (take == 0) {
+        return 0;
+    }
+
+    /* Newest data ends AT the cursor, so walk back `take` bytes from it. */
+    start = (cur + WINMALI_RING_CAP - take) % WINMALI_RING_CAP;
+    for (i = 0; i < take; ++i) {
+        Buf[i] = pay[(start + i) % WINMALI_RING_CAP];
+    }
+    return take;
+}
+
 ULONG
 WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...)
 {

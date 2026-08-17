@@ -533,6 +533,7 @@ extern ULONG g_WinMaliQaiOutSize;
 extern ULONG g_WinMaliQaiCapsSizeof;
 extern ULONG g_WinMaliQaiSegFlags;   /* DXGK_SEGMENTFLAGS we sent; DirectFlip=0x400 */
 
+
 extern LONG  g_WinMaliScanoutWc;      /* 1 = write-combined, 0 = UNCACHED (~1000x) */
 extern LONG  g_WinMaliFlipHasMdl;
 extern LONG  g_WinMaliFlipMdlPages;

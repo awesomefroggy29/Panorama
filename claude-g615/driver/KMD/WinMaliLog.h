@@ -37,6 +37,13 @@ VOID     WinMaliSerialTeardown(VOID);
 /* Raw text writer: polled TX, bounded spins, any IRQL. */
 VOID     WinMaliSerialWrite(_In_z_ const char* Text);
 
+/* Copy the NEWEST bytes of the log ring out (up to BufBytes); returns how many.
+   Lock-free by design - see the comment at the definition. This is the only way
+   to read the driver's own trace on MT6897: mtkcpufreq's BootLog is a one-shot
+   snapshot from its own load time and cannot be re-taken. */
+ULONG    WinMaliSerialSnapshot(_Out_writes_bytes_(BufBytes) unsigned char* Buf,
+                               _In_ unsigned long BufBytes);
+
 /* printf-shim: formats once, forwards to real DbgPrint + the UART. */
 ULONG    WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...);
 
