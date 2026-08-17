@@ -115,6 +115,67 @@ WinMaliWriteParamsDword(
     return status;
 }
 
+/* ⛔★★★★★ FLUSHED VARIANT - USE FOR ANYTHING THAT MUST SURVIVE A HANG.
+ *
+ * ZwSetValueKey writes the LIVE hive in memory and Windows flushes lazily. If the
+ * box wedges before that flush the value is GONE. Measured 2026-08-17: the present
+ * worker published StatPresentSettleMs, the machine hung ~20 s later, and the
+ * offline hive afterwards read `<absent>` - a counter that HAD been written looked
+ * exactly like code that never ran.
+ *
+ * That is fatal for a bug whose only symptom is a hang: the values written in the
+ * seconds before the freeze are the ones that say what the driver was doing, and
+ * they are precisely the ones lazy flushing loses.
+ *
+ * ZwFlushKey commits the hive before returning. It is EXPENSIVE - use it for a
+ * few values on a bounded number of passes, never on a per-frame hot path. */
+NTSTATUS
+WinMaliWriteParamsDwordFlushed(
+    _In_ PUNICODE_STRING RegistryPath,
+    _In_ PCWSTR          ValueName,
+    _In_ ULONG           Value)
+{
+    WCHAR             pathBuf[512];
+    UNICODE_STRING    paramsPath;
+    UNICODE_STRING    valueName;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE            hKey        = NULL;
+    NTSTATUS          status;
+    ULONG             disposition = 0;
+
+    if (RegistryPath == NULL || RegistryPath->Buffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (RegistryPath->Length + sizeof(WINMALI_PARAMS_SUFFIX) > sizeof(pathBuf)) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    RtlCopyMemory(pathBuf, RegistryPath->Buffer, RegistryPath->Length);
+    paramsPath.Buffer        = pathBuf;
+    paramsPath.Length        = RegistryPath->Length;
+    paramsPath.MaximumLength = sizeof(pathBuf);
+    status = RtlAppendUnicodeToString(&paramsPath, WINMALI_PARAMS_SUFFIX);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    InitializeObjectAttributes(&oa, &paramsPath,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL, NULL);
+    status = ZwCreateKey(&hKey, KEY_SET_VALUE, &oa, 0, NULL,
+                         REG_OPTION_NON_VOLATILE, &disposition);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlInitUnicodeString(&valueName, ValueName);
+    status = ZwSetValueKey(hKey, &valueName, 0, REG_DWORD, &Value, sizeof(Value));
+    if (NT_SUCCESS(status)) {
+        (VOID)ZwFlushKey(hKey);   /* the whole point: commit before we can die */
+    }
+    ZwClose(hKey);
+    return status;
+}
+
 /* Write a REG_BINARY into Services\WinMaliKmd\Parameters. Same posture as
    WinMaliWriteParamsDword; used to persist the DxgkDdiQueryInterface GUID
    sequence, which is otherwise only visible on a kernel debugger. */

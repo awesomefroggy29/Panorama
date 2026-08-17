@@ -1,173 +1,82 @@
-# claude-g615 — WinMali on Mali-G615 (Valhall, MT6897)
+# claude-g615 — WinMali on Mali-G615 (MT6897 / Dimensity 8300)
 
-Windows-on-ARM WDDM display+render driver for Mali, running on a **Lenovo TB375FC**
-(MediaTek Dimensity 8300 / MT6897, **Mali-G615 MC5**), booted via a custom EDK2.
+Snapshot 2026-08-17. Same ancestor as `codex-g610` (`WinMali-rk3588.sln`), taken
+further on the **display/WDDM** side. `driver/` is the KMD+UMD tree;
+`mesa/winmali-mesa-workingtree.patch` is a **source-only** diff against upstream
+mesa (no build artefacts).
 
-This folder is a read-only-ish scratchpad: the source as it stands today, so the
-codex-g610 side (and its LLM) can diff against it. It is not a buildable tree on
-its own — see *What is NOT here*.
+## Hardware difference that matters
 
----
+| | codex-g610 | claude-g615 |
+|---|---|---|
+| GPU | Mali-G610, Valhall **arch 10** | Mali-G615, Valhall **arch 11** |
+| panfrost/panvk support | good (RK3588 is the reference board) | **arch 11 is a gap — panfrost skips it and fails SILENTLY** |
 
-## ⚠ G610 vs G615 — read this first, it will bite you
+⚠ Arch-11 code paths fail *quietly*, not loudly. Do not assume a working arch-10
+result carries over without checking.
 
-**G615 is Valhall arch 11. G610 is arch 10.** Panfrost/Mesa has `v10` and `v12`
-codepaths and **skips 11 entirely**, and it fails *silently* — no error, just
-wrong or absent behaviour. Our tree brackets it: where arch 11 is missing we
-clone the v10 path and diff against v12 to decide each field.
+## State on G615
 
-So a fix that is correct on your G610 may be a no-op or actively wrong here, and
-vice versa. When comparing code, check the arch gate before assuming divergence
-is a bug.
+**Works**
+- Mali executes real command streams (CSF: GROUP_CREATE, tiler heap, submits
+  complete, syncobj waits return 0).
+- The composited desktop/lock-screen reaches the panel at **full height**.
+- Driver loads clean: `device=OK / CM_PROB_NONE`, dwm + LogonUI both map our UMD.
 
-Authoritative sources we use for GPU ID decode / CSF iface / MMU:
-- ARM DDK source `gpu_mali/mali_avalon/mali-r49p1` (not for shader descriptors —
-  those live in the blob).
-- The stock vendor `mali_kbase_mt6897_r44.ko`, which is **unstripped** — exception
-  tables and register offsets were decoded out of its jump tables rather than
-  guessed. ⚠ `.rodata` tail-merges strings, so a `strings` grep is a hypothesis,
-  not the table.
+**Blocked — logon never completes while the driver is armed**
+dxgk rejects every LogonUI present *before it reaches the driver*:
+```
+ETW Microsoft-Windows-DxgKrnl id=184
+  FlipInterval=0 (IMMEDIATE)  Flags=0x8000 (RedirectedFlip)
+  ReturnStatus=0xC000000D STATUS_INVALID_PARAMETER      9/9 rejected
+```
+Only 2 `DxgkDdiSetVidPnSourceAddress` calls land in 287 s against 6093 vsyncs.
+Disarm the driver and logon completes, every time.
 
----
+**Controlled A/B (same box, same OS, same LogonUI, our driver disarmed):**
+the known-good display driver accepts **200/200** presents including 5 of the
+*identical* RedirectedFlip+IMMEDIATE shape. ⇒ the present is fine; **our adapter
+is the cause**.
 
-## Layout
+## 🔴 SHARED BUG — BOTH TREES HAVE IT
+
+dxgk emits, on the *same thread* as each rejected present, ~2 per rejection:
 
 ```
-driver/            the WDDM kernel-mode driver (our code)
-  KMD/             miniport: dxgk DDIs, MMU/VM, BO table, CSF firmware, escapes
-  Shared/          the UMD<->KMD escape ABI (WinMaliEscape.h) — the contract
-  UMD/, Mesa/      thin UMD shim + Mesa project glue
-  Tools/           gen-dxgk-stubs.py  ⛔ DO NOT RUN — see below
-mesa/
-  kmod-winmali/    our pan_kmod backend (the Mesa side of the escape ABI)
-  winmali-mesa-workingtree.patch   everything else we changed in Mesa
+ETW id=494:  "WDDM2 driver calls WDDM1.x DDI!"   (EventData1 = 88)
 ```
 
-`mesa/winmali-mesa-workingtree.patch` is `git diff` of an uncommitted working
-tree on top of **`DarkFire01/mesa`** (gitlab.freedesktop.org), commit `0f7e82d`
-("WIP") — a WoA Mesa fork, not upstream. It touches ~40 files across
-`gallium/drivers/panfrost`, `gallium/frontends/d3d10umd`, and `panfrost/lib`.
+Both trees declare `WDDMVersion = DXGKDDI_WDDMv3_2` and then call the WDDM 1.x
+callback **`DxgkCbGetHandleData`**:
 
-⛔ **Never run `Tools/gen-dxgk-stubs.py`.** The dxgk stubs are hand-maintained now;
-regenerating them overwrites real implementations with stubs.
+* `codex-g610`  — 7 calls / 2 files
+* `claude-g615` — 16 calls / 4 files (Alloc, Ddi, Escape, Kmd.h)
 
----
+This is the strongest current lead for the present rejection, and it is a
+**shared** fix: replace `DxgkCbGetHandleData` with the private driver data the
+WDDM2 DDIs already hand you.
 
-## How it actually works right now
+## Refuted (measured, not assumed)
 
-Two things are worth understanding before reading the code, because neither is
-the obvious design:
+1. D3D feature level — nothing ever requests D3D10.1/D3D11 from us.
+2. `FlipCaps.FlipImmediateMmIo` — set it, dxgk still returns `0xC000000D`.
+3. "our caps never reach dxgk" — `QueryCapsOutSz == QueryCapsSizeof == 592`,
+   `FlipCaps` at offset 60, value `0xA` confirmed written.
+4. `NoScreenToScreenBlt` / `NoOverlapScreenBlt`.
+5. `DxgkDdiSetPowerState` as a teardown hook (never called).
+6. "we scan out the wrong buffer" — dxgk names the surface every flip.
 
-**1. Submission goes through a private escape, not the dxgk-native path.**
-There are two gates, `WINMALI_DXGK_ADDR` and `WINMALI_DXGK_SUBMIT`, and on this
-device both are **off**: allocation/addressing/submission all ride our own
-`DxgkDdiEscape` ABI. Allocation + addressing + submission + **fences** are one
-design — mixing halves is the single most productive source of bugs in this
-project (see *Root causes* below).
+## Notes for anyone reading the display path
 
-⚠ Gate state is a **registry/env fact, not a source fact**. The `[default]`
-comment in the source describes the build, not the machine you are looking at.
-
-**2. The scanout source is a user VA the KMD wraps.**
-Escape `0x93 BoFromUserVa` takes the UMD's locked CPU VA (from `pfnLockCb`),
-`MmProbeAndLockPages` it, and the present worker scans out of that same
-probe-locked MDL. This is how a full desktop reaches the panel. It exists
-because under escape-submit dxgk never aperture-maps, so `ApertureMdl` is NULL
-forever and every aperture-based read path (escapes 0x81 / 0x92) is dead.
-
-`DxgkDdiPresent` is **never called** — DWM uses our UMD to *render*, not to
-present, and presents via FLIP. Don't tune the present path; it's exonerated.
-
----
-
-## Root causes found (both verified on hardware, 2026-08-16)
-
-**A. The CS ring `Insert` pointer was written back masked.**
-`Insert`/`Extract` are continuous 64-bit counters, not ring offsets. The mask
-belongs on the *copy* (where bytes land in the 64 KiB buffer), never on the
-value written back. Once the firmware's `Extract` passed `RING_BYTES`,
-`Insert & 0xFFFF` == 0 and we wrote `Insert = 0x80` while `Extract = 0x10000`,
-putting Insert permanently 65,408 bytes *behind* Extract. The FW then sees no
-work and every submit times out.
-
-Measured before the fix:
-```
-RingInsert 0x00000080   RingExtract 0x00010000
-seqno      0x00000200 (512)   and 512 * 128 B = 0x10000   <- they agree
-CMD_PTR 0  BLOCKED 0  CS_FAULT 0  FATAL_INFO 0
-```
-The GPU had executed **512 trampolines correctly** and then stopped forever.
-After the fix, with real compositor traffic: `CsSubmits 906->961`,
-`CsOk 906->960`, `CsTimeouts 0`, `Insert 0x1E080 > Extract 0x1E000`.
-
-If your G610 tree has a submit path that "works for a few seconds then goes
-black", check this first — 512 jobs is a few seconds of compositing.
-
-**B. Fences were not gated, so every submit was rejected before reaching the GPU.**
-Mesa created **dxgk monitored fences** (the D3D frontend installs the dxgk data
-plane unconditionally, "no env gates") while submitting through the **escape**
-path, whose sync ops resolve against the KMD's own syncobj table. Result:
-`ENOENT` on every submit carrying a wait op. The tell was unmistakable once
-logged: `SyncBadHandle = 0x40000800` — a D3DKMT-shaped handle, when KMD syncobj
-handles are small integers from a counter starting at 1.
-
-Fix: gate the fence hooks on the same switch as submission
-(`winmali_use_dxgk_fences()` in `mesa/kmod-winmali/winmali_kmod.c`).
-
----
-
-## Traps that cost us days — worth checking in your tree
-
-- **`CS_FATAL` is latched and never acked.** A non-zero value is not evidence of
-  a *current* fault. `CS_FATAL = 0x40` decoded to `CS_CONFIG_FAULT` and sent us
-  hunting a CS misconfiguration; it was a stale latch from bring-up.
-  `FATAL_INFO = 0` was the tell. Only the first fatal of a boot means anything.
-- **An all-zero status block is indistinguishable from an unwritten page.**
-  `CMD_PTR=0, BLOCKED=0, FAULT=0` reads as "misconfigured CS" and equally as
-  "nothing ever wrote here". The **ring pointers settle it without the firmware's
-  cooperation**: we write `Insert`, the FW writes `Extract`.
-- **A counter published only in the failure branch cannot show success.** Our
-  ring/seqno values lived in the timeout branch, so a *working* driver published
-  all zeros — identical to "not instrumented". Pair every failure counter with a
-  completion counter (`CsOk` vs `CsTimeouts`).
-- **Handle tables minted from a per-adapter counter reset to 1** on every adapter
-  start, while DWM/explorer survive the restart still holding old handles. Worse
-  than failing: a restarted counter can re-issue a handle that is still live and
-  silently alias someone else's object. All three tables (BO, group, syncobj) are
-  now boot-unique.
-- **Shader/tiler power is NOT our problem here** — measured
-  `SHADER_READY == SHADER_PRESENT (0x130012)`, `L2_READY 1`, `TILER_READY 1`
-  across a real draw. If you are chasing "cores never came up", measure it before
-  believing it.
-- **An idle desktop submits nothing.** Any "the bug is fixed" reading taken on an
-  idle desktop is a dead window that looks exactly like success.
-
----
-
-## Open threads (as of this upload)
-
-1. Mesa still logs ~8 `GROUP_SUBMIT failed ret=-2 (ENOENT)` per 2 min while the
-   KMD's counters (`StatSubmitSyncFail`, `StatSubmitNoGroup`, `CsfFailCount`) all
-   read 0. Contradictory counters at the two ends of one interface — the bug is
-   in the code *between* them, on a path with no counter yet.
-2. The scanned present source is full of content (`StatSrcNonBlack 646/646`,
-   `StatSrcEdges 639`) but its change counter is flat — rendering completes, yet
-   that surface isn't being updated.
-3. Taskbar and mouse cursor are not composited.
-4. `texture_map` refuses KMT-imported destinations by design, which kills the CPU
-   delivery fallback.
-
-## What is NOT here
-
-- No binaries, no firmware blobs, no certificates, no build output.
-- No Mesa tree — only our patch and our kmod backend.
-- The upstream base for the patch is recorded above; you need that fork to apply it.
-- Build uses the EWDK (kit 10.0.26100.0). `Tools/gen-dxgk-stubs.py` hardcodes a
-  local `F:\Program Files\Windows Kits\10\Include` path — that is the mounted EWDK
-  ISO, not a machine secret.
-
-## Licensing note
-
-`driver/` is our own work. `mesa/` is derived from Mesa (MIT) via the
-DarkFire01 fork. Exception-code tables in `KMD/WinMaliFw.c` were *decoded from*
-(not copied out of) the vendor kbase module. No ARM DDK source is vendored here.
+- There is **no page flip and no OVL**. `SetVidPnSourceAddress` only *records*
+  the address; pixels reach the panel by **CPU memcpy into the firmware
+  framebuffer** (`0xFD619400`, `MmMapIoSpaceEx`) that EDK2 lit and the firmware
+  DISP block still scans out. All three `SetVidPnSourceAddressWithMultiPlaneOverlay*`
+  DDIs are NULL.
+- A recent real bug worth knowing: the read-overrun guard in
+  `panfrost_resource_copy_region` read `slices[].tiled_or_linear.row_stride_B` on
+  an **AFBC** surface. `afbc` and `tiled_or_linear` are a **union**, so it read an
+  AFBC header field (24576) instead of the real pitch (11784), invented a 975-row
+  limit for an 1842-row image and truncated every frame to **52.9%** of the
+  screen. Fixed by bounding on the resource extent and only trusting
+  `row_stride_B` when `modifier == DRM_FORMAT_MOD_LINEAR`.

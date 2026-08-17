@@ -68,6 +68,39 @@ volatile LONG g_WinMaliStopping = 0;
    See the long note in WinMaliPresentWorker_. */
 ULONG g_WinMaliPresentTestPattern = 0;
 
+/* Parameters\FlipSrcFromVidMm (DEFAULT 0 - LEAVE IT 0).
+   When 1, the present worker may read the flip allocation through VidMm's
+   aperture MDL. That HANGS THE MACHINE: touching a non-resident page faults,
+   VidMm queues a paging op to satisfy it, that op is serviced by this driver,
+   and our worker is blocked inside the fault. Deadlock, no bugcheck.
+   Proven by an armed boot with PresentTestPattern=1 (never reads srcVa): stable,
+   dwm on our UMD, LiveFlipLatch 1->2, StatPresentCalls 0->23, GROUP_SUBMIT
+   failures 0. Exists only so the finding can be re-tested on purpose. */
+ULONG g_WinMaliFlipSrcFromVidMm = 0;
+
+/* Parameters\FlipSrcFromAperture (DEFAULT 0 - LEAVE IT 0).
+   The sibling of the knob above, and it existed unguarded for far too long. The
+   fallback branch it now gates maps `src->ApertureMdl` - a dxgk allocation's
+   aperture MDL - which is the SAME class of memory as the VidMm read above, and
+   fails the same way: fault -> VidMm paging op -> serviced by this driver ->
+   our worker is the blocked thread -> wedge with no bugcheck.
+   It was mislabelled in the source as "srcPath = 2, 0x93 probe-locked BO",
+   which is why it read as safe. It is not a 0x93 read; 0x93 is srcPath 3. */
+ULONG g_WinMaliFlipSrcFromAperture = 0;
+
+/* Parameters\PresentCopyBudgetKB - bytes copied per worker wake, in KB.
+   0/absent = the WHOLE frame in one wake (default). 2048 restores the old 2 MB
+   throttle. The throttle existed for a hang that was later root-caused to the
+   BoFree/system-VA race; its remaining effect is an ~11-wake window in which a
+   short-lived DWM surface can be destroyed underneath us. */
+ULONG g_WinMaliPresentCopyBudgetKB = 0;
+
+/* Ticks where NO 0x93 candidate qualified and, with the aperture fallback gated
+   off, we skipped the frame instead of reading memory we do not own. Expected to
+   be LARGE (404 of 501 candidates were under-size last run) - that is the knob
+   working, not a fault. */
+LONG  g_WinMaliStatSkipNoSrc = 0;
+
 /* Parameters\PresentMarker: stamp a colour-cycling square on every frame WE
    blit, so a desktop on the panel can be told apart from a stale framebuffer. */
 ULONG g_WinMaliPresentMarker = 0;
@@ -92,6 +125,7 @@ ULONG g_WinMaliPresentTimerHz = 30;
    the fix; FAILING the submit on top of that is a real behaviour change that
    could crash-loop the compositor, so it stays opt-in until measured. */
 ULONG g_WinMaliFailOnGpuFault = 0;
+ULONG g_WinMaliUvSrcInvalidate = 1;
 
 /* --- DxgkDdiQueryInterface forensics -------------------------------------
  * When ComputeOnly=0, dxgk queries a run of display interfaces and then fails
@@ -212,9 +246,17 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                  &g_WinMaliPresentTimerHz);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FailOnGpuFault", 0,
                                  &g_WinMaliFailOnGpuFault);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"UvSrcInvalidate", 1,
+                                 &g_WinMaliUvSrcInvalidate);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentMarker", 0, &g_WinMaliPresentMarker);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTestPattern", 0,
                                  &g_WinMaliPresentTestPattern);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"FlipSrcFromVidMm", 0,
+                                 &g_WinMaliFlipSrcFromVidMm);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"FlipSrcFromAperture", 0,
+                                 &g_WinMaliFlipSrcFromAperture);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentCopyBudgetKB", 0,
+                                 &g_WinMaliPresentCopyBudgetKB);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"ChildCfg", 0, &g_WinMaliChildCfg);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"VidPnSources", 0, &g_WinMaliVidPnSources);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"ChildCount", (ULONG)-1, &g_WinMaliChildCount);
@@ -1300,6 +1342,77 @@ WinMaliPresentWorker_(_In_ PVOID Context)
 {
     PWINMALI_ADAPTER a = (PWINMALI_ADAPTER)Context;
 
+    /* ⛔★★★★★ HOLD OFF UNTIL BOOT HAS SETTLED.
+     *
+     * THE CRITICAL PATH: dwm can only be put on our UMD by an ARMED BOOT - it is
+     * a PROTECTED process and cannot be restarted on a running system (taskkill,
+     * Stop-Process in a job, a fully detached process and a session logoff ALL
+     * left the pid unchanged, 2026-08-17). But every armed boot HANGS at the
+     * logon spinner, showing the partial top-band paint first.
+     *
+     * The discriminator: arming at RUNTIME is fine - two full 100 s windows with
+     * no hang - while arming at BOOT dies within seconds. The difference is what
+     * else is happening: at boot, LogonUI, dwm init and our StartDevice all land
+     * at once, and we immediately start pushing ~21 MB frames into the very
+     * framebuffer the firmware/DSI is still using.
+     *
+     * So do nothing for the first WINMALI_PRESENT_SETTLE_MS after the worker
+     * starts. If the boot hang disappears, early-boot contention IS the cause and
+     * the fix is a proper readiness gate rather than a delay. If it still hangs,
+     * this is refuted cheaply and the cause is elsewhere. */
+    {
+        LARGE_INTEGER settle;
+        settle.QuadPart = -((LONGLONG)WINMALI_PRESENT_SETTLE_MS * 10000LL);
+        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &settle);
+        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                L"StatPresentSettleMs", (ULONG)WINMALI_PRESENT_SETTLE_MS);
+    }
+
+    /* ⛔★★★★★★ CLAIM THE REGISTRY BUDGET FOR THE COUNTERS THAT MATTER.
+     *
+     * `Parameters` caps at 127 values; this driver publishes 164 DISTINCT names.
+     * So 37 of them can never be CREATED - and which 37 is decided purely by the
+     * order they are first written in. Every counter added recently landed late
+     * in that order and therefore read <absent> forever, which is
+     * indistinguishable from "the code never ran".
+     *
+     * That has produced FOUR wrong conclusions in one session: StatUvSrcAsked=0
+     * (read as "AcquireBest never ran" when it had run 1674 times), StatUvProbe,
+     * StatPowerStop, and StatUvMaxCov. Each time I reasoned about the driver from
+     * a number the registry had silently refused to store.
+     *
+     * Creating them HERE, once, before the worker publishes anything else,
+     * reserves their slots permanently: after any purge the first names rewritten
+     * are these. The later writes then just update values that already exist.
+     * ⇒ An <absent> among these now genuinely means the code did not run. */
+    {
+        static const PCWSTR reserve[] = {
+            L"StatPresSrcHReal",L"StatPresDstHReal",L"StatApWithContent2",
+            L"StatPresSrcRectTL",L"StatPresSrcRectBR",L"StatPresDstRectTL",
+            L"StatPresDstRectBR",L"StatPresSubRectCnt",L"StatPresDmaSize",
+            L"StatPresMultipass",L"StatPresColor",
+            L"StatUmdPresentCtx2",
+            L"StatPawmReg",    L"StatOpenByPawm", L"StatOpenCalls",  L"StatOpenResolved",
+            L"StatOpenById",   L"StatOpenFailed",
+            L"StatOpenFailPdMagic", L"StatOpenFailPdSize", L"StatPresentBlts",
+            L"StatPresentCalls2", L"StatPresentNullCookie2",
+            L"StatUvMaxCov",   L"StatUvQual",     L"StatUvHeldOver",L"StatUvCoverage",
+            L"StatWinPitch",
+            L"StatWinRows",
+            L"StatSrcLastRow", L"StatSrcFirstRow",L"StatSrcRowsNZ", L"StatSrcPathMeas",
+            L"StatSrcProbePitch", L"StatSweeps",
+            L"StatLatchDrop",  L"StatCopyAbort",  L"StatCopyKB",    L"StatUvRevokeTo",
+            L"StatSkipNoSrc",  L"StatPowerStop",  L"StatUvSrcAsked",L"StatUvSrcCands",
+            L"StatUvSrcTooSmall", L"StatUvSrcUniform", L"StatUvSrcBo", L"StatUvSrcPid",
+            L"StatUvSrcPages", L"Stat0x93Calls",  L"Stat0x93Ok",    L"StatPresentCalls",
+            L"LiveFlipLatch",  L"StatScanoutWc",
+        };
+        ULONG ri;
+        for (ri = 0; ri < RTL_NUMBER_OF(reserve); ri++) {
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, reserve[ri], 0);
+        }
+    }
+
     for (;;) {
         KeWaitForSingleObject(&a->PresentWake, Executive, KernelMode, FALSE, NULL);
         if (InterlockedCompareExchange(&a->PresentStop, 0, 0) != 0) {
@@ -1366,25 +1479,38 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"StatUvSrcPages",        (ULONG)g_WinMaliStatUvSrcPages);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatUvSrcNCand",        (ULONG)g_WinMaliStatUvSrcNCand);
+                /* ★ THE NEW SELECTION SIGNAL. Published in the PERIODIC block,
+                   not the copy block, so it is still readable on a tick where no
+                   source qualified - which is precisely when it matters. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUvCoverage",        (ULONG)g_WinMaliStatUvSrcCoverage);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUvMaxCov",          (ULONG)g_WinMaliStatUvSrcMaxCov);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUvQual",            (ULONG)g_WinMaliStatUvSrcQual);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUvHeldOver",        (ULONG)g_WinMaliStatUvHeldOver);
+                /* ★ Did our DRIVERCAPS land where dxgk reads them? Two cap
+                   experiments have now changed nothing, and this file's own
+                   comment records dxgk reading 0x8 from a field we set to 0.
+                   QueryCapsOutSz < QueryCapsSizeof means the running kernel has
+                   a SMALLER DXGK_DRIVERCAPS than our 26100 WDK header, so our
+                   FIELD_OFFSETs address the wrong bytes and BOTH refutations
+                   are no-ops rather than evidence. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryFlipCaps",         g_WinMaliQaiFlipCapsValue);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryCapsOff",          g_WinMaliQaiFlipCapsOff);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryCapsOutSz",        g_WinMaliQaiOutSize);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryCapsSizeof",       g_WinMaliQaiCapsSizeof);
                 {
                     /* One row per qualifying candidate: bo / pid / hits / pages.
                        Named individually so a plain registry read decodes them
                        without any packing convention to get wrong later. */
-                    static const PCWSTR boN[4]   = { L"UvCand0Bo",   L"UvCand1Bo",
-                                                     L"UvCand2Bo",   L"UvCand3Bo" };
-                    static const PCWSTR pidN[4]  = { L"UvCand0Pid",  L"UvCand1Pid",
-                                                     L"UvCand2Pid",  L"UvCand3Pid" };
-                    static const PCWSTR hitN[4]  = { L"UvCand0Hits", L"UvCand1Hits",
-                                                     L"UvCand2Hits", L"UvCand3Hits" };
-                    static const PCWSTR pgN[4]   = { L"UvCand0Pages",L"UvCand1Pages",
-                                                     L"UvCand2Pages",L"UvCand3Pages" };
-                    static const PCWSTR nbN[4]   = { L"UvCand0NonBlk",L"UvCand1NonBlk",
-                                                     L"UvCand2NonBlk",L"UvCand3NonBlk" };
-                    static const PCWSTR chN[4]   = { L"UvCand0Chg",  L"UvCand1Chg",
-                                                     L"UvCand2Chg",  L"UvCand3Chg" };
-                    static const PCWSTR scN[4]   = { L"UvCand0Scans",L"UvCand1Scans",
-                                                     L"UvCand2Scans",L"UvCand3Scans" };
-                    ULONG ci;
+                    ULONG ci = 0;
+
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"StatUvSrcUniform", (ULONG)g_WinMaliStatUvSrcUniform);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1406,6 +1532,12 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             L"SyncBadFlags",  (ULONG)g_WinMaliStatSyncBadFlags);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"SyncWaitTmo",   (ULONG)g_WinMaliStatSyncWaitTimeout);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"SignalFail",    (ULONG)g_WinMaliStatSubmitSignalFail);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"SignalErr",     (ULONG)g_WinMaliStatSignalErr);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"SignalBadHnd",  (ULONG)g_WinMaliStatSignalBadHandle);
                     /* The CSF timeout diagnosis - CMD_PTR says WHERE the command
                        stream parked, BLOCKED_REASON says WHY, CsFault/CsFatal
                        cover the command-stream-only errors that leave the MMU
@@ -1424,6 +1556,32 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             L"CsFatal",      (ULONG)g_WinMaliStatCsFatal);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"CsCalleeRet",  (ULONG)g_WinMaliStatCsCalleeRet);
+                    /* What dxgk actually scans out, vs the surface our heuristic
+                       picked. If FlipW/H match the panel and FlipAllocId differs
+                       from the winner BO's alloc id, the heuristic is on the
+                       wrong buffer and that is why there is no taskbar. */
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"ApMapOps",     (ULONG)g_WinMaliApMapOps);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"ApMapMaxSize", (ULONG)g_WinMaliApMapMaxSize);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"ApMapLastSize",(ULONG)g_WinMaliApMapLastSize);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocW",   (ULONG)g_WinMaliFlipAllocW);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocH",   (ULONG)g_WinMaliFlipAllocH);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocPitch",(ULONG)g_WinMaliFlipAllocPitch);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocFmt", (ULONG)g_WinMaliFlipAllocFmt);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocSize",(ULONG)g_WinMaliFlipAllocSize);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocId",  (ULONG)g_WinMaliFlipAllocId);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocOk",  (ULONG)g_WinMaliFlipAllocOk);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipAllocBad", (ULONG)g_WinMaliFlipAllocBad);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"CsSubmits",    (ULONG)g_WinMaliStatCsSubmitCount);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1432,6 +1590,33 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             L"RingInsert",   (ULONG)g_WinMaliStatRingInsert);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"RingExtract",  (ULONG)g_WinMaliStatRingExtract);
+                    /* ★ THE SCANOUT ALLOCATION, SAMPLED FROM THE WORKER.
+                     * At flip time this always read NULL - flips happen at
+                     * mode-set and residency lands later, so the sample was
+                     * simply taken too early (dxgk then mapped that very
+                     * allocation: ApMapMaxSize == its exact size). The worker
+                     * runs ~30x a second and sees the steady state. Non-zero
+                     * here means the COMPOSED frame - taskbar and cursor
+                     * included - is finally reachable. */
+                    {
+                        PWINMALI_KMD_ALLOCATION fa =
+                            (PWINMALI_KMD_ALLOCATION)InterlockedCompareExchangePointer(
+                                (PVOID*)&g_WinMaliFlipAlloc, NULL, NULL);
+                        if (fa != NULL && fa->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+                            (VOID)InterlockedExchange(&g_WinMaliFlipWorkerMdl,
+                                (LONG)(fa->ApertureMdl != NULL ? 1 : 0));
+                            (VOID)InterlockedExchange(&g_WinMaliFlipWorkerPages,
+                                (LONG)fa->AperturePageCount);
+                        }
+                    }
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipSrcUsed",  (ULONG)g_WinMaliStatFlipSrcUsed);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipSrcMapFail",(ULONG)g_WinMaliStatFlipSrcMapFail);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipWorkerMdl", (ULONG)g_WinMaliFlipWorkerMdl);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"FlipWorkerPages",(ULONG)g_WinMaliFlipWorkerPages);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"CsReq",        (ULONG)g_WinMaliStatCsReq);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1505,22 +1690,31 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"LiveScanoutSkip", (ULONG)a->ScanoutBltSkipped);
 
-                    for (ci = 0; ci < 4; ++ci) {
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, boN[ci],
-                                (ULONG)g_WinMaliUvCandBo[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, pidN[ci],
-                                (ULONG)g_WinMaliUvCandPid[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, hitN[ci],
-                                (ULONG)g_WinMaliUvCandHits[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, pgN[ci],
-                                (ULONG)g_WinMaliUvCandPages[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, nbN[ci],
-                                (ULONG)g_WinMaliUvCandNonBlack[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, chN[ci],
-                                (ULONG)g_WinMaliUvCandChg[ci]);
-                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, scN[ci],
-                                (ULONG)g_WinMaliUvCandScans[ci]);
-                    }
+                    /* ⛔★★★★★★ THESE 28 VALUES WERE COSTING US EVERY NEW COUNTER.
+                     *
+                     * `Parameters` caps at 127 values. This block published
+                     * 7 fields x 4 candidate slots = 28 of them EVERY tick, and
+                     * with the rest of the telemetry the key regenerates to ~204
+                     * within a minute of every boot. Past the cap, CREATING a new
+                     * value silently fails - so any counter added late in the
+                     * publish order can never exist, and its absence is
+                     * indistinguishable from "the code never ran".
+                     *
+                     * That ambiguity has now cost four wrong readings in one
+                     * session: StatUvSrcAsked=0 (read as "AcquireBest never ran"
+                     * when it had run 1674 times), StatUvProbe, StatPowerStop,
+                     * and StatUvMaxCov. Each time I reasoned about driver
+                     * behaviour from a number the registry had refused to store.
+                     *
+                     * The candidate rows are also superseded: they predate the
+                     * per-slot Pitch/Size/coverage data, and the winner's own
+                     * figures plus StatUvMaxCov answer the question they were
+                     * added for ("was something better available?") in 2 values
+                     * instead of 28.
+                     *
+                     * ⇒ Deleted. Budget is a correctness property of the
+                     * instrument, not a tidiness concern. */
+                    UNREFERENCED_PARAMETER(ci);
                 }
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatApPrevSrc",         (ULONG)g_WinMaliStatApPrevSrc);
@@ -1528,6 +1722,22 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"StatPresentNullCookie", (ULONG)g_WinMaliStatPresentNullCookie);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatPresentBlts",       (ULONG)g_WinMaliStatPresentBlts);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenCalls",         (ULONG)g_WinMaliStatOpenCalls);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPawmReg",           (ULONG)g_WinMaliStatPawmRegistered);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenByPawm",        (ULONG)g_WinMaliStatOpenByPawm);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenResolved",      (ULONG)g_WinMaliStatOpenResolved);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenById",          (ULONG)g_WinMaliStatOpenById);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenFailed",        (ULONG)g_WinMaliStatOpenFailed);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenFailPdMagic",   (ULONG)g_WinMaliStatOpenFailPdMagic);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatOpenFailPdSize",    (ULONG)g_WinMaliStatOpenFailPdSize);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatPresentFlips",      (ULONG)g_WinMaliStatPresentFlips);
                 /* Proof-of-life for OUR UMD's _Present, under names NOTHING else
@@ -1554,10 +1764,52 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"StatPresentPrivSize",   (ULONG)g_WinMaliStatPresentPrivSize);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatPresentPrivHits",   (ULONG)g_WinMaliStatPresentPrivHits);
+                /* ⛔★★★★★★ THESE TWO NAMES WERE OVERLOADED AND IT COST HOURS.
+                 *
+                 * They used to publish `0x5000 + someOtherCounter` under names
+                 * that say "Handle", while DxgkDdiPresent ALSO wrote the real
+                 * handles into the same globals - one value name, TWO writers,
+                 * the exact trap this codebase already warns about, done
+                 * deliberately to save registry slots and labelled OVERLOADED in
+                 * a trailing comment I did not read.
+                 *
+                 * EVERY "handle" quoted this session - 20480, 21202, 21898,
+                 * 20794, 0x53A2 - was this overload: src constant because
+                 * ApWithContent=0, dst climbing because it is the UMD's _Present
+                 * context count. It produced "handles that change while the
+                 * present count is frozen", which I chased as a real anomaly, and
+                 * it made the DDI's actual handles INVISIBLE for the whole
+                 * investigation.
+                 *
+                 * ⇒ Overloaded names are not a slot-saving trick, they are a
+                 * measurement that lies. The cap is fixed properly now (reserved
+                 * slots), so publish the truth under names with ONE writer each.
+                 * The old names keep their overloaded meaning ONLY because older
+                 * notes quote them; the *Real names are the ones to trust. */
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                        L"StatPresentSrcHandle",  (ULONG)(0x5000u + (ULONG)g_WinMaliStatApWithContent));   /* OVERLOADED: +0x5000 = apertureWithContent */
+                        L"StatPresSrcHReal",      (ULONG)g_WinMaliStatPresentSrcHandle);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                        L"StatPresentDstHandle",  (ULONG)(0x5000u + (ULONG)g_WinMaliStatUmdPresentCtx));   /* OVERLOADED: +0x5000 = UMD _Present ctx */
+                        L"StatPresSrcRectTL",     (ULONG)g_WinMaliStatPresSrcRectTL);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresSrcRectBR",     (ULONG)g_WinMaliStatPresSrcRectBR);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresDstRectTL",     (ULONG)g_WinMaliStatPresDstRectTL);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresDstRectBR",     (ULONG)g_WinMaliStatPresDstRectBR);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresSubRectCnt",    (ULONG)g_WinMaliStatPresSubRectCnt);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresDmaSize",       (ULONG)g_WinMaliStatPresDmaSize);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresMultipass",     (ULONG)g_WinMaliStatPresMultipass);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresColor",         (ULONG)g_WinMaliStatPresColor);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresDstHReal",      (ULONG)g_WinMaliStatPresentDstHandle);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatApWithContent2",    (ULONG)g_WinMaliStatApWithContent);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUmdPresentCtx2",    (ULONG)g_WinMaliStatUmdPresentCtx);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatPresentDmaPrivSize",(ULONG)g_WinMaliStatPresentDmaPrivSize);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1682,6 +1934,52 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                 PWINMALI_KMD_ALLOCATION src = NULL;
                 PUCHAR                  srcVa = NULL;
                 ULONG                   s;
+                /* ⛔★★★★★ THE USE-REF LEAK SWEEP.
+                 *
+                 * AcquireBest and ReacquireVa both take a use-ref that
+                 * WinMaliUvSrcRevoke blocks on, so it MUST be dropped once per
+                 * acquisition. The release below sits after the copy, but this
+                 * block has several `continue` paths and one missed path would
+                 * stall every future BO teardown for the full 1 s timeout.
+                 * Rather than audit every exit, sweep at the TOP of the next
+                 * iteration: worst case a ref is held ~one tick (~30 ms) longer
+                 * than needed, and a leak can never accumulate.
+                 * ★ Only one worker thread touches this, so a plain static is
+                 * sufficient - and the sweep runs BEFORE any new acquisition, so
+                 * it can never drop a ref this iteration just took. */
+                static ULONG            s_pendingUse = 0;
+                if (s_pendingUse != 0) {
+                    WinMaliUvSrcEndUse(s_pendingUse);
+                    s_pendingUse = 0;
+                }
+                /* ⛔★★★★★ WHICH BRANCH ACTUALLY SET srcVa. Set it WHERE srcVa is
+                 * assigned - never inferred afterwards.
+                 *
+                 * My first attempt at this computed the "source path" in the copy
+                 * block from whether the flip allocation happened to be non-NULL:
+                 *     (ga != NULL && gaVa != NULL) ? 1 : 2
+                 * `ga` is read there unconditionally, so it reported 1 (VidMm)
+                 * even with FlipSrcFromVidMm=0 and the VidMm branch compiled out
+                 * of the path. It measured "does that allocation exist", not
+                 * "did we read from it" - and I nearly concluded the knob was
+                 * broken. Same trap as StatUvSrcChg: a counter next to the thing
+                 * it claims to describe is not the same as a counter ON it.
+                 *
+                 * 0 = none, 1 = VidMm aperture MDL, 2 = 0x93 probe-locked BO. */
+                ULONG                   srcPath = 0;
+                /* Handle of the uv candidate srcVa came from, so the copy loop can
+                   re-check it is still live between slices (we no longer hold the
+                   table lock across the copy - that wedged DWM). 0 = not from uv. */
+                ULONG                   uvHandleForCopy = 0;
+                /* Row pitch of the adopted source, 0 = unknown/assume panel pitch. */
+                ULONG                   srcPitch = 0;
+                /* Real byte size of the adopted source. Clamping rows by the
+                   FRAME size instead is only a guaranteed LOWER bound: measured
+                   StatWinRows=1820 against a surface that actually holds 1856
+                   rows, so 20 rows of panel went unpainted for no reason.
+                   Over-trusting it walks off a locked MDL, so only widen when
+                   the source itself reports a larger extent. */
+                SIZE_T                  srcBytes = 0;
                 /* TRUE => srcVa points into a 0x93 BO and we hold the candidate
                    table lock, which must be released after the copy. */
                 BOOLEAN                 uvHeld = FALSE;
@@ -1852,7 +2150,137 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                     }
                 }
 
-                /* 🎯 FIRST CHOICE: A PAINTED 0x93 BO.
+                /* 🏆 TRUE FIRST CHOICE: THE ALLOCATION DXGK ACTUALLY SCANS OUT.
+                 *
+                 * Everything below this is a HEURISTIC for a question the OS
+                 * answers directly. DxgkDdiSetVidPnSourceAddress hands us
+                 * hAllocation - our own WINMALI_KMD_ALLOCATION for the surface
+                 * being scanned out - on every flip. Scoring imported surfaces
+                 * by "painted and freshest" instead latched DWM's RENDER TARGET,
+                 * which is why the panel showed a full desktop with NO TASKBAR
+                 * and NO CURSOR: those are composited into the flip primary,
+                 * which the heuristic never even considered.
+                 *
+                 * This became usable only with the dxgk-native gates on. With
+                 * escape submit, VidMm never grants residency to anything
+                 * (measured ApMapOps == 0), so the primary had no MDL and this
+                 * branch could not exist. With ADDR/SUBMIT=1: ApMapOps 104,
+                 * ApMapMaxSize 21,667,840, FlipWorkerMdl 1, FlipWorkerPages 5290
+                 * - an exact match for the primary.
+                 *
+                 * ⚠ The MDL is VidMm's and is only valid while the allocation is
+                 * resident; UNMAP_APERTURE_SEGMENT clears the stash. Re-read it
+                 * every tick and never cache the mapped VA across ticks.
+                 * ⚠ Require the full extent - a partial mapping would be read as
+                 * a short surface, the same class of bug as the 262-row clamp. */
+                /* ⛔★★★★★★ READING VidMm's APERTURE MDL HANGS THE MACHINE.
+                 *
+                 * PROVEN 2026-08-17 by running an armed boot with
+                 * `Parameters\PresentTestPattern=1`, which paints colour bars and
+                 * NEVER touches srcVa. The panel showed clean bars with a smoothly
+                 * moving band, the box stayed up - and everything that had looked
+                 * independently broken all session came right at once:
+                 *     dwm ON OUR UMD · LiveFlipLatch 1 -> 2 (pinned at 1 for
+                 *     every previous build) · StatPresentCalls 0 -> 23 ·
+                 *     GROUP_SUBMIT failures 0 · 1929/1929 submits · 0 crashes.
+                 * One cause, four symptoms.
+                 *
+                 * MECHANISM (fits a HANG with no bugcheck): this VA maps memory
+                 * VidMm owns. Touching a page that is not resident faults; VidMm
+                 * must page it in; it queues a paging operation; that operation is
+                 * serviced by THIS driver - while our worker thread is blocked
+                 * inside the fault. Deadlock, no crash, machine wedged.
+                 *
+                 * ⇒ NEVER read VidMm memory from the present worker. Read only
+                 * pages WE probe-locked ourselves - that is the 0x93 BoFromUserVa
+                 * path (MmProbeAndLockPages), which previously delivered a full
+                 * desktop at nonBlack 646/646.
+                 *
+                 * `FlipSrcFromVidMm` (default 0) exists only to re-test this
+                 * deliberately; leave it 0. Earlier today I made this VidMm path
+                 * take PRIORITY over 0x93 - that is what introduced the hang. */
+                if (srcVa == NULL && g_WinMaliFlipSrcFromVidMm != 0) {
+                    PWINMALI_KMD_ALLOCATION fa =
+                        (PWINMALI_KMD_ALLOCATION)InterlockedCompareExchangePointer(
+                            (PVOID volatile *)&g_WinMaliFlipAlloc, NULL, NULL);
+                    if (fa != NULL && fa->Magic == WINMALI_KMD_ALLOC_MAGIC &&
+                        fa->ApertureMdl != NULL &&
+                        (SIZE_T)fa->AperturePageCount * PAGE_SIZE >= bytes) {
+                        /* ⛔ READ THE CACHED VA - DO NOT MAP HERE.
+                           This used to call MmGetSystemAddressForMdlSafe on
+                           VidMm's MDL every tick (~30/s). VidMm can tear that
+                           MDL down between the NULL check above and the call,
+                           and the machine reboot-looped: desktop, then instant
+                           reset, repeatedly. The mapping now happens once in
+                           MAP_APERTURE_SEGMENT where the MDL is known valid,
+                           and UNMAP clears ApertureVa before ApertureMdl. */
+                        PUCHAR fv = (PUCHAR)fa->ApertureVa;
+                        if (fv != NULL) {
+                            /* ★ INVALIDATE BEFORE READING - the 0x93 path already
+                               does this and this one did not.
+                               ApertureVa is a CACHED system mapping. Whoever last
+                               wrote these pages (the GPU, or the display engine)
+                               did not do it through this CPU's caches, so without
+                               an invalidate we can read the bytes that were there
+                               when the mapping was created and never see an
+                               update - a surface that is non-black, structured,
+                               and FROZEN, which is exactly the symptom we have
+                               been chasing. WinMaliUvSelectSrc flushes its MDL for
+                               precisely this reason (WinMaliBo.c). Same call, same
+                               argument order, on the path we actually take.
+                               Safe at any IRQL. */
+                            if (fa->ApertureMdl != NULL) {
+                                KeFlushIoBuffers(fa->ApertureMdl, TRUE, TRUE);
+                            }
+                            /* The stash records where in the MDL this allocation
+                               starts; AperturePageCount is a COUNT, not a total. */
+                            srcVa = fv + ((SIZE_T)fa->ApertureMdlOffset * PAGE_SIZE);
+                            srcPath = 1;   /* VidMm aperture MDL */
+                            (VOID)InterlockedIncrement(&g_WinMaliStatFlipSrcUsed);
+
+                            /* ★★★★★ PUBLISH THE SOURCE'S GEOMETRY, NOT JUST THAT
+                             * BYTES MOVED.
+                             *
+                             * Every counter here measures whether a copy HAPPENED;
+                             * none measure whether it was the right SHAPE. A 4 MB
+                             * 1024x1024 surface smeared across a 2944x1840 scanout
+                             * at pitch 11776 reports as a perfect success - Blts
+                             * climbs, FlipSrcUsed climbs, StatSrcNonBlack finds
+                             * content - while the panel shows a slanted band over
+                             * the top ~19% (4194304/11776 = 356 of 1840 rows, and
+                             * src pitch 4096 vs dst 11776 walks the diagonal).
+                             * The user's photo of the panel showed exactly that.
+                             *
+                             * So publish what we are ABOUT TO COPY FROM. If this
+                             * reports 1024x1024 pitch 4096 while we copy `bytes`
+                             * at WINMALI_FB_STRIDE, the mismatch IS the picture.
+                             * Rate-limited to the sampler's cadence; StatGeo* so
+                             * the deploy's ^Stat purge sweeps it (a Src* name
+                             * would escape the deny-list and risk the 127 cap). */
+                            {
+                                static LONG64 s_geoTick = 0;
+                                if ((InterlockedIncrement64(&s_geoTick) % 120) == 1) {
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoW",     (ULONG)fa->Width);
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoH",     (ULONG)fa->Height);
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoPitch", (ULONG)fa->Pitch);
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoPages", (ULONG)fa->AperturePageCount);
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoBytes", (ULONG)bytes);
+                                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                            L"StatGeoDstPitch", (ULONG)WINMALI_FB_STRIDE);
+                                }
+                            }
+                        } else {
+                            (VOID)InterlockedIncrement(&g_WinMaliStatFlipSrcMapFail);
+                        }
+                    }
+                }
+
+                /* 🎯 FALLBACK: A PAINTED 0x93 BO.
                  *
                  * ⛔ THIS USED TO BE A LAST RESORT, AFTER the aperture branches,
                  * AND THAT MADE IT DEAD CODE. Measured with gates off, nonce
@@ -1873,21 +2301,197 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                  * the copy. */
                 {
                     ULONG uvHandle = 0, uvHits = 0;
-                    PVOID uv = WinMaliUvSrcAcquireBest(bytes,
-                                                       WINMALI_FB_STRIDE,
-                                                       WINMALI_FB_HEIGHT,
-                                                       &uvHandle, &uvHits);
-                    (VOID)InterlockedExchange(&g_WinMaliStatUvSrcHits,
-                                              (LONG)uvHits);
+                    PVOID uv = NULL;
+                    ULONG latched;
+
+                    /* ⛔★★★★★ PROVE THIS BLOCK RUNS - DO NOT INFER IT.
+                     *
+                     * MEASURED 1208: StatUvSrcAsked=0 and StatUvSrcCands=0 while
+                     * Stat0x93Calls=81/81 OK and StatDbgSrcPath=2. i.e. DWM
+                     * registered 81 surfaces, and the consumer of those surfaces
+                     * apparently never ran - yet this block is UNCONDITIONAL and
+                     * sits above the aperture branch that did run. That is a flat
+                     * contradiction, so one of the two readings is lying.
+                     *
+                     * StatUvSrcAsked is incremented INSIDE AcquireBest and only
+                     * AFTER its `NeedBytes == 0` early return, so it cannot
+                     * distinguish "never called" from "called with bytes==0" -
+                     * and a counter that cannot split its outcomes is not an
+                     * oracle. These two write from OUTSIDE any branch:
+                     *   StatUvProbe = 0xC0DE  - this block executed, full stop
+                     *   StatUvBytes = bytes   - what we actually passed in
+                     * Absent probe  => the block never runs (or the key is full).
+                     * Probe + bytes=0 => AcquireBest bailed before counting.
+                     * Probe + bytes=21667840 => it ran and Asked's channel is
+                     * broken, which would make every Uv* zero this session
+                     * meaningless. Flushed, first 3 passes only. */
+                    {
+                        static LONG s_uvProbe = 0;
+                        if (InterlockedIncrement(&s_uvProbe) <= 3) {
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatUvProbe", 0xC0DEu);
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatUvBytes", (ULONG)bytes);
+                        }
+                    }
+
+                    latched = (ULONG)InterlockedCompareExchange(
+                                  &g_WinMaliUvLatchBo, 0, 0);
+
+                    /* ⛔★★★★★ ONE SOURCE PER SWEEP - DO NOT RE-SELECT MID-FRAME.
+                     *
+                     * A wake copies at most 2 MB, so a 21,667,840 B frame needs
+                     * ~11 wakes. This block used to run AcquireBest on every one
+                     * of them, and AcquireBest deliberately picks the MOST
+                     * RECENTLY WRITTEN surface - so consecutive strips of a
+                     * single scanout came from DIFFERENT buffers composed at
+                     * different instants.
+                     *
+                     * USER-OBSERVED, 1208: "the lines were changing places on
+                     * every reprint". That is not tearing in the ordinary sense;
+                     * it is a mosaic, and it is what re-selecting mid-frame
+                     * must produce.
+                     *
+                     * So: latch the winner when a sweep starts and re-resolve
+                     * that same handle for the rest of the sweep. The latch is
+                     * dropped when the sweep wraps (next frame gets a fresh,
+                     * newer surface) or when the candidate dies. */
+                    if (latched != 0) {
+                        uv = WinMaliUvSrcReacquireVa(latched, &srcPitch, &srcBytes);
+                        if (uv != NULL) {
+                            uvHandle = latched;
+                            uvHits   = 1;   /* it qualified when it was latched */
+                        } else {
+                            /* Candidate freed under us - restart the sweep from
+                               the top rather than splicing in a different one. */
+                            (VOID)InterlockedExchange(&g_WinMaliUvLatchBo, 0);
+                            (VOID)InterlockedIncrement(&g_WinMaliStatLatchDrop);
+                            latched = 0;
+                        }
+                    }
+                    if (uv == NULL) {
+                        uv = WinMaliUvSrcAcquireBest(bytes,
+                                                     WINMALI_FB_STRIDE,
+                                                     WINMALI_FB_HEIGHT,
+                                                     &uvHandle, &uvHits, &srcPitch, &srcBytes);
+                        (VOID)InterlockedExchange(&g_WinMaliStatUvSrcHits,
+                                                  (LONG)uvHits);
+                        uvHeld = (uv != NULL);
+                    }
+                    /* ⛔★★★★★★ HOLD THE LAST GOOD SOURCE — THIS IS THE STUTTER.
+                     *
+                     * USER-OBSERVED with PresentMarker=1: the marker "flashes
+                     * quickly, then the render freezes, then continues - rinse and
+                     * repeat". MEASURED, same cadence: `StatUvQual` alternates
+                     * 1,0,1,0 tick to tick. On a qual=0 tick NOTHING qualifies,
+                     * srcVa stays NULL, and the worker takes the `continue` below
+                     * (StatSkipNoSrc) - so it paints nothing at all and the panel
+                     * sits frozen until a candidate happens to qualify again.
+                     *
+                     * Skipping was the right call when the alternative was reading
+                     * aperture memory we do not own. It is the WRONG call when we
+                     * still hold a perfectly good probe-locked surface from the
+                     * last sweep: a slightly stale frame is strictly better than a
+                     * frozen one, and it is the same memory we were legitimately
+                     * reading a moment ago.
+                     *
+                     * Prefer a fresh winner whenever there is one (this only runs
+                     * when there is not), and re-resolve through the normal path so
+                     * the use-ref and Dying checks still apply - if the surface has
+                     * since been freed this yields NULL and we skip as before. */
+                    if (uv == NULL) {
+                        ULONG lastGood = (ULONG)InterlockedCompareExchange(
+                                             &g_WinMaliUvLastGoodBo, 0, 0);
+                        if (lastGood != 0) {
+                            uv = WinMaliUvSrcReacquireVa(lastGood, &srcPitch, &srcBytes);
+                            if (uv != NULL) {
+                                uvHandle = lastGood;
+                                uvHits   = 1;   /* it qualified when it was adopted */
+                                (VOID)InterlockedIncrement(&g_WinMaliStatUvHeldOver);
+                            } else {
+                                (VOID)InterlockedExchange(&g_WinMaliUvLastGoodBo, 0);
+                            }
+                        }
+                    }
                     if (uv != NULL && uvHits > 0) {
                         srcVa  = (PUCHAR)uv;
-                        uvHeld = TRUE;
+                        /* ⛔★★★★★ THIS IS THE SOURCE THAT IS ACTUALLY USED (3).
+                         *
+                         * I instrumented the two aperture branches (1 = VidMm,
+                         * 2 = aperture-by-AllocId) and MISSED THIS ONE, because my
+                         * grep was `srcVa = ` and this line is `srcVa  = ` with two
+                         * spaces. StatDbgSrcPath then read 0 on a pass that had
+                         * definitely copied - and the counter was RIGHT: neither
+                         * instrumented branch had run.
+                         * ★ When a well-formed counter reports something
+                         * "impossible", suspect the MODEL before the counter. */
+                        srcPath = 3;   /* 0x93 uv candidate, AcquireBest */
+                        uvHandleForCopy = uvHandle;   /* re-checked between slices */
+                        /* Whichever of AcquireBest/ReacquireVa produced `uv` took
+                           a use-ref on this handle. Record it so it is dropped -
+                           by the release after the copy, or failing that by the
+                           sweep at the top of the next iteration. */
+                        s_pendingUse = uvHandle;
+
+                        /* ⛔★★★★★★ RELEASE THE TABLE LOCK NOW - DO NOT HOLD IT
+                         * ACROSS THE COPY. THIS IS THE WEDGE.
+                         *
+                         * AcquireBest returns holding g_WinMaliUvSrcLock (a
+                         * KMUTEX) and the old code released it at the END of the
+                         * whole block - line ~2121 to ~2564, spanning the pixel
+                         * sampler, the 2 MB copy, AND (as of today) five
+                         * ZwFlushKey calls, each a synchronous DISK WRITE.
+                         *
+                         * The other user of that mutex is WinMaliUvSrcPublish,
+                         * called from the **0x93 escape path** - i.e. from DWM and
+                         * from every app registering a surface. So while this
+                         * worker copies and flushes, DWM BLOCKS in its escape, and
+                         * everything upstream of DWM blocks behind it.
+                         *
+                         * That is exactly the reported symptom: the EDK2 spinner
+                         * FROZEN while our blue bar keeps flashing. The worker is
+                         * alive because it OWNS the lock; the system is wedged
+                         * because it does not. And my own flushed instrumentation
+                         * widened the hold window, which is why the failure point
+                         * kept moving (13 -> 20 -> 40 passes) - I was aggravating
+                         * the bug I was measuring.
+                         *
+                         * Safe to release early: the pages behind srcVa are
+                         * PROBE-LOCKED by the 0x93 BO (MmProbeAndLockPages) and
+                         * stay resident until BoFree, so the copy does not need
+                         * the table lock - only the SELECTION did.
+                         *
+                         * ⚠ Only AcquireBest returns holding the lock. The latched
+                         * path came from WinMaliUvSrcReacquireVa, which takes and
+                         * drops it internally - releasing again there would be an
+                         * unowned release. Hence the uvHeld guard. */
+                        if (uvHeld) {
+                            WinMaliUvSrcRelease();
+                            uvHeld = FALSE;
+                        }
+                        /* Latch this winner for the rest of the sweep. */
+                        (VOID)InterlockedExchange(&g_WinMaliUvLatchBo,
+                                                  (LONG)uvHandle);
+                        /* Remember it beyond this sweep so a tick where nothing
+                           qualifies can keep painting instead of freezing. */
+                        (VOID)InterlockedExchange(&g_WinMaliUvLastGoodBo,
+                                                  (LONG)uvHandle);
                         (VOID)InterlockedExchange(&g_WinMaliStatUvSrcBo,
                                                   (LONG)uvHandle);
                     } else if (uv != NULL) {
                         /* Candidates exist but none is painted - hand the lock
-                           back and let the aperture branches try. */
-                        WinMaliUvSrcRelease();
+                           back and let the aperture branches try.
+                           ⚠ A use-ref was still taken by whichever call produced
+                           `uv`, and we are NOT adopting it, so drop it right here
+                           - s_pendingUse is never set on this path and the sweep
+                           would not know to. */
+                        if (uvHeld) {
+                            WinMaliUvSrcRelease();
+                            uvHeld = FALSE;
+                        }
+                        if (uvHandle != 0) {
+                            WinMaliUvSrcEndUse(uvHandle);
+                        }
                     }
                 }
 
@@ -1930,7 +2534,28 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                 /* ⚠ `srcVa == NULL &&` IS LOAD-BEARING: without it the aperture
                    branch overwrites a 0x93 source we already adopted above, and
                    we would silently go back to scanning out the empty surface. */
-                if (srcVa == NULL && src != NULL) {
+                /* ⛔★★★★★★ THIS IS AN APERTURE READ, NOT A 0x93 READ.
+                 *
+                 * The srcPath=2 label below says "0x93 probe-locked BO (uv
+                 * candidate)". IT IS NOT. This branch maps `src->ApertureMdl` -
+                 * a dxgk allocation's aperture MDL - which is the SAME class of
+                 * memory as the VidMm branch above that is gated off with a
+                 * six-paragraph warning saying it HANGS THE MACHINE. I believed
+                 * the comment instead of the code and left the dangerous read
+                 * wide open on the fallback path.
+                 *
+                 * MEASURED 1209: StatUvSrcTooSmall=404 of 501 candidates, so the
+                 * uv selection FAILS most ticks and falls through to exactly this
+                 * branch; StatDbgSrcPath=2 for the whole logged window. The run
+                 * reached 203 full sweeps - far longer than any before - and still
+                 * wedged. Every remaining wedge candidate points here.
+                 *
+                 * Same treatment as VidMm: gate it, default OFF. If no 0x93
+                 * candidate qualifies we now SKIP the frame (the `srcVa == NULL`
+                 * continue below) instead of reading memory we do not own.
+                 * A skipped frame is a stale panel; an aperture read is a dead box.
+                 * `FlipSrcFromAperture=1` re-enables it to re-test deliberately. */
+                if (srcVa == NULL && src != NULL && g_WinMaliFlipSrcFromAperture != 0) {
                     PUCHAR base = (PUCHAR)MmGetSystemAddressForMdlSafe(
                                       src->ApertureMdl, NormalPagePriority | MdlMappingNoExecute);
                     if (base != NULL) {
@@ -1946,15 +2571,111 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             off = (SIZE_T)(flipAddr - src->GpuVa);
                         }
                         srcVa = base + (SIZE_T)src->ApertureMdlOffset * PAGE_SIZE + off;
+                        srcPath = 2;   /* APERTURE MDL of a dxgk allocation (gated) */
                     }
                 }
 
                 if (srcVa == NULL) {
                     /* No aperture allocation covers this address (or the MDL
                        could not be mapped). Do not fall back to DmaSegmentVa -
-                       that is exactly the bug being fixed. */
+                       that is exactly the bug being fixed.
+                       ★ With the aperture branch gated off this is now the NORMAL
+                       outcome whenever no 0x93 candidate qualifies (404 of 501
+                       were under-size last run), so count it: a huge SkipNoSrc
+                       with a healthy StatSweeps means we are simply idling
+                       between good frames, which is the intended behaviour. */
                     (VOID)InterlockedIncrement64(&a->ScanoutBltSkipped);
+                    (VOID)InterlockedIncrement(&g_WinMaliStatSkipNoSrc);
                     continue;
+                }
+
+                /* ⛔★★★★★ WHERE DOES THE SOURCE'S CONTENT END?
+                 *
+                 * THE ONE MEASUREMENT THAT SPLITS THE REMAINING HYPOTHESIS.
+                 * The user reports the panel filling to ~50% and no further, on
+                 * build after build. MEASURED 1209: the copy loop writes all
+                 * 21,667,840 bytes (StatDbgPass==StatDbgDone, StatCopyAbort=0,
+                 * StatSweeps=203 complete frames), and PresentTestPattern=1 paints
+                 * clean bars over the WHOLE panel without ever touching srcVa.
+                 * So the destination and the copy are both proven good for the
+                 * full extent, and the deficit must be in what the SOURCE holds.
+                 *
+                 * Walk the source top to bottom and record the LAST row that has
+                 * any non-black sample:
+                 *   StatSrcLastRow  ~920  => the source is half-painted. The 50%
+                 *                            is DWM's surface, not our copy, and
+                 *                            the fix is upstream in selection.
+                 *   StatSrcLastRow ~1840  => the source is full and something
+                 *                            downstream eats the bottom half.
+                 * StatSrcRowsNZ counts how many sampled rows had content, so a
+                 * sparse/striped source cannot masquerade as a full one, and
+                 * StatSrcFirstRow catches an offset (content starting mid-buffer).
+                 *
+                 * ⚠ ONLY on srcPath 3 - pages WE probe-locked. Walking an aperture
+                 * or VidMm mapping is the deadlock this driver already has two
+                 * knobs to prevent. Every 120th tick; 1840/8 rows x 16 columns is
+                 * ~3.7k reads, negligible beside the 2 MB copy it sits next to. */
+                /* ⚠ THIS WAS `srcPath == 3` ONLY - and that gate meant the ONE path
+                 * that sees DWM's ACTUAL FLIP TARGET was the one path we refused
+                 * to measure, so its extent had to be eyeballed off the panel.
+                 *
+                 * The gate existed because reading an aperture/VidMm mapping was
+                 * believed to deadlock the worker. REFUTED 2026-08-17: with the
+                 * BoFree/system-VA race fixed, FlipSrcFromVidMm=1 ran with the
+                 * marker updating rapidly and no hang. That old verdict was the
+                 * BoFree race in disguise - the aperture path had survived 203
+                 * sweeps while the 0x93-only build died in 2 redraws, the opposite
+                 * of what a deadlocking read predicts.
+                 * ⇒ Measure whichever source we actually adopted, and publish
+                 * WHICH one it was so the extent is never attributed to the wrong
+                 * buffer. */
+                if (srcVa != NULL) {
+                    static LONG64 s_extTick = 0;
+                    /* ⛔★★★★★ WALK THE SOURCE AT THE SOURCE'S PITCH.
+                     *
+                     * This probe used WINMALI_FB_STRIDE - the PANEL pitch - to
+                     * step rows in a buffer whose real pitch is something else.
+                     * MEASURED: the source is 2976x1856 at pitch 11904, not
+                     * 2944x1840 at 11776, so every "row" this probe looked at was
+                     * offset from a real one and its answer (StatSrcLastRow=984)
+                     * described the probe's own striding, not the content.
+                     * ★ A measurement taken with the wrong geometry is not a
+                     * weaker measurement, it is a different question. */
+                    const ULONG probePitch =
+                        (srcPitch != 0) ? srcPitch : WINMALI_FB_STRIDE;
+                    if ((InterlockedIncrement64(&s_extTick) % 120) == 1) {
+                        ULONG y, x, first = 0xFFFFFFFFu, last = 0, rowsNz = 0;
+                        ULONG probeRows = (ULONG)(bytes / probePitch);
+                        if (probeRows > WINMALI_FB_HEIGHT) { probeRows = WINMALI_FB_HEIGHT; }
+                        for (y = 0; y < probeRows; y += 8) {
+                            const ULONG *row =
+                                (const ULONG *)(srcVa + (SIZE_T)y * probePitch);
+                            BOOLEAN nz = FALSE;
+                            for (x = 0; x < (probePitch / 4); x += (probePitch / 64)) {
+                                if ((row[x] & 0x00FFFFFFu) != 0) { nz = TRUE; break; }
+                            }
+                            if (nz) {
+                                rowsNz++;
+                                last = y;
+                                if (first == 0xFFFFFFFFu) { first = y; }
+                            }
+                        }
+                        if (first == 0xFFFFFFFFu) { first = 0; }
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcLastRow",  last);
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcFirstRow", first);
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcRowsNZ",   rowsNz);
+                        /* WHICH source the extent above describes: 1=VidMm flip
+                           target (DWM's real primary), 2=aperture, 3=0x93 layer.
+                           Without it the numbers get attributed to the wrong
+                           buffer, which is how "52%" crossed paths by eye. */
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcPathMeas", srcPath);
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcProbePitch", probePitch);
+                    }
                 }
 
                 /* Prove the source now has content. Same sparse grid as the
@@ -1962,8 +2683,26 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                    it read nonBlack=0 out of 646 from DmaSegmentVa. */
                 {
                     static LONG64 s_srcTick = 0;
+                    /* ★ LIVENESS FOR *THIS* SOURCE PATH.
+                     *
+                     * StatUvSrcChg is written in WinMaliUvSelectSrc (WinMaliBo.c),
+                     * i.e. the 0x93 user-VA heuristic. The worker now prefers
+                     * dxgk's own flip allocation, and Blts == FlipSrcUsed on every
+                     * tick proves that branch wins every time - so UvSelectSrc is
+                     * never called and StatUvSrcChg sits FROZEN at a stale value.
+                     * Reading it as "the surface never repaints" is reading a
+                     * counter on a branch we no longer take.
+                     *
+                     * This hash rides the sampler that is already looking at the
+                     * bytes we actually copy, so it answers the real question:
+                     * does the content of the scanned surface change over time?
+                     * One value name, ONE writer - published nowhere else. */
+                    static ULONG   s_srcHash    = 0;
+                    static ULONG   s_srcChg     = 0;
+                    static BOOLEAN s_haveSrcHash = FALSE;
                     if ((InterlockedIncrement64(&s_srcTick) % 120) == 1) {
                         ULONG orAll = 0, nonBlack = 0, sampled = 0, y, x;
+                        ULONG srcHash = 2166136261u;
                         /* ★ WHERE is the content? The user reports ~15% on the
                          * RIGHT side with the taskbar entirely absent, which is a
                          * very different bug from "content is scattered". Build a
@@ -1997,9 +2736,15 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                                 if (havePrev && px != prevPx) { edges++; }
                                 prevPx   = px;
                                 havePrev = TRUE;
+                                /* Order-sensitive, so a permutation of the same
+                                   pixels still registers as a change. */
+                                srcHash = (srcHash * 33u) ^ px;
                                 sampled++;
                             }
                         }
+                        if (s_haveSrcHash && srcHash != s_srcHash) { s_srcChg++; }
+                        s_srcHash     = srcHash;
+                        s_haveSrcHash = TRUE;
                         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                                 L"StatSrcEdges", (ULONG)edges);
                         /* Tagged with bit31 so it can never be confused with the
@@ -2071,13 +2816,354 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                                 L"StatSrcNonBlack", (ULONG)nonBlack);
                         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                                 L"StatSrcSampled", (ULONG)sampled);
+                        /* Scans is the channel proof: if StatSrcScans climbs but
+                           StatSrcChg does not, the surface really is static. If
+                           Scans is <absent> or frozen, this sampler never ran and
+                           NEITHER number means anything (the Parameters key caps
+                           at 127 values and silently drops new names). */
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcChg", (ULONG)s_srcChg);
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcScans", (ULONG)(ULONG64)s_srcTick);
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                L"StatSrcHash", (ULONG)srcHash);
                     }
                 }
 
-                /* Source and destination are both WINMALI_FB_STRIDE-pitched
-                   X8R8G8B8 at the panel's native size, so this is one flat
-                   copy. */
-                RtlCopyMemory(a->ScanoutVa, srcVa, bytes);
+                /* ⛔★★★★★ DO NOT HOLD A 21 MB memcpy OVER MEMORY VidMm OWNS.
+                 *
+                 * This used to be one flat RtlCopyMemory of ~21 MB. srcVa is a
+                 * system VA mapped over VidMm's aperture MDL - memory ANOTHER
+                 * COMPONENT is free to evict, unmap or repurpose. A single copy
+                 * of that size takes many milliseconds, and if the allocation
+                 * moves underneath us mid-copy the CPU faults or stalls with the
+                 * machine wedged.
+                 *
+                 * USER-OBSERVED, and this is what identified it: when armed, the
+                 * panel paints SLOWLY, leaving a band of bright lines across the
+                 * TOP and black below - then the box HANGS. It did this more than
+                 * once and **painted LESS the second time**. A flat copy fills the
+                 * framebuffer ROW-MAJOR TOP-DOWN, so that band is literally HOW
+                 * FAR THE COPY GOT before the machine died: taller = died later.
+                 * ⇒ A symptom whose MAGNITUDE varies between runs is a PROGRESS
+                 * INDICATOR, not a geometry error. (I twice mis-read it as a
+                 * stride bug, then as a crash-time artifact.)
+                 *
+                 * So: copy in slices, and between slices re-check that the
+                 * allocation we started from still holds the SAME mapping. If it
+                 * moved, abort and COUNT it - a partial frame is a cosmetic miss,
+                 * a wedged machine costs a spare-install recovery. */
+                {
+                    /* ⛔★★★★★ NEVER PUSH THE WHOLE FRAME IN ONE WAKE.
+                     *
+                     * With the scanout mapped UNCACHED a full 21 MB frame is a
+                     * MULTI-SECOND sustained write burst into the very memory the
+                     * DSI controller is scanning out. Every armed run so far has
+                     * frozen mid-paint, and the user reports it stops at NEARLY
+                     * THE SAME PLACE each time - a constant offset at a constant
+                     * copy rate means a constant ELAPSED TIME, i.e. something with
+                     * a timeout fires. It is not a fault at a bad address (that
+                     * would stop somewhere different every run).
+                     *
+                     * So bound the burst: copy at most WINMALI_COPY_BUDGET bytes
+                     * per wake and resume from s_copyOff next time. The frame
+                     * still completes, just spread over several wakes, and the
+                     * interconnect is never monopolised for seconds at a stretch.
+                     * This is BOTH the mitigation and the experiment: if bounding
+                     * the burst stops the hang, the burst was the cause. */
+                    /* ⛔★★★★★★ THE 2 MB THROTTLE IS WHY WE LOSE THE SOURCE.
+                     *
+                     * A full frame at 2 MB/wake takes ~11 wakes. MEASURED on the
+                     * lock screen: Stat0x93Calls climbs ~3.4/s (a FRESH surface
+                     * registered several times a second), StatLatchDrop climbs in
+                     * step, and StatUvHeldOver stayed 0 - on every tick where
+                     * nothing qualified, the previous source was ALSO already
+                     * freed. DWM/LogonUI compose into short-lived buffers and
+                     * destroy them, so we cannot finish an 11-wake copy inside one
+                     * buffer's lifetime: we paint part of a frame, lose it, skip,
+                     * repeat. USER-OBSERVED as "flash, render, freeze, rinse and
+                     * repeat".
+                     *
+                     * The throttle was added when a full-frame copy appeared to
+                     * cause hangs - but that hang was later ROOT-CAUSED to BoFree
+                     * unmapping the system VA mid-copy (fixed: Revoke runs first
+                     * and blocks on a use-ref). The reason for it is gone; the
+                     * cost is not.
+                     *
+                     * Knob, so this is tunable without a rebuild and the old
+                     * behaviour is one registry write away:
+                     *   PresentCopyBudgetKB absent/0 -> whole frame in one wake
+                     *   PresentCopyBudgetKB = 2048   -> the old 2 MB throttle
+                     * ⚠ This is an EXPERIMENT with a prediction, not an assumption
+                     * that bigger is better: StatLatchDrop should fall toward 0.
+                     * If it stays high, the surface dies faster than a single copy
+                     * takes and the fix is elsewhere entirely. */
+                    SIZE_T budget = (g_WinMaliPresentCopyBudgetKB != 0)
+                                  ? ((SIZE_T)g_WinMaliPresentCopyBudgetKB * 1024u)
+                                  : bytes;
+                    /* ⛔★★★★★★ COPY ROW BY ROW AT THE SOURCE'S OWN PITCH.
+                     *
+                     * This was a FLAT byte copy: dst[o] = src[o] for o over the
+                     * whole frame. That is only correct when the source pitch
+                     * equals the panel pitch - and MEASURED, it does not. DWM and
+                     * LogonUI register 2946x1842 surfaces with stride 24576
+                     * (their own mesa log says so), which passes the only gate
+                     * there is (Size 22,093,824 >= frame 21,667,840) while being
+                     * a different shape entirely. Copied flat at 11776 the image
+                     * is squeezed into the top of the panel: measured
+                     * StatSrcLastRow=984 of 1840, i.e. the ~50% fill seen on the
+                     * glass all session.
+                     *
+                     * ⚠ CLAMP THE ROW COUNT BY WHAT THE SOURCE CAN SUPPLY. At a
+                     * pitch wider than the panel's, a full 1840 rows needs far
+                     * more memory than the buffer holds, and walking off the end
+                     * of a probe-locked MDL is an uncatchable fault - the exact
+                     * class of bug that has been killing this box. We only KNOW
+                     * the source is at least `bytes` long (selection guarantees
+                     * Size >= NeedBytes), so bound rows by that and never by the
+                     * surface's own claimed height. */
+                    const ULONG  dstPitch = WINMALI_FB_STRIDE;
+                    ULONG        effPitch = (srcPitch != 0) ? srcPitch : dstPitch;
+                    ULONG        rowBytes = (effPitch < dstPitch) ? effPitch : dstPitch;
+                    ULONG        maxRows  = WINMALI_FB_HEIGHT;
+                    static ULONG s_copyRow = 0;
+                    BOOLEAN      restartSweep = FALSE;
+                    ULONG        rowsPerWake = (ULONG)(budget / dstPitch);
+                    ULONG        startRow, endRow, r, doneRows = 0;
+                    if (effPitch == 0) { effPitch = dstPitch; rowBytes = dstPitch; }
+                    {
+                        SIZE_T avail = (srcBytes > bytes) ? srcBytes : bytes;
+                        SIZE_T cap = (avail >= rowBytes)
+                                   ? ((avail - rowBytes) / effPitch) + 1 : 0;
+                        if (cap < maxRows) { maxRows = (ULONG)cap; }
+                    }
+                    if (rowsPerWake == 0) { rowsPerWake = 1; }
+                    startRow = (s_copyRow < maxRows) ? s_copyRow : 0;
+                    endRow   = startRow + rowsPerWake;
+                    if (endRow > maxRows) { endRow = maxRows; }
+                    /* Kept so the existing forensics below read unchanged. */
+                    SIZE_T start = (SIZE_T)startRow * dstPitch;
+                    SIZE_T limit = (SIZE_T)(endRow - startRow) * dstPitch;
+                    SIZE_T done  = 0;
+                    PWINMALI_KMD_ALLOCATION ga = (PWINMALI_KMD_ALLOCATION)
+                        InterlockedCompareExchangePointer(
+                            (PVOID volatile *)&g_WinMaliFlipAlloc, NULL, NULL);
+                    PVOID gaVa = (ga != NULL) ? ga->ApertureVa : NULL;
+
+                    /* ⛔★★★★★ FORENSIC BREADCRUMBS - FLUSHED, BOUNDED.
+                     *
+                     * The only symptom of this bug is a HANG, so every previous
+                     * armed boot cost a full recovery cycle and returned ONE bit
+                     * of information. Worse, lazily-written counters die with the
+                     * box: StatPresentSettleMs was definitely written and still
+                     * read <absent> afterwards.
+                     *
+                     * So before touching the source at all, commit WHAT WE ARE
+                     * ABOUT TO DO, flushed to disk:
+                     *   StatDbgPass    - which pass this is (did we get here?)
+                     *   StatDbgSrcPath - 1 = VidMm aperture MDL, 2 = 0x93 probe-
+                     *                    locked, 0 = neither (should not copy)
+                     *   StatDbgSrcLo   - low 32 bits of srcVa, so a bad/blank VA
+                     *                    is visible rather than inferred
+                     *   StatDbgBytes   - how much this pass intends to copy
+                     * Then StatCopyKB below records how far it ACTUALLY got.
+                     *
+                     * First 8 passes only: ZwFlushKey is expensive and the box
+                     * dies within seconds, so 8 is ample and cannot itself become
+                     * the performance problem. */
+                    {
+                        static LONG s_dbgPass = 0;
+                        LONG pass = InterlockedIncrement(&s_dbgPass);
+                        /* ⚠ CAP RAISED 8 -> 40. The user COUNTED 13 blue flashes
+                         * before the freeze (one flash = one 2 MB pass; a full
+                         * 21,667,840 B frame is ~11 passes). With the cap at 8,
+                         * every logged pass completed and the hang happened past
+                         * the end of the record - the run cost a recovery cycle
+                         * and could not say where it died. 40 covers ~3.6 frames.
+                         * ⇒ Size a bounded log to the OBSERVED failure point, not
+                         * to a guess about how fast it will fail. */
+                        if (pass <= 40) {
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgPass", (ULONG)pass);
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgSrcPath", srcPath);   /* set AT the assignment */
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgSrcLo", (ULONG)((ULONG_PTR)srcVa & 0xFFFFFFFFu));
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgBytes", (ULONG)limit);
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgOff", (ULONG)(start >> 10));  /* KB into the frame */
+                        }
+                    }
+
+                    for (r = startRow; r < endRow; r++) {
+
+                        /* ⛔★★★★★ TEARDOWN MUST NOT WAIT FOR THIS COPY.
+                         *
+                         * StopDevice does KeWaitForSingleObject on this worker
+                         * thread. With the scanout mapped UNCACHED a frame takes
+                         * ~20 s, so Disable-PnpDevice blocked for that long, PnP
+                         * timed out, and the machine HUNG - twice on 2026-08-17,
+                         * both times inside deploy_hot's adapter bounce, which
+                         * then cost a spare-install recovery each.
+                         *
+                         * A half-painted frame is cosmetic. A teardown that
+                         * cannot complete takes the box down. Bail immediately
+                         * when asked to stop. */
+                        if (InterlockedCompareExchange(&a->PresentStop, 1, 1) == 1) {
+                            (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                            break;
+                        }
+
+                        /* ⛔★★★★★ RE-VALIDATE THE uv CANDIDATE BETWEEN SLICES.
+                         *
+                         * We release the table lock right after selection (holding
+                         * it across the copy wedges DWM, which needs the same mutex
+                         * from the 0x93 escape). That leaves a window where BoFree
+                         * can MmUnlockPages the very buffer we are reading.
+                         *
+                         * MEASURED 1207: StatDbgPass=18 / StatDbgDone=17 - died
+                         * INSIDE pass 18, with StatUvSrcHits=0 and StatUvSrcBo=0:
+                         * the candidate had gone away underneath the copy. I had
+                         * traded a wedge for a use-after-unlock.
+                         *
+                         * A SHORT re-check between 256 KB slices keeps the mutex
+                         * hold tiny (selection only) while making a vanished
+                         * candidate an aborted frame instead of a dead machine. */
+                        if (srcPath == 3 && uvHandleForCopy != 0 &&
+                            !WinMaliUvSrcStillValid(uvHandleForCopy)) {
+                            (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                            /* ★ RESTART THE SWEEP, don't resume it. Resuming would
+                               fill the remainder of this frame from a DIFFERENT
+                               surface - the mosaic we are removing. Drop the latch
+                               and rewind so the next wake re-selects and starts a
+                               clean frame from the top. */
+                            (VOID)InterlockedExchange(&g_WinMaliUvLatchBo, 0);
+                            restartSweep = TRUE;
+                            break;   /* candidate freed mid-copy - drop this frame */
+                        }
+
+                        /* Re-validate between slices. Only meaningful when the
+                           source came from the flip allocation; for other source
+                           paths ga is NULL and we simply copy through. */
+                        if (ga != NULL) {
+                            PWINMALI_KMD_ALLOCATION now =
+                                (PWINMALI_KMD_ALLOCATION)InterlockedCompareExchangePointer(
+                                    (PVOID volatile *)&g_WinMaliFlipAlloc, NULL, NULL);
+                            if (now != ga ||
+                                ga->Magic != WINMALI_KMD_ALLOC_MAGIC ||
+                                ga->ApertureMdl == NULL ||
+                                ga->ApertureVa != gaVa) {
+                                (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                                break;   /* leave the rest of the frame stale */
+                            }
+                        }
+
+                        /* ⛔★★★★★ COPY AT `start + done`, NOT `done`.
+                         *
+                         * This read `ScanoutVa + done` / `srcVa + done`, ignoring
+                         * `start` entirely - so every pass rewrote the SAME first
+                         * 2 MB no matter what s_copyOff said. */
+                        /* ★ EACH ROW AT ITS OWN PITCH ON EACH SIDE. dst advances
+                           by the panel pitch, src by the SOURCE's pitch. When the
+                           two are equal this is byte-for-byte what the old flat
+                           copy did, so a UMD that reports no pitch is unaffected. */
+                        RtlCopyMemory((PUCHAR)a->ScanoutVa + (SIZE_T)r * dstPitch,
+                                      srcVa + (SIZE_T)r * effPitch,
+                                      rowBytes);
+                        doneRows++;
+                        done += dstPitch;
+                    }
+
+                    /* ⛔★★★★★★ ADVANCE THE CURSOR. THIS WAS MISSING AND IT IS MY BUG.
+                     *
+                     * `start = s_copyOff` was read every pass but s_copyOff was
+                     * NEVER updated, so the worker re-copied the first 2 MB of the
+                     * frame forever - about 178 rows, the top ~10% of the panel.
+                     *
+                     * MEASURED (1205): StatDbgOff = 0 on pass 40, StatDbgPass =
+                     * StatDbgDone = 40. Forty successful copies, all of the same
+                     * strip.
+                     *
+                     * ⇒ THAT is the "flashing blue bar at the top": not a partial
+                     * frame, not a progress indicator, not a stride error - the
+                     * only region we ever wrote, repainted ~11x/s. I read that band
+                     * as evidence for three different theories today (a 4 MB
+                     * surface at the wrong pitch, a copy dying partway, then
+                     * boot-time contention) when it was a missing `+=`.
+                     * ★ A symptom that survives every hypothesis you throw at it
+                     * deserves suspicion of the instrument, not another theory. */
+                    s_copyRow = restartSweep ? 0 : (startRow + doneRows);
+                    if (s_copyRow >= maxRows) {
+                        s_copyRow = 0;                           /* wrap to the top */
+                        /* ★ SWEEP COMPLETE - DROP THE LATCH so the next frame
+                           re-runs the contest and picks up whatever DWM has
+                           composed since. Holding the latch across frames would
+                           freeze the panel on one surface forever; dropping it
+                           mid-frame is what produced the mosaic. The latch's
+                           lifetime is EXACTLY one frame, by construction. */
+                        (VOID)InterlockedExchange(&g_WinMaliUvLatchBo, 0);
+                        (VOID)InterlockedIncrement(&g_WinMaliStatSweeps);
+                    }
+                    (VOID)InterlockedExchange(&g_WinMaliStatCopyDone,
+                                              (LONG)(done >> 10));   /* KB copied */
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatCopyAbort", (ULONG)g_WinMaliStatCopyAbort);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatCopyKB",    (ULONG)g_WinMaliStatCopyDone);
+                    /* ★ THE ORACLE FOR THE LATCH. StatSweeps counts FULL frames
+                       delivered from a SINGLE source; StatLatchDrop counts frames
+                       abandoned because that source died. Sweeps climbing with
+                       LatchDrop low = one coherent frame per paint (the mosaic is
+                       gone). Sweeps stuck at 0 with LatchDrop climbing = no
+                       candidate survives a whole frame, which is a different bug
+                       and needs a different fix than tearing. */
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatSweeps",    (ULONG)g_WinMaliStatSweeps);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatUvRevokeTo", (ULONG)g_WinMaliStatUvRevokeTimeout);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatSkipNoSrc",  (ULONG)g_WinMaliStatSkipNoSrc);
+                    /* ★ WHAT SHAPE DID WE ACTUALLY COPY? StatWinPitch is the
+                       source pitch the UMD reported (0 = it did not), and
+                       StatWinRows is how many rows the buffer could supply at
+                       that pitch. Rows well under 1840 means the surface cannot
+                       cover the panel at its own pitch - a UMD-side geometry bug,
+                       not something the KMD can paper over. */
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatWinPitch",  effPitch);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatWinRows",   maxRows);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatPowerStop", (ULONG)g_WinMaliStatPowerStop);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatLatchDrop", (ULONG)g_WinMaliStatLatchDrop);
+                    /* ★ THE COPY IS DONE - DROP THE USE-REF NOW. Holding it any
+                       longer needlessly blocks a BO teardown that is waiting on
+                       it. The sweep at the top of the next iteration is only the
+                       backstop for paths that never reach here. */
+                    if (s_pendingUse != 0) {
+                        WinMaliUvSrcEndUse(s_pendingUse);
+                        s_pendingUse = 0;
+                    }
+                    /* ★ FLUSHED completion marker for the first few passes. Paired
+                     * with StatDbgPass above this is the decisive read after a
+                     * hang: if StatDbgPass is N but StatDbgDone is N-1, the box
+                     * died INSIDE pass N's copy - which finally distinguishes
+                     * "the copy hangs" from "something after the copy hangs".
+                     * Without a flush both counters vanish and the hang tells us
+                     * nothing, which is what the last two recovery cycles cost. */
+                    {
+                        static LONG s_dbgDone = 0;
+                        LONG d = InterlockedIncrement(&s_dbgDone);
+                        if (d <= 40) {
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgDone", (ULONG)d);
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"StatDbgDoneKB", (ULONG)(done >> 10));
+                        }
+                    }
+                }
 
                 /* Release only AFTER the copy - holding the candidate table
                    across it is what stops a BO free unlocking these pages
@@ -2204,10 +3290,34 @@ WinMaliPresentInit(_Inout_ PWINMALI_ADAPTER Adapter)
            would leave the panel showing stale lines until something flushed. */
         Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes,
                                                PAGE_READWRITE | PAGE_WRITECOMBINE);
-        if (Adapter->ScanoutMapVa == NULL) {
-            /* Fall back to plain uncached rather than giving up on presenting. */
+        if (Adapter->ScanoutMapVa != NULL) {
+            (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 1);
+        } else {
+            /* ⛔★★★★★ THE UNCACHED FALLBACK IS A ~1000x SLOWDOWN, AND IT WAS
+             * SILENT.
+             *
+             * Uncached MMIO writes on ARM64 run at a few MB/s, so a 21,667,840-byte
+             * frame takes on the order of TWENTY SECONDS instead of ~30 ms. That
+             * is not a slow frame, it is a wedged machine:
+             *   - the panel visibly paints TOP-DOWN over ~20 s (user-observed;
+             *     being able to SEE it paint at all is itself proof the mapping
+             *     is uncached - write-combined would land in well under a second)
+             *   - teardown does KeWaitForSingleObject(PresentWorkerThread), so
+             *     Disable-PnpDevice BLOCKS for as long as the copy runs, PnP
+             *     times out and the box hangs. Two of three hangs on 2026-08-17
+             *     happened during exactly that call, inside deploy_hot.
+             *
+             * Which attribute won was never recorded, so a catastrophic
+             * performance cliff looked identical to a healthy mapping. Count it. */
+            (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 0);
             Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes, PAGE_READWRITE);
+            WINMALI_WARN("Present: WRITE-COMBINED map REFUSED for 0x%llx (%Iu bytes) - "
+                         "falling back to UNCACHED. Expect ~20 s per frame and a "
+                         "teardown that blocks that long.",
+                         (ULONGLONG)pa.QuadPart, mapBytes);
         }
+        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                L"StatScanoutWc", (ULONG)g_WinMaliScanoutWc);
         if (Adapter->ScanoutMapVa == NULL) {
             WINMALI_WARN("Present: could not map framebuffer 0x%llx (%Iu bytes) - "
                          "the panel will stay blank while we own the display",
@@ -2643,11 +3753,37 @@ WinMaliKmdSetPowerState(
     _In_ DEVICE_POWER_STATE  DevicePowerState,
     _In_ POWER_ACTION        ActionType)
 {
+    PWINMALI_ADAPTER a = (PWINMALI_ADAPTER)MiniportDeviceContext;
+
     WM_TRACE_ENTER("SetPowerState");
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
     UNREFERENCED_PARAMETER(DeviceUid);
-    UNREFERENCED_PARAMETER(DevicePowerState);
-    UNREFERENCED_PARAMETER(ActionType);
+
+    /* ⛔★★★★★★ STOP THE PRESENT WORKER ON SHUTDOWN. THIS WAS A PURE STUB.
+     *
+     * MEASURED 2026-08-17: a remote `shutdown /r` was ACCEPTED and the box then
+     * sat in "a system shutdown is in progress" (rc 1115) for twenty minutes -
+     * reachable over WinRM throughout, with StatSweeps climbing 1282 -> 1320 ->
+     * 1391 THROUGH the shutdown. The present worker was still copying frames
+     * into the scanout while Windows was trying to tear the machine down, and it
+     * took a hard reset to recover.
+     *
+     * PresentStop was only ever set from StopDevice. A shutdown need not route
+     * through StopDevice, but it ALWAYS lowers device power, and this DDI is
+     * where that arrives - so this is the right place to stop touching the
+     * framebuffer.
+     *
+     * ⚠ Deliberately ONE-WAY: never clear PresentStop here. A worker that
+     * resumes painting because something briefly returned to D0 mid-teardown is
+     * the same hang again, and nothing needs the worker once power has dropped -
+     * the next real D0 arrives with a fresh StartDevice. */
+    if (a != NULL && (DevicePowerState != PowerDeviceD0 ||
+                      ActionType == PowerActionShutdown ||
+                      ActionType == PowerActionShutdownReset ||
+                      ActionType == PowerActionShutdownOff)) {
+        (VOID)InterlockedExchange(&a->PresentStop, 1);
+        (VOID)InterlockedIncrement(&g_WinMaliStatPowerStop);
+    }
+
     WM_TRACE_EXIT_S("SetPowerState", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }

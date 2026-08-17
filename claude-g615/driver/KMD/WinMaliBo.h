@@ -123,6 +123,7 @@ int WinMaliBoCreateFromUserVa(_Inout_ PWINMALI_ADAPTER Adapter,
                               _In_ PVOID UserVa,
                               _In_ SIZE_T Size,
                               _In_ ULONG Flags,
+                              _In_ ULONG SrcPitch,
                               _In_opt_ PVOID OwnerDevice,
                               _Out_ ULONG* OutHandle,
                               _Out_opt_ UINT64* OutMappedBytes);
@@ -136,14 +137,39 @@ int WinMaliBoCreateFromUserVa(_Inout_ PWINMALI_ADAPTER Adapter,
    AcquireBest RETURNS HOLDING THE TABLE LOCK when it returns non-NULL: the
    caller must Release after it has finished reading, and Revoke (from BO free)
    blocks until then. It returns NULL already unlocked. */
-VOID  WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size);
+/* SrcPitch = the surface's row pitch in bytes, 0 when the UMD did not supply it.
+   Without it the worker copies every candidate at the PANEL pitch, which turns a
+   2946x1842/stride-24576 DWM surface into a half-height smear. */
+VOID  WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size,
+                          _In_ ULONG SrcPitch);
 VOID  WinMaliUvSrcRevoke(_In_ ULONG Handle);
 PVOID WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                               _In_ ULONG Stride,
                               _In_ ULONG Height,
                               _Out_ ULONG* OutHandle,
-                              _Out_ ULONG* OutHits);
+                              _Out_ ULONG* OutHits,
+                              _Out_opt_ ULONG* OutPitch,
+                              _Out_opt_ SIZE_T* OutSize);
 VOID  WinMaliUvSrcRelease(VOID);
+
+/* TRUE while Handle is still a live candidate (present, MDL non-NULL). Takes the
+   table lock BRIEFLY - call it between copy slices instead of holding the lock
+   across the whole copy, which wedges DWM (it needs the same mutex from the 0x93
+   escape path). See the long note on the definition. */
+BOOLEAN WinMaliUvSrcStillValid(_In_ ULONG Handle);
+
+/* Re-resolve a LATCHED candidate's system VA without re-running the selection.
+   A wake copies only a slice of the frame, so re-selecting every wake splices
+   strips from different surfaces into one scanout ("lines changing places on
+   every reprint"). Latch one source per sweep and re-resolve it with this.
+   Returns NULL when the candidate is gone - abandon the sweep and re-select. */
+PVOID WinMaliUvSrcReacquireVa(_In_ ULONG Handle, _Out_opt_ ULONG* OutPitch,
+                              _Out_opt_ SIZE_T* OutSize);
+
+/* Drop the use-ref that AcquireBest / ReacquireVa took. MANDATORY once per
+   successful acquisition: WinMaliUvSrcRevoke blocks (bounded) on that count, so
+   a leaked ref stalls every BO teardown for its full timeout. */
+VOID WinMaliUvSrcEndUse(_In_ ULONG Handle);
 
 /* Destroy every BO owned by OwnerDevice (device rundown). Returns the
    number destroyed. */

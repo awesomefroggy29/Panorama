@@ -368,6 +368,13 @@ NTSTATUS WinMaliWriteParamsDword(_In_ PUNICODE_STRING RegistryPath,
                                  _In_ PCWSTR ValueName,
                                  _In_ ULONG Value);
 
+/* Same, but ZwFlushKey's the hive before returning so the value SURVIVES A HANG.
+   Lazy flushing loses exactly the values written just before a freeze - the ones
+   that say what the driver was doing. Expensive: bounded use only. */
+NTSTATUS WinMaliWriteParamsDwordFlushed(_In_ PUNICODE_STRING RegistryPath,
+                                        _In_ PCWSTR ValueName,
+                                        _In_ ULONG Value);
+
 NTSTATUS WinMaliWriteParamsBinary(_In_ PUNICODE_STRING RegistryPath,
                                   _In_ PCWSTR ValueName,
                                   _In_reads_bytes_(Length) const VOID *Data,
@@ -393,6 +400,14 @@ extern LONG  g_WinMaliStatPresentLastFlags;
 extern LONG  g_WinMaliStatPresentLastCounts;
 extern LONG  g_WinMaliStatPresentSrcHandle;
 extern LONG  g_WinMaliStatPresentDstHandle;
+extern LONG  g_WinMaliStatPresSrcRectTL;
+extern LONG  g_WinMaliStatPresSrcRectBR;
+extern LONG  g_WinMaliStatPresDstRectTL;
+extern LONG  g_WinMaliStatPresDstRectBR;
+extern LONG  g_WinMaliStatPresSubRectCnt;
+extern LONG  g_WinMaliStatPresDmaSize;
+extern LONG  g_WinMaliStatPresMultipass;
+extern LONG  g_WinMaliStatPresColor;
 extern LONG  g_WinMaliStatPresentDmaPrivSize;
 extern LONG  g_WinMaliStatPresentPrivSize;
 extern LONG  g_WinMaliStatPresentPrivHits;
@@ -456,9 +471,60 @@ extern LONG  g_WinMaliStatSyncBadFlags;
    handle) on purpose: one says our bookkeeping is wrong, the other says the
    GPU is wedged, and they used to share a single ENOENT. */
 extern LONG  g_WinMaliStatSyncWaitTimeout;
+/* SIGNAL-phase sync failures: the CS ran to completion, then signalling failed.
+   Distinct from StatSubmitSyncFail (a rejected WAIT) - different bug, own counter. */
+extern LONG  g_WinMaliStatSubmitSignalFail;
+extern LONG  g_WinMaliStatSignalErr;
+extern LONG  g_WinMaliStatSignalBadHandle;
 extern LONG  g_WinMaliStatCsTimeoutCount;
 /* Ring pointers + req/ack pairs: the proof that the CS output iface we read the
    timeout diagnosis out of is a channel the FW actually writes. */
+/* Identity of the allocation dxgk actually scans out, captured on every flip.
+   The present source is otherwise chosen by a heuristic, which latched a
+   pre-composition layer (desktop, no taskbar, no cursor, Chg 0). */
+extern LONG  g_WinMaliFlipAllocW;
+extern LONG  g_WinMaliFlipAllocH;
+extern LONG  g_WinMaliFlipAllocPitch;
+extern LONG  g_WinMaliFlipAllocFmt;
+extern LONG  g_WinMaliFlipAllocSize;
+extern LONG  g_WinMaliFlipAllocId;
+extern LONG  g_WinMaliApMapOps;
+extern LONG  g_WinMaliApMapLastSize;
+extern LONG  g_WinMaliApMapMaxSize;
+extern PVOID g_WinMaliFlipAlloc;   /* WINMALI_KMD_ALLOCATION* dxgk scans out */
+extern LONG  g_WinMaliStatFlipSrcUsed;
+extern LONG  g_WinMaliStatFlipSrcMapFail;
+extern LONG  g_WinMaliFlipWorkerMdl;
+extern LONG  g_WinMaliFlipWorkerPages;
+extern LONG  g_WinMaliStatCopyAbort;  /* frames abandoned mid-copy (alloc moved) */
+extern LONG  g_WinMaliStatCopyDone;   /* KB copied on the last pass */
+extern LONG  g_WinMaliUvLatchBo;
+extern LONG  g_WinMaliUvLastGoodBo;
+extern LONG  g_WinMaliStatUvHeldOver;      /* uv candidate latched for the current sweep */
+extern LONG  g_WinMaliStatLatchDrop;  /* sweeps abandoned - latched candidate died */
+extern LONG  g_WinMaliStatSweeps;     /* full frames completed */
+extern LONG  g_WinMaliStatUvRevokeTimeout; /* Revoke gave up waiting - must be 0 */
+extern LONG  g_WinMaliStatPowerStop;  /* SetPowerState stopped the present worker */
+extern LONG  g_WinMaliStatUvSrcQual;
+extern LONG  g_WinMaliStatUvSrcMaxCov;
+extern LONG  g_WinMaliStatUvSrcCoverage; /* adopted source painted extent, %% */
+
+/* DRIVERCAPS VISIBILITY - see the long comment in WinMaliQai.c. These answer
+   "do our caps land where dxgk actually reads them", which decides whether the
+   cap experiments so far (NoScreenToScreenBlt, FlipImmediateMmIo) were genuine
+   refutations or silent no-ops. If OutSize < CapsSizeof the running kernel has a
+   SMALLER view of DXGK_DRIVERCAPS than our 26100 WDK, and our field offsets are
+   addressing the wrong bytes. */
+extern ULONG g_WinMaliQaiFlipCapsValue;
+extern ULONG g_WinMaliQaiFlipCapsOff;
+extern ULONG g_WinMaliQaiOutSize;
+extern ULONG g_WinMaliQaiCapsSizeof;
+
+extern LONG  g_WinMaliScanoutWc;      /* 1 = write-combined, 0 = UNCACHED (~1000x) */
+extern LONG  g_WinMaliFlipHasMdl;
+extern LONG  g_WinMaliFlipMdlPages;
+extern LONG  g_WinMaliFlipAllocOk;
+extern LONG  g_WinMaliFlipAllocBad;
 extern LONG  g_WinMaliStatCsSubmitCount;
 extern LONG  g_WinMaliStatCsOkCount;
 extern LONG  g_WinMaliStatRingInsert;
@@ -486,6 +552,15 @@ extern LONG  g_WinMaliUvCandPages[4];
 /* Allocation DWM last flipped to; the present worker copies from this. */
 extern PVOID g_WinMaliFlipSourceAlloc;
 
+extern LONG g_WinMaliStatPawmRegistered;
+extern LONG g_WinMaliStatOpenByPawm;
+extern LONG g_WinMaliStatOpenCalls;
+extern LONG g_WinMaliStatOpenResolved;
+extern LONG g_WinMaliStatOpenById;
+extern LONG g_WinMaliStatOpenFailed;
+extern LONG g_WinMaliStatOpenLastId;
+extern LONG g_WinMaliStatOpenFailPdMagic;
+extern LONG g_WinMaliStatOpenFailPdSize;
 extern LONG g_WinMaliStatPresentCalls;
 extern LONG g_WinMaliStatPresentNotBlt;
 extern LONG g_WinMaliStatPresentNullCookie;
@@ -503,10 +578,28 @@ extern ULONG g_WinMaliChildCfg;
 /* Non-zero once teardown has begun (StopDevice/RemoveDevice). */
 extern volatile LONG g_WinMaliStopping;
 extern ULONG g_WinMaliPresentTestPattern;
+/* DEFAULT 0 - LEAVE IT 0. 1 lets the worker read the flip alloc through VidMm's
+   aperture MDL, which DEADLOCKS the machine (fault -> VidMm paging op -> serviced
+   by us -> our worker is the blocked thread). Kept only to re-test on purpose. */
+extern ULONG g_WinMaliFlipSrcFromVidMm;
+/* FlipSrcFromAperture (default 0): allow the present worker to read a dxgk
+   allocation's APERTURE MDL as the frame source. Same deadlock class as
+   FlipSrcFromVidMm - it was simply never gated, and was mislabelled in the
+   source as a 0x93 read. Leave 0; 0x93 (srcPath 3) is the only safe source. */
+extern ULONG g_WinMaliFlipSrcFromAperture;
+extern ULONG g_WinMaliPresentCopyBudgetKB; /* 0 = whole frame per wake */
+extern LONG  g_WinMaliStatSkipNoSrc;
 extern ULONG g_WinMaliPresentMarker;
 extern ULONG g_WinMaliTraceSubmit;
 extern ULONG g_WinMaliPresentTimerHz;
 extern ULONG g_WinMaliFailOnGpuFault;
+/* UvSrcInvalidate (default 1): invalidate the scanout source before reading it.
+   Correct while the GPU is the last writer (it writes non-coherently). ⚠ WRONG
+   once delivery into that surface is a CPU copy - an invalidate can DISCARD the
+   CPU's still-dirty lines, so the worker would read stale DRAM and the surface
+   would look frozen even though the copy ran. A knob, so the two policies can be
+   told apart in one deploy instead of two. */
+extern ULONG g_WinMaliUvSrcInvalidate;
 
 /* Bounded, termination-aware replacement for KeWaitForSingleObject on any path
    a user thread can reach through an escape. Timeout==NULL means "no caller

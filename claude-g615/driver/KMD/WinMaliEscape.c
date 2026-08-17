@@ -564,6 +564,12 @@ WinMaliEscapeBoFromUserVa_(_In_    PWINMALI_ADAPTER       adapter,
                                     (PVOID)(ULONG_PTR)args->UserVa,
                                     (SIZE_T)args->Size,
                                     args->Flags,
+                                    /* Row pitch, or 0 from a UMD built before the
+                                       field existed - the worker then falls back
+                                       to assuming the panel pitch, which is the
+                                       behaviour that produced the half-height
+                                       smear. See WINMALI_BO_FROM_USER_VA. */
+                                    args->SrcPitch,
                                     WinMaliDeviceOwnerToken(pEscape->hDevice),
                                     &handle,
                                     &mapped);
@@ -1441,6 +1447,36 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
         if (syncs != NULL) {
             int e = WinMaliEscapeProcessSyncOps_(adapter, syncs, qs->SyncsCount, TRUE);
             if (e != WMERR_OK && err == WMERR_OK) {
+                /* ⛔ THE ONE ENOENT PATH WITH NO COUNTER.
+                 *
+                 * The WAIT phase above is counted (StatSubmitSyncFail); this,
+                 * the SIGNAL phase, was not - so a submit whose command stream
+                 * ran to completion and then failed to signal reported a bare
+                 * ENOENT to the UMD while EVERY kernel counter stayed 0.
+                 * Measured: mesa logging ~8 GROUP_SUBMIT ret=-2 per 2 min with
+                 * StatSubmitSyncFail/NoGroup/CsfFailCount all reading 0, and
+                 * CsOk climbing the whole time. Contradictory counters at the
+                 * two ends of one interface localise the bug to the code
+                 * between them - and this was the only uninstrumented line in
+                 * it. Count it, and name the handle. */
+                (VOID)InterlockedIncrement(&g_WinMaliStatSubmitSignalFail);
+                (VOID)InterlockedExchange(&g_WinMaliStatSignalErr, (LONG)e);
+                if (qs->SyncsCount > 0) {
+                    ULONG k;
+                    /* Report the first SIGNAL-direction handle, not syncs[0] -
+                       syncs[0] is usually a WAIT and would name the wrong one. */
+                    for (k = 0; k < qs->SyncsCount; ++k) {
+                        if (syncs[k].Flags & WINMALI_SYNC_OP_SIGNAL) {
+                            (VOID)InterlockedExchange(&g_WinMaliStatSignalBadHandle,
+                                                      (LONG)syncs[k].Handle);
+                            break;
+                        }
+                    }
+                }
+                WINMALI_WARN("GroupSubmit: group=%u queue=%u the CS RAN but the "
+                             "SIGNAL sync ops failed err=%d (count=%u) - this is a "
+                             "different bug from a rejected WAIT",
+                             args->GroupHandle, qs->QueueIndex, e, qs->SyncsCount);
                 err = e;
             }
         }

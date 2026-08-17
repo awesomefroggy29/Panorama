@@ -21,6 +21,15 @@
 #define WINMALI_FB_BPP          32u
 #define WINMALI_FB_SCANOUT_PA   0xFD619400ULL   /* live buffer, LK-STAGE path */
 
+/* How long the present worker sits idle after starting, before it copies anything.
+   Armed BOOTS hang at the logon spinner (partial top-band paint, then dead) while
+   runtime arming survives 100 s windows. The difference is that at boot we start
+   pushing 21 MB frames into the firmware framebuffer while LogonUI, dwm init and
+   StartDevice are all still in flight - and the user sees the same partial paint
+   during a session logoff transition too. Blunt settle timer to TEST that; if it
+   works, replace it with a real readiness gate rather than a delay. */
+#define WINMALI_PRESENT_SETTLE_MS  25000u
+
 /*
  * ---- MODE TIMING: THE EDID AND THE SIGNAL INFO MUST AGREE EXACTLY ----------
  *

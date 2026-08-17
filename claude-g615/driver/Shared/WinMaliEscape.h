@@ -766,7 +766,23 @@ typedef struct _WINMALI_BO_FROM_USER_VA {
     uint64_t UserVa;            /* from pfnLockCb(LockEntire).pData */
     uint64_t Size;              /* bytes; must be the locked extent   */
     uint32_t Flags;             /* WINMALI_BO_FLAG_* (subset valid)   */
-    uint32_t Pad;
+    /* ⛔★★★★★ THE SOURCE'S ROW PITCH IN BYTES. 0 = unknown/not supplied.
+     *
+     * The KMD had no idea what SHAPE these buffers are: 0x93 carried only
+     * UserVa+Size, and the present worker's only gate was `Size >= frameBytes`.
+     * So it copied every candidate as a flat block at the PANEL pitch (11776).
+     *
+     * MEASURED, from the UMD's own log: the surfaces DWM/LogonUI register are
+     *     2946x1842, stride 24576, size 22,093,824
+     * which sails through a byte-size gate (22.09 MB >= 21.67 MB) while being a
+     * completely different shape. Copied linearly at 11776, that image is
+     * squeezed into the top half of the panel - exactly the ~50% fill seen on
+     * the glass all session and measured as StatSrcLastRow=984 of 1840.
+     *
+     * ⚠ REUSES THE OLD `Pad` SLOT DELIBERATELY: sizeof() is unchanged, so a UMD
+     * built before this field sends 0 here and the KMD falls back to the old
+     * linear copy. No ABI break and no flag day between UMD and KMD versions. */
+    uint32_t SrcPitch;
     /* out */
     uint32_t BoHandle;
     uint32_t Pad1;

@@ -74,6 +74,13 @@ typedef struct _WINMALI_KMD_ALLOCATION {
     PMDL                ApertureMdl;
     ULONG               ApertureMdlOffset;   /* pages into the MDL */
     ULONG               AperturePageCount;
+    /* ⛔ System VA for ApertureMdl, mapped ONCE at MAP_APERTURE_SEGMENT and
+       cleared at UNMAP. The present worker must NEVER call
+       MmGetSystemAddressForMdlSafe on this MDL itself: the MDL belongs to VidMm
+       and can be torn down between our NULL check and our use. Doing it ~30x a
+       second from the worker REBOOT-LOOPED the machine (desktop, then instant
+       reset). Map where the MDL is known valid; read a plain pointer after. */
+    PVOID               ApertureVa;
 
     /* UMD-supplied identity, copied out of WINMALI_ALLOCATION_PRIVATE at
        CreateAllocation. This is how DxgkDdiOpenAllocation finds us WITHOUT

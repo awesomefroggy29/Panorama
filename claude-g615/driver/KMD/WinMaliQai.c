@@ -28,6 +28,30 @@
 
 #define WM_QAI_OK(name)  DbgPrint("[WinMali]    QAI[%s] OK\n", name)
 
+/* ★★★★★ ARE OUR DRIVERCAPS EVEN LANDING WHERE dxgk READS THEM?
+ *
+ * Two cap experiments have now "refuted" cleanly (NoScreenToScreenBlt /
+ * NoOverlapScreenBlt, then FlipImmediateMmIo) - each rebuilt, deployed, cold
+ * booted, and measured, each changing NOTHING. That is a suspicious pattern, and
+ * this file already carries an unexplained anomaly saying why it might be:
+ *
+ *   "dxgk reported reading 0x8 from a field this code sets to 0"
+ *
+ * plus the header note above - we compile DXGK_DRIVERCAPS from the 26100 WDK,
+ * but the running kernel may have a SMALLER OR DIFFERENT view of that struct. If
+ * so, FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps) computed from OUR header does not
+ * address FlipCaps in THEIRS, every cap we set lands in the wrong field, and
+ * every cap-based refutation so far is VOID rather than informative.
+ *
+ * These are DbgPrint'ed already, which is useless on a box with no kernel
+ * debugger. Publish them so a plain registry read answers it.
+ * Names start with "Query" so the deploy's deny-list purges them as driver
+ * OUTPUT rather than treating them as knobs. */
+ULONG g_WinMaliQaiFlipCapsValue = 0;
+ULONG g_WinMaliQaiFlipCapsOff   = 0;
+ULONG g_WinMaliQaiOutSize       = 0;
+ULONG g_WinMaliQaiCapsSizeof    = 0;
+
 NTSTATUS APIENTRY
 WinMaliKmdQueryAdapterInfo(
     _In_ CONST HANDLE                       hAdapter,
@@ -129,8 +153,39 @@ WinMaliKmdQueryAdapterInfo(
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, PresentationCaps) +
             sizeof(caps->PresentationCaps) <= lim) {
             caps->PresentationCaps.SupportSoftwareDeviceBitmaps = TRUE;
-            caps->PresentationCaps.NoScreenToScreenBlt          = TRUE;
-            caps->PresentationCaps.NoOverlapScreenBlt           = TRUE;
+            /* ⛔★★★★★★ THESE TWO REFUSED THE EXACT PRESENT LOGONUI NEEDS.
+             *
+             *   NoScreenToScreenBlt - "Driver does not support kernel mode
+             *                          Present WITHIN THE SAME ALLOCATION"
+             *   NoOverlapScreenBlt  - "...within the same allocation with
+             *                          OVERLAPPED SrcRect and DstRect"
+             *
+             * MEASURED 2026-08-17 (KMD 1226 published the full present geometry):
+             *     SrcRect = (1434,1405)..(1510,1484)
+             *     DstRect = (1434,1405)..(1510,1484)   <- IDENTICAL
+             *     SubRectCnt=1, no stretch
+             * a 76x79 SELF-BLT - the logon spinner refreshing one screen region.
+             * Same allocation, maximally overlapped rects: precisely what both
+             * caps declare we cannot do.
+             *
+             * So dxgk cannot route the spinner to us as a blt. It falls back to a
+             * RedirectedFlip (ETW id=184, Flags=0x8000 = RedirectedFlip), which
+             * it then REJECTS with STATUS_INVALID_PARAMETER for want of a
+             * destination - and LogonUI spins ~2,350 dxgk calls/s on the retry,
+             * so LOGON NEVER COMPLETES. Disarming the driver releases it, every
+             * time (user-observed 3x).
+             *
+             * We can genuinely service this: the present blt executor is a CPU
+             * RtlCopyMemory (WinMaliPresentExecuteBlt_), so a copy inside one
+             * allocation is ordinary work - and with Src==Dst it is a no-op.
+             * ⚠ For PARTIALLY overlapping rects a forward row copy can smear;
+             * identical rects cannot. If a real overlapping case shows up,
+             * ExecuteBlt must choose its copy direction.
+             * ⚠ This CLAIMS a capability. If the blt path cannot honour it we get
+             * corruption instead of a stall - a different failure - so judge this
+             * on the PANEL as well as the counters. */
+            caps->PresentationCaps.NoScreenToScreenBlt          = FALSE;
+            caps->PresentationCaps.NoOverlapScreenBlt           = FALSE;
             caps->PresentationCaps.MaxTextureWidthShift         = 3;
             caps->PresentationCaps.MaxTextureHeightShift        = 3;
         }
@@ -166,10 +221,51 @@ WinMaliKmdQueryAdapterInfo(
             caps->FlipCaps.Value = 0;
             if (g_WinMaliComputeOnly == 0) {
                 caps->FlipCaps.FlipOnVSyncMmIo = 1;
+
+                /* ★★★★★ THE FLIP LogonUI ASKS FOR IS **IMMEDIATE**, AND WE HAVE
+                 * NEVER CLAIMED WE COULD DO ONE.
+                 *
+                 * MEASURED 2026-08-17 (UMD_1232, armed, stalled at logon). ETW
+                 * id=184 decoded against the provider manifest - its fields are
+                 *   hContext, hWindow, VidPnSourceId, FlipInterval, Flags,
+                 *   ReturnStatus, hSrcAllocHandle, hDstAllocHandle
+                 * and EVERY LogonUI present reads:
+                 *   FlipInterval = 0        (D3DDDI_FLIPINTERVAL_IMMEDIATE)
+                 *   Flags        = 0x8000   (RedirectedFlip)
+                 *   ReturnStatus = 0xC000000D  STATUS_INVALID_PARAMETER
+                 * 9 in 4 s, alternating across BOTH buffers of a two-buffer
+                 * swapchain, while DxgkDdiSetVidPnSourceAddress was called just
+                 * TWICE in 287 s. The flips are refused before reaching us.
+                 *
+                 * d3dkmddi.h: FlipImmediateMmIo = "Support Flip as mmio
+                 * immediate". Without it dxgk has no route to service a
+                 * FLIPINTERVAL_IMMEDIATE request at all.
+                 *
+                 * ⚠ IS THIS HONEST? More honest than what we already claim.
+                 * Our "flip" records an address and a worker memcpys pixels into
+                 * the firmware framebuffer; there is NO vsync synchronisation
+                 * anywhere in it (the vsync we report is a KTIMER, not a scanout
+                 * signal). "Immediate" describes that better than "at the vsync
+                 * interrupt" does.
+                 *
+                 * ⚠ Corroborated by our own history: the id=494 text that forced
+                 * FlipOnVSyncMmIo on read "does not support FlipOnVSyncMmIo cap.
+                 * The caps value is 0x8" - and 0x8 IS this bit. It was once set
+                 * ALONE and dxgk demanded bit1 as well. The answer was always
+                 * BOTH: 0x2 | 0x8 = 0xA.
+                 *
+                 * Still NOT claimed, because we genuinely cannot do them:
+                 * FlipOnVSyncWithNoWait, FlipInterval (TWO/THREE/FOUR),
+                 * FlipIndependent, DdiPresentForIFlip. */
+                caps->FlipCaps.FlipImmediateMmIo = 1;
             }
             /* Publish what we ACTUALLY sent, plus the offset we wrote it at.
                dxgk reported reading 0x8 from a field this code sets to 0, and
                that discrepancy is not something to resolve by reasoning. */
+            g_WinMaliQaiFlipCapsValue = (ULONG)caps->FlipCaps.Value;
+            g_WinMaliQaiFlipCapsOff   = (ULONG)FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps);
+            g_WinMaliQaiOutSize       = (ULONG)pQueryAdapterInfo->OutputDataSize;
+            g_WinMaliQaiCapsSizeof    = (ULONG)sizeof(DXGK_DRIVERCAPS);
             DbgPrint("[WinMali]    QAI[DRIVERCAPS] FlipCaps=0x%08x @off=%u outsz=%u sizeof(caps)=%u\n",
                      (unsigned)caps->FlipCaps.Value,
                      (unsigned)FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps),
@@ -246,7 +342,43 @@ WinMaliKmdQueryAdapterInfo(
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_4)
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, MiscCaps) +
             sizeof(caps->MiscCaps) <= lim) {
-            caps->MiscCaps.SupportContextlessPresent = 1;
+            /* ⛔★★★★★ EXPERIMENT 2026-08-17: SupportContextlessPresent was 1,
+             * with no comment justifying it - conspicuous in a file where every
+             * other cap carries its reasoning. It is the prime suspect for the
+             * ONE rejection that actually blocks DWM's flips.
+             *
+             * MEASURED (DxgKrnl ETW id=494, grouped BY PID, 10 s):
+             *     x49 "There should be at least one broadcast context passed to
+             *          signal."   evtPid=1240 = DWM
+             * and it CONTINUES after the UMD-side BroadcastContextCount fix,
+             * because DWM does not present through our UMD at all (it called
+             * _Present ONCE; Explorer called it 193 times). DWM presents via the
+             * KERNEL path - so the context contract that matters is the one WE
+             * declare here, not anything the UMD does.
+             *
+             * This bit tells dxgk "presents need no context". If dxgk takes us up
+             * on it for DWM's flips, the present arrives contextless, and
+             * whatever must be SIGNALLED afterwards has no context to broadcast
+             * to - which is that message, verbatim.
+             *
+             * ✅🏆 RESULT: KEEP IT AT 0. **THE PANEL SHOWED A FULL DESKTOP WITH A
+             * TASKBAR** on this build (user-observed, 2026-08-17) - the taskbar
+             * had NEVER rendered before in this whole effort ("full desktop, no
+             * taskbar, no cursor" was the standing signature).
+             *
+             * ⛔★★★★★ AND THE COUNTER I CHOSE MISSED IT. I declared this bit
+             * "innocent" because dwm's id=494 broadcast count did not move
+             * (39 vs 49, inside run-to-run noise) and had already written the
+             * restore-to-1 edit. The ETW message count was simply not measuring
+             * what changed; the PANEL was. **When the deliverable is pixels, the
+             * panel is the oracle** - a log-message rate is a proxy, and a proxy
+             * that disagrees with the artifact is the proxy being wrong.
+             *
+             * ⚠ Still unexplained and worth understanding rather than cargo-
+             * culting: the broadcast rejections continue at the same rate, so
+             * whatever this bit changed, it was not that. Do not assume the two
+             * are related. */
+            caps->MiscCaps.SupportContextlessPresent = 0;
             caps->MiscCaps.Detachable                = 0;  /* not eGPU */
 
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_6)

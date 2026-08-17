@@ -1345,7 +1345,7 @@ index a8695b2..b2bd420 100644
  
     /* The first 32MB are reserved, so pick a dumb address from there.
 diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
-index 8cfbc01..e352b77 100644
+index 8cfbc01..0f48b45 100644
 --- a/src/gallium/drivers/panfrost/pan_resource.c
 +++ b/src/gallium/drivers/panfrost/pan_resource.c
 @@ -390,13 +390,60 @@ panfrost_resource_from_winmali_kmt(struct pipe_screen *pscreen,
@@ -1546,7 +1546,43 @@ index 8cfbc01..e352b77 100644
  
     rsc->bo = bo;
     rsc->plane.base = bo->ptr.gpu;
-@@ -2742,6 +2872,14 @@ panfrost_winmali_set_wddm_alloc_ops(struct pipe_screen *pscreen,
+@@ -1711,7 +1841,34 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
+        drm_is_afrc(rsrc->modifier)) {
+       struct panfrost_resource *staging =
+          pan_alloc_staging(ctx, rsrc, level, box);
+-      assert(staging);
++
++      /* ⛔★★★★★ `assert(staging)` USED TO BE THE ONLY GUARD HERE, AND MESA IS
++       * BUILT -DNDEBUG, SO IT COMPILED TO NOTHING.
++       *
++       * pan_alloc_staging() can and does return NULL (it is a full resource
++       * create: BO allocation, layout init - all of which can fail). With the
++       * assert gone, the very next statement dereferenced it:
++       *     staging->plane.layout.slices[0].tiled_or_linear.row_stride_B
++       *
++       * SYMBOLIZED FROM A REAL CRASH (2026-08-17, Explorer.EXE on the TB375FC):
++       *     WinMaliUmd.dll + 0x791c0  ->  panfrost_ptr_map
++       *     pan_resource.c:1849       ->  code c0000005 (access violation)
++       *
++       * ⚠ This is the SAME CLASS as the panfrost_bo_alloc live-slot bug: an
++       * invariant expressed only as an assert, in a build where asserts do not
++       * exist. Treat every bare `assert(ptr)` in this tree as UNGUARDED.
++       *
++       * A failed map must FAIL, not fault - unwind what we already set up
++       * (out_transfer was assigned above) and return NULL. */
++      if (staging == NULL) {
++         mesa_loge("panfrost_ptr_map: pan_alloc_staging FAILED (level=%u %dx%d) "
++                   "- failing the map instead of dereferencing NULL",
++                   level, box->width, box->height);
++         pipe_resource_reference(&transfer->base.resource, NULL);
++         ralloc_free(transfer);
++         *out_transfer = NULL;
++         return NULL;
++      }
+ 
+       /* Staging resources have one LOD: level 0. Query the strides
+        * on this LOD.
+@@ -2742,6 +2899,14 @@ panfrost_winmali_set_wddm_alloc_ops(struct pipe_screen *pscreen,
     if (dev && dev->kmod.dev)
        winmali_kmod_set_wddm_alloc_ops(dev->kmod.dev, ops);
  }
@@ -1561,7 +1597,7 @@ index 8cfbc01..e352b77 100644
  #endif /* _WIN32 && HAVE_WINMALI_WDDM_KMOD */
  
  void
-@@ -2769,6 +2907,123 @@ panfrost_resource_screen_destroy(struct pipe_screen *pscreen)
+@@ -2769,6 +2934,311 @@ panfrost_resource_screen_destroy(struct pipe_screen *pscreen)
     u_transfer_helper_destroy(pscreen->transfer_helper);
  }
  
@@ -1605,11 +1641,77 @@ index 8cfbc01..e352b77 100644
 +    * the mapping, and ran one page off the end of the destination (symbolized
 +    * repeatedly from LogonUI dumps). Clamp the extent to what the destination
 +    * BO can really hold before handing it over. */
++   /* ★★★★★ UNCONDITIONAL CENSUS - LOG OUTSIDE EVERY FAILURE BRANCH.
++    *
++    * Every other log in this function fires only on a clamp or a drop, so a
++    * silent run is ambiguous in the worst way: it cannot distinguish "no copy
++    * ever targets the primary" from "copies happen and are silently wrong".
++    * Measured 2026-08-17 with every precondition satisfied (dwm on our UMD,
++    * animator running, sampler sampling, no CPU-VA refusals): the GPU completed
++    * 104 submits and StatSrcChg did not move once over 3960 ticks. So the
++    * question is now exactly this counter's job to answer.
++    *
++    * The primary on this panel is 2944x1840 @ stride 11776 = 21,667,840 B, and
++    * it is the ONLY destination anywhere near that size - so dst BO size is a
++    * sufficient discriminator here without reaching into the winmali layer.
++    * If `toPrimary` stays 0 while `calls` climbs, delivery into the scanned
++    * surface is NEVER ATTEMPTED and the bug is upstream of this function. */
++   {
++      static unsigned s_ccrCalls = 0, s_ccrToPrimary = 0, s_ccrNoBo = 0;
++      struct panfrost_resource *pdst0 = pan_resource(dst);
++      uint64_t dstBoSize0 =
++         (dst->target != PIPE_BUFFER && pdst0 != NULL && pdst0->bo != NULL)
++            ? panfrost_bo_size(pdst0->bo) : 0;
++
++      s_ccrCalls++;
++      if (dstBoSize0 == 0) s_ccrNoBo++;
++      else if (dstBoSize0 >= 16u * 1024u * 1024u) s_ccrToPrimary++;
++
++      if ((s_ccrCalls & 63u) == 1u) {
++         mesa_loge("CCR CENSUS: calls=%u toPrimary(dstBO>=16MB)=%u noBo=%u | "
++                   "this dst %ux%u fmt=%u target=%u boSize=%llu",
++                   s_ccrCalls, s_ccrToPrimary, s_ccrNoBo,
++                   dst->width0, dst->height0, (unsigned)dst->format,
++                   (unsigned)dst->target, (unsigned long long)dstBoSize0);
++      }
++   }
++
 +   {
 +      struct panfrost_resource *pdst = pan_resource(dst);
 +      struct pipe_box box = *src_box;
 +
-+      if (dst->target != PIPE_BUFFER && pdst->bo != NULL) {
++      /* ⛔⛔ slices[].afbc and slices[].tiled_or_linear are a UNION, and every
++       * row calculation below is meaningful ONLY for the tiled_or_linear member.
++       *
++       * MEASURED 2026-08-17 (LogonUI on WinMaliUmd_1230): the surface arriving
++       * here carries modifier 0x800000000000351 = ARM AFBC
++       * (SC|TILED|SPARSE|YTR|16x16). An AFBC slice has no row_stride_B at all,
++       * so the bytes read through that union member were an AFBC header field:
++       * 24576, against a real linear pitch of 11784 for the same 2946x1842
++       * extent. Dividing the BO size by it invented "975 rows" for an image of
++       * 1842, and the guard then truncated a perfectly legal full-height copy.
++       *
++       * 974/1842 = 52.9% - exactly the "only ever 50-60% of the screen paints"
++       * the panel showed all session. THE GUARD WAS THE BUG, not the copy it was
++       * guarding. The layout was never inconsistent: data_size_B == the BO size
++       * == 23,961,600, which is a correct AFBC allocation for this extent.
++       *
++       * Bound by the resource's OWN EXTENT (right for every modifier), and only
++       * consult BO/stride arithmetic when the image really is linear. */
++      if (dst->target != PIPE_BUFFER) {
++         unsigned dstRows = u_minify(dst->height0, dst_level);
++
++         if (dsty >= dstRows) {
++            mesa_loge("panfrost_resource_copy_region: dst row %u is beyond the "
++                      "destination extent (%u rows) - dropping", dsty, dstRows);
++            return;
++         }
++         if ((uint64_t)dsty + box.height > dstRows)
++            box.height = (int)(dstRows - dsty);
++      }
++
++      if (pdst->image.props.modifier == DRM_FORMAT_MOD_LINEAR &&
++          dst->target != PIPE_BUFFER && pdst->bo != NULL) {
 +         uint64_t bo_size = panfrost_bo_size(pdst->bo);
 +         uint64_t offset = pdst->plane.layout.slices[dst_level].offset_B;
 +         uint64_t stride =
@@ -1629,12 +1731,134 @@ index 8cfbc01..e352b77 100644
 +               return;
 +            }
 +            if ((uint64_t)dsty + box.height > rows_avail) {
++               /* ⚠ THE ROW COUNT ALONE CANNOT SAY WHICH SIDE IS WRONG.
++                * "BO holds 262 rows" is consistent with a too-small BO, a
++                * too-large stride, or a dst whose declared height never matched
++                * its allocation - three different bugs. Print every input to
++                * rows_avail plus the destination's own geometry, so one line
++                * settles it instead of inviting a guess. */
 +               mesa_loge("panfrost_resource_copy_region: clamping copy height "
-+                         "%d -> %llu at dst row %u (BO holds %llu rows)",
++                         "%d -> %llu at dst row %u | rows_avail=%llu "
++                         "bo_size=%llu offset=%llu stride=%llu | dst %ux%u fmt=%u "
++                         "level=%u | stride implies width=%llu px @4B",
 +                         box.height,
 +                         (unsigned long long)(rows_avail - dsty), dsty,
-+                         (unsigned long long)rows_avail);
++                         (unsigned long long)rows_avail,
++                         (unsigned long long)bo_size,
++                         (unsigned long long)offset,
++                         (unsigned long long)stride,
++                         dst->width0, dst->height0, (unsigned)dst->format,
++                         dst_level,
++                         (unsigned long long)(stride / 4));
 +               box.height = (int)(rows_avail - dsty);
++            }
++         }
++      }
++
++      /* ⛔ THE DESTINATION CLAMP ABOVE IS ONLY HALF THE BOUND - AND THE MISSING
++       * HALF CRASH-LOOPED THE SHELL.
++       *
++       * util_copy_rect READS box.height rows from the SOURCE as well as writing
++       * them to the destination, and nothing here bounded the source. Measured
++       * 2026-08-16 with the dxgk-native path live: Explorer.EXE and
++       * StartMenuExperienceHost died repeatedly with c0000005 inside
++       * WinMaliUmd.dll, symbolising to memmove_unaligned called from this
++       * function, plus c0000374 (HEAP CORRUPTION) in dwm.exe and LogonUI.exe -
++       * the signature of a copy running past the end of a mapping.
++       *
++       * It only became reachable once imported surfaces started ADOPTING a real
++       * CPU VA: before that bo_map_cpu refused them and the copy was dropped, so
++       * the missing bound could never fire. Fixing one thing exposed the next -
++       * the same shape as the fence fix exposing the infinite wait.
++       *
++       * Bound the extent by BOTH ends before handing it to util_copy_rect. */
++      {
++         struct panfrost_resource *psrc = pan_resource(src);
++
++         /* Same union trap as the destination above - see that comment. The
++          * source is where it actually bit: LogonUI's AFBC surface was clamped
++          * to 52.9% of its height on every single frame. Bound by the extent
++          * always; only trust row_stride_B when the image is linear. */
++         if (src->target != PIPE_BUFFER) {
++            unsigned srcRows = u_minify(src->height0, src_level);
++
++            if ((unsigned)box.y >= srcRows) {
++               mesa_loge("panfrost_resource_copy_region: src row %d is beyond "
++                         "the source extent (%u rows) - dropping", box.y, srcRows);
++               return;
++            }
++            if ((uint64_t)box.y + box.height > srcRows)
++               box.height = (int)(srcRows - (uint64_t)box.y);
++         }
++
++         if (psrc->image.props.modifier == DRM_FORMAT_MOD_LINEAR &&
++             src->target != PIPE_BUFFER && psrc->bo != NULL) {
++            uint64_t sbo    = panfrost_bo_size(psrc->bo);
++            uint64_t soff   = psrc->plane.layout.slices[src_level].offset_B;
++            uint64_t sstr   =
++               psrc->plane.layout.slices[src_level].tiled_or_linear.row_stride_B;
++
++            if (sstr != 0 && sbo > soff) {
++               uint64_t srows = (sbo - soff) / sstr;
++
++               if ((uint64_t)box.y >= srows) {
++                  mesa_loge("panfrost_resource_copy_region: src row %d is beyond "
++                            "the source BO (%llu rows of %llu B) - dropping",
++                            box.y, (unsigned long long)srows,
++                            (unsigned long long)sstr);
++                  return;
++               }
++               if ((uint64_t)box.y + box.height > srows) {
++                  mesa_loge("panfrost_resource_copy_region: clamping height %d -> "
++                            "%llu at src row %d | src bo=%llu off=%llu stride=%llu "
++                            "%ux%u  (READ overrun - this is what crashed the shell)",
++                            box.height, (unsigned long long)(srows - box.y), box.y,
++                            (unsigned long long)sbo, (unsigned long long)soff,
++                            (unsigned long long)sstr, src->width0, src->height0);
++
++                  /* ★ WHY IS THE LAYOUT WIDER THAN THE BUFFER IT DESCRIBES?
++                   *
++                   * Measured 2026-08-17 off LogonUI: a 2946x1842 BGRA8 surface
++                   * reported row_stride_B=24576 over a 23,961,600 B BO - exactly
++                   * 975 rows where the copy wanted 1842. 975/1842 = 52.9%, which
++                   * is the "50-60% of the screen paints" the panel has shown all
++                   * session. The KMD is not at fault: it copies every row it is
++                   * given, and the rows below ~974 were simply never written.
++                   *
++                   * DXGI format 87 maps to PIPE_FORMAT_B8G8R8A8_UNORM (4 B), so a
++                   * doubled bpp is NOT the source of the doubled stride - it has
++                   * to come from the image's own props, which nothing here has
++                   * ever printed. Dump them rather than deduce them; rate-limited
++                   * because this fires every frame. */
++                  {
++                     static unsigned dumped = 0;
++                     if (dumped < 3) {
++                        unsigned bpp =
++                           util_format_get_blocksize(psrc->image.props.format);
++                        dumped++;
++                        mesa_loge("  ^ LAYOUT: modifier=0x%llx fmt=%u bpp=%u "
++                                  "extent=%ux%ux%u | slice.size_B=%llu "
++                                  "data_size_B=%llu array_stride_B=%llu | a linear "
++                                  "stride for that extent would be %u (x%.2f) | "
++                                  "rows needed=%d have=%llu",
++                                  (unsigned long long)psrc->image.props.modifier,
++                                  (unsigned)psrc->image.props.format, bpp,
++                                  psrc->image.props.extent_px.width,
++                                  psrc->image.props.extent_px.height,
++                                  psrc->image.props.extent_px.depth,
++                                  (unsigned long long)
++                                     psrc->plane.layout.slices[src_level].size_B,
++                                  (unsigned long long)psrc->plane.layout.data_size_B,
++                                  (unsigned long long)psrc->plane.layout.array_stride_B,
++                                  psrc->image.props.extent_px.width * bpp,
++                                  (double)sstr /
++                                     (double)(psrc->image.props.extent_px.width * bpp),
++                                  box.y + box.height, (unsigned long long)srows);
++                     }
++                  }
++
++                  box.height = (int)(srows - (uint64_t)box.y);
++               }
 +            }
 +         }
 +      }
@@ -1685,7 +1909,7 @@ index 8cfbc01..e352b77 100644
  void
  panfrost_resource_context_init(struct pipe_context *pctx)
  {
-@@ -2776,7 +3031,7 @@ panfrost_resource_context_init(struct pipe_context *pctx)
+@@ -2776,7 +3246,7 @@ panfrost_resource_context_init(struct pipe_context *pctx)
     pctx->buffer_unmap = u_transfer_helper_transfer_unmap;
     pctx->texture_map = u_transfer_helper_transfer_map;
     pctx->texture_unmap = u_transfer_helper_transfer_unmap;
@@ -1721,6 +1945,44 @@ index b280cd7..222ff1a 100644
 +void panfrost_cmdstream_screen_init_v11(struct panfrost_screen *screen);
  void panfrost_cmdstream_screen_init_v13(struct panfrost_screen *screen);
  void panfrost_cmdstream_screen_init_v14(struct panfrost_screen *screen);
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 63104c0..5aed38b 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -36,6 +36,7 @@
+ #include "State.h"
+ 
+ #include "Debug.h"
++#include "util/log.h"
+ 
+ #include "util/u_memory.h"
+ 
+@@ -131,10 +132,21 @@ OpenAdapter10(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
+ #endif
+       break;
+    default:
+-      if (0) {
+-         DebugPrintf("%s: unsupported interface version 0x%08x\n",
+-                     __func__, pOpenData->Interface);
+-      }
++      /* ★ NAME THE VERSION THE RUNTIME ASKED FOR — this refusal has always been
++       * SILENT in shipping builds (DebugPrintf compiles out at MESA_DEBUG=0, and
++       * it was additionally dead behind `if (0)`).
++       *
++       * With SUPPORT_D3D10_1 and SUPPORT_D3D11 both 0 we reject every D3D10.1
++       * and D3D11 interface here. Measured 2026-08-17 at the logon stall:
++       * LogonUI spins on ~14 DXGI CreateFactory + ~25 CreateAdapter per 5 s,
++       * which is the signature of a client that cannot get a usable device and
++       * keeps starting over from scratch. This line decides whether that spin is
++       * OUR refusal or something else - do not infer it, read it.
++       * mesa_loge reaches MESA_LOG_FILE; DebugPrintf does not. */
++      mesa_loge("wm: OpenAdapter10 REFUSING interface version 0x%08x "
++                "(SUPPORT_D3D10_1=%d SUPPORT_D3D11=%d) -> E_FAIL",
++                (unsigned)pOpenData->Interface,
++                (int)SUPPORT_D3D10_1, (int)SUPPORT_D3D11);
+       return E_FAIL;
+    }
  
 diff --git a/src/gallium/frontends/d3d10umd/Debug.h b/src/gallium/frontends/d3d10umd/Debug.h
 index efdf318..be0969b 100644
@@ -2012,7 +2274,7 @@ index e1b292e..cc88b58 100644
     if (pDevice->hContext) {
        D3DDDICB_DESTROYCONTEXT dtxCb;
 diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
-index d6b9d52..1549605 100644
+index d6b9d52..ccfa5b0 100644
 --- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
 +++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
 @@ -38,6 +38,10 @@
@@ -2026,7 +2288,25 @@ index d6b9d52..1549605 100644
  #include "util/format/u_format.h"
  
  
-@@ -93,10 +97,23 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+@@ -55,6 +59,17 @@
+ HRESULT APIENTRY
+ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+ {
++   /* ★★★★★ UNCONDITIONAL ENTRY CENSUS.
++    * LOG_ENTRYPOINT is compiled out in release, so "no _Present lines in the log"
++    * has never been evidence of anything. Measured on HW 2026-08-17: DWM renders
++    * 104 submits through us, DxgkDdiPresent is called ZERO times, and
++    * SetVidPnSourceAddress latches ONCE at mode-set - the frame never enters
++    * presentation at all. This line says whether DXGI routes presents to us. */
++   {
++      static unsigned s_presentCalls = 0;
++      if ((++s_presentCalls & 31u) == 1u)
++         mesa_loge("DXGI CENSUS: _Present calls=%u", s_presentCalls);
++   }
+ 
+    LOG_ENTRYPOINT();
+ 
+@@ -93,10 +108,23 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
        device->hContextTried = TRUE;
        device->hContext = NULL;
        if (device->KTCallbacks.pfnCreateContextCb != NULL) {
@@ -2050,7 +2330,7 @@ index d6b9d52..1549605 100644
           HRESULT chr = device->KTCallbacks.pfnCreateContextCb(device->hDevice,
                                                                &ctxCb);
           if (SUCCEEDED(chr))
-@@ -116,19 +133,59 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+@@ -116,19 +144,151 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
      * proper target (DWM redirection / cross-adapter surface); dxgk then
      * calls the KMD's DxgkDdiPresent, which records the blt executed by
      * SubmitCommand. */
@@ -2093,12 +2373,98 @@ index d6b9d52..1549605 100644
 +         presentCb.hDstAllocation        = 0;
 +         presentCb.pDXGIContext          = pPresentData->pDXGIContext;
 +         presentCb.hContext              = device->hContext;
++         /* ★★★★★ A FLIP PRESENT NEEDS AT LEAST ONE BROADCAST CONTEXT.
++          *
++          * The memset leaves BroadcastContextCount = 0, and dxgkrnl rejects the
++          * present outright. MEASURED 2026-08-17 via DxgKrnl ETW, 25 s window:
++          *   id=494 x273 (~11/s, i.e. FRAME CADENCE), payload string
++          *   "There should be at least one broadcast context passed to signal."
++          * with a per-attempt sequence number incrementing alongside (id=551/294).
++          *
++          * So DWM was presenting ~11x/s all along and EVERY present was dropped
++          * here - which is why SetVidPnSourceAddress latched exactly ONCE (the
++          * mode-set) and the panel held a frozen, correct-geometry, fully-painted
++          * primary forever. It also explains why dwm's _Present count read 1
++          * while an ordinary app read 193: the failure is on the far side of this
++          * callback, so the frame never comes back for another UMD-side pass.
++          *
++          * dxgiddi.h: BroadcastContext[] is "Only supported for flip operation" -
++          * which is exactly the path DWM takes here (_Blt measured 0). Broadcast
++          * to our own single context; this is not LDA, so one entry is correct
++          * and BroadcastSrcAllocation/DstAllocation stay NULL. */
++         /* ★★★★★ RE-APPLIED 2026-08-17, THIS TIME AS A MEASURED EXPERIMENT.
++          *
++          * BASELINE (reverted build, stable, 10 s DxgKrnl ETW):
++          *     id=494 = 112, and ALL 112 are
++          *     "There should be at least one broadcast context passed to signal."
++          *   = ~11.2/s, exactly dwm's frame cadence, identical to the 273/25 s
++          *     measured before any of this. So the rejection is REAL, PERSISTENT,
++          *     and the sole 494 message.
++          *
++          * ORACLE for this change: that count must DROP TO ~0. Anything else and
++          * the broadcast reading is wrong, whatever else improves.
++          *
++          * ⚠ Previously this shipped UNVERIFIED (every attempt to re-count 494
++          * died with the box) and correlated with two regressions - the scanned
++          * surface going black, and ~10x GPU submits (+1058 vs +101). Those are
++          * now KNOWN side effects to re-check, not reasons to avoid the test: the
++          * platform is stable (throttled copy) and a hang costs one reboot. */
++         if (device->hContext != NULL) {
++            presentCb.BroadcastContextCount = 1;
++            presentCb.BroadcastContext[0]   = device->hContext;
++         }
 +         presentCb.PrivateDriverDataSize = sizeof priv;
 +         presentCb.pPrivateDriverData    = &priv;
++
++         /* ⛔★★★★★★ DO NOT SUBMIT A PRESENT DXGK WILL REJECT - IT WEDGES LOGON.
++          *
++          * MEASURED 2026-08-17, DxgKrnl ETW during the logon stall, event id=184
++          * (the present entry point: hContext, hWindow, VidPnSourceId,
++          * FlipInterval, Flags, ReturnStatus, hSrcAllocHandle, hDstAllocHandle):
++          *
++          *   hWindow=0  VidPnSourceId=0  hDstAllocHandle=0  Flags=0x8000
++          *   hSrcAllocHandle=0x80000A00
++          *   ReturnStatus=0xC000000D  (STATUS_INVALID_PARAMETER)   x12 in 5 s
++          *   from pid 1228 = LogonUI, which then spins ~2,350 dxgk calls/s.
++          *
++          * dxgkrnl rejects the present BEFORE it ever becomes a DxgkDdiPresent
++          * call - which is why the KMD only ever sees ~23 unrelated presents and
++          * why every cookie / allocation-list theory was at the wrong end of the
++          * pipe. LogonUI retries the rejected present forever, so LOGON NEVER
++          * COMPLETES; disarming the driver releases it instantly.
++          *
++          * hDstAllocation == 0 is documented-legal ("in: if non-zero, it's the
++          * destination allocation"), so the zero is not itself the error - the
++          * present simply has NO routing target at all: no window, no VidPn
++          * source, no destination allocation. pDXGIContext is what normally
++          * carries that, so a NULL one leaves dxgk nothing to route to.
++          *
++          * Until we can name a real destination, issuing the call anyway is
++          * strictly worse than not issuing it: the frame is lost either way, but
++          * the rejection is what puts LogonUI into a retry spin. Skip it, and
++          * report the routing inputs through mesa_loge (the EDK2 ring is
++          * fill-once and long full, so it cannot carry this). */
++         if (presentCb.pDXGIContext == NULL && presentCb.hDstAllocation == 0) {
++            static bool warned = false;
++            if (!warned) {
++               warned = true;
++               mesa_loge("wm: present NOT submitted - unroutable "
++                         "(pDXGIContext=NULL, hDstAllocation=0, hSrc=0x%x). "
++                         "dxgk answers STATUS_INVALID_PARAMETER to this shape "
++                         "and LogonUI then spins on the retry.",
++                         (unsigned)presentCb.hSrcAllocation);
++            }
++            return S_OK;
++         }
++
 +         HRESULT hr = device->pDXGIBaseCallbacks->pfnPresentCb(device->hDevice,
 +                                                               &presentCb);
 +         if (FAILED(hr))
-+            DebugPrintf("%s: DXGI pfnPresentCb failed 0x%08x\n", __func__, hr);
++            mesa_loge("wm: DXGI pfnPresentCb failed 0x%08x "
++                      "(hSrc=0x%x hDst=0x%x ctx=%p bcast=%u)",
++                      (unsigned)hr, (unsigned)presentCb.hSrcAllocation,
++                      (unsigned)presentCb.hDstAllocation,
++                      presentCb.pDXGIContext, presentCb.BroadcastContextCount);
 +         return hr;
 +      }
 +
@@ -2112,18 +2478,46 @@ index d6b9d52..1549605 100644
 +         presentCb.hContext              = device->hContext;
 +         presentCb.PrivateDriverDataSize = sizeof priv;
 +         presentCb.pPrivateDriverData    = &priv;
-+         HRESULT hr = device->KTCallbacks.pfnPresentCb(device->hDevice,
-+                                                       &presentCb);
-+         if (FAILED(hr))
-+            DebugPrintf("%s: pfnPresentCb failed 0x%08x\n", __func__, hr);
-+         return hr;
++
++         /* ⚠ SAME TRAP, WORSE: D3DDDICB_PRESENT has no pDXGIContext field at
++          * all, so this path can carry NO routing target whatsoever - no window,
++          * no VidPn source, and hDstAllocation is 0 here. That is exactly the
++          * shape dxgk answered with STATUS_INVALID_PARAMETER (ETW id=184), and
++          * the rejection is what puts LogonUI into a ~2,350 calls/s retry spin
++          * that stops logon completing. Refuse to submit it. */
++         mesa_loge("wm: KT present path reached (no DXGI ctx available) - "
++                   "hSrc=0x%x hCtx=%p; NOT submitting, dxgk rejects this shape",
++                   (unsigned)presentCb.hSrcAllocation, device->hContext);
++         return S_OK;
        }
 -      return hr;
     }
     DebugPrintf("%s: kernel present unavailable (hKMAlloc=%p hContext=%p pfnPresentCb=%p) - skipping\n",
                 __func__, (void *)(uintptr_t)pSrcResource->hKMAllocation,
+@@ -334,6 +494,21 @@ _RotateResourceIdentities( DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResour
+ HRESULT APIENTRY
+ _Blt(DXGI_DDI_ARG_BLT *Blt)
+ {
++   /* ★★★★★ UNCONDITIONAL ENTRY CENSUS - the other half of the question.
++    * The UMD returns S_OK from CreateDevice to opt INTO DXGI's shared-resource
++    * redirection, on the premise "a render-only adapter has no scanout, so
++    * BltDXGI is the only way a frame reaches the screen" (Device.cpp:819). That
++    * premise is now STALE: the KMD owns the display (sole display adapter,
++    * 2944x1840, monitor child, FlipCaps set, gets SetVidPnSourceAddress). So the
++    * UMD is opted into the redirection model while the KMD is a display adapter,
++    * and those want DIFFERENT present paths. Counting both entry points says
++    * which model DXGI actually chose - or whether it chose neither. */
++   {
++      static unsigned s_bltCalls = 0;
++      if ((++s_bltCalls & 31u) == 1u)
++         mesa_loge("DXGI CENSUS: _Blt calls=%u (redirection/BltDXGI path)", s_bltCalls);
++   }
++
+    LOG_ENTRYPOINT();
+ 
+    /* This is the windowed-DWM present path: with DWM composition on, DXGI moves
 diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
-index 22b3365..b534522 100644
+index 22b3365..7a799df 100644
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
 @@ -47,6 +47,10 @@
@@ -2133,7 +2527,7 @@ index 22b3365..b534522 100644
 +extern "C" void winmali_kmod_register_alloc_id(uint32_t kmt, uint32_t id,
 +                                               uint32_t id_hi);
 +extern "C" void winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu,
-+                                                uint64_t size);
++                                                uint64_t size, uint32_t pitch);
  #endif
  
  
@@ -2351,7 +2745,7 @@ index 22b3365..b534522 100644
        /* Pin the allocation resident before handing it to the KMD.
         * BoFromAllocation snapshots the allocation's page frames; the lock
         * is what forces the aperture mapping to exist NOW and guarantees
-@@ -410,20 +562,76 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -410,20 +562,81 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
           lockCb.hAllocation = pResource->hKMAllocation;
           lockCb.Flags.LockEntire = 1;
           hr = pDevice->KTCallbacks.pfnLockCb(pDevice->hDevice, &lockCb);
@@ -2431,12 +2825,17 @@ index 22b3365..b534522 100644
 +            and both 0x81 and 0x92 are dead ends). Escape 0x93 probe-and-locks
 +            this range in the KMD and wraps its PFNs. Discarding pData is what
 +            made the previous three import attempts impossible. */
++         /* ★ PASS THE STRIDE. This allocation is laid out at `stride` bytes per
++            row (ALIGN_POT(width*bpp, 64)), which need not equal the panel pitch
++            - and the KMD had no way to know that, so its present worker copied
++            every surface as a flat block at the panel pitch, squashing anything
++            shaped differently into part of the screen. */
 +         winmali_kmod_register_alloc_cpu((uint32_t)pResource->hKMAllocation,
-+                                         lockCb.pData, allocSize);
++                                         lockCb.pData, allocSize, stride);
        }
  
        struct winsys_handle whandle;
-@@ -463,11 +671,29 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -463,11 +676,29 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
     } else
  #endif /* _WIN32 && HAVE_WINMALI_WDDM_KMOD */
     {
@@ -2467,7 +2866,7 @@ index 22b3365..b534522 100644
        SetError(hDevice, E_OUTOFMEMORY);
        return;
     }
-@@ -576,8 +802,351 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
+@@ -576,8 +807,352 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
               D3D10DDI_HRESOURCE hResource,                        // IN
               D3D10DDI_HRTRESOURCE hRTResource)                    // IN
  {
@@ -2757,7 +3156,8 @@ index 22b3365..b534522 100644
 +         the mapped view - so a wrong guess is visible, never silent. */
 +      winmali_kmod_register_alloc_cpu((uint32_t)pResource->hKMAllocation,
 +                                      lockCb.pData,
-+                                      (uint64_t)openStride * (uint64_t)openHeight);
++                                      (uint64_t)openStride * (uint64_t)openHeight,
++                                      openStride);
 +   }
 +
 +   struct winsys_handle whandle;
@@ -2819,7 +3219,7 @@ index 22b3365..b534522 100644
  }
  
  
-@@ -627,16 +1196,25 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
+@@ -627,16 +1202,25 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
      * acquired in CreateResource. Done AFTER the panfrost BO has dropped
      * its reference so the GPU is no longer touching the allocation when
      * the kernel reclaims it. */
@@ -2853,7 +3253,7 @@ index 22b3365..b534522 100644
        D3DKMT_HANDLE handleList[1] = { pResource->hKMAllocation };
        D3DDDICB_DEALLOCATE dealloc;
        memset(&dealloc, 0, sizeof dealloc);
-@@ -952,6 +1530,49 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
+@@ -952,6 +1536,49 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
        src_box.depth  = u_minify(src_resource->depth0,  src_level);
     }
  
@@ -2903,7 +3303,7 @@ index 22b3365..b534522 100644
     if (areResourcesCompatible(src_resource, dst_resource)) {
        pipe->resource_copy_region(pipe,
                                   dst_resource, dst_level,
-@@ -959,11 +1580,45 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
+@@ -959,11 +1586,45 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
                                   src_resource, src_level,
                                   &src_box);
     } else {
@@ -3485,7 +3885,7 @@ index 05fbc68..d0b53e5 100644
  /* pan_context.c / pan_csf.c call libdrm's drmSyncobj* directly (not via the
   * pan_kmod backend). The winmali_drm_compat.h shims route here. Binary
 diff --git a/src/panfrost/lib/kmod/winmali/winmali_kmod.c b/src/panfrost/lib/kmod/winmali/winmali_kmod.c
-index 635db13..19293ee 100644
+index 635db13..352c907 100644
 --- a/src/panfrost/lib/kmod/winmali/winmali_kmod.c
 +++ b/src/panfrost/lib/kmod/winmali/winmali_kmod.c
 @@ -27,6 +27,7 @@
@@ -3859,7 +4259,26 @@ index 635db13..19293ee 100644
     uint8_t *buf = (uint8_t *)calloc(1, total);
     if (!buf)
        return;
-@@ -781,6 +1013,27 @@ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
+@@ -772,8 +1004,17 @@ winmali_kmod_bo_set_label(struct pan_kmod_dev *dev,
+ void *
+ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
+ {
+-   if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP)
++   if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP) {
++      /* "mapping src-texture failed" is emitted by util_resource_copy_region and
++       * names neither the BO nor the reason. Three different refusals below all
++       * surface as that one line, so say which one fired. Rate-limited: this is
++       * on a per-frame path. */
++      static unsigned s_nommap = 0;
++      if ((s_nommap++ % 128) == 0)
++         mesa_loge("wm: bo_map_cpu REFUSED bo=%u size=%llu - NO_MMAP flag (seen %u)",
++                   bo->handle, (unsigned long long)bo->size, s_nommap);
+       return MAP_FAILED;
++   }
+ 
+    /* dxgk-native BOs are already CPU-mapped for their lifetime via pfnLockCb
+     * (captured at alloc). Hand back that persistent VA - no escape. */
+@@ -781,6 +1022,37 @@ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
     if (wbo->wddm_cpu_va)
        return wbo->wddm_cpu_va;
  
@@ -3880,6 +4299,16 @@ index 635db13..19293ee 100644
 +    * memory that had already passed a NULL check (pan_cmdstream.h:277,
 +    * pan_texture.c:420). Fail cleanly and let the caller handle it. */
 +   if (wbo->wddm_kmt_handle) {
++      /* An IMPORTED surface that did not adopt a CPU VA. Since the adoption fix
++       * this should be rare - when it fires, the UMD never registered that kmt
++       * (or the size guard rejected it), which is a different bug from NO_MMAP
++       * and from an escape failure. Name it. */
++      static unsigned s_nova = 0;
++      if ((s_nova++ % 64) == 0)
++         mesa_loge("wm: bo_map_cpu REFUSED bo=%u kmt=0x%x size=%llu - imported "
++                   "with NO adopted CPU VA (seen %u)",
++                   bo->handle, wbo->wddm_kmt_handle,
++                   (unsigned long long)bo->size, s_nova);
 +      errno = ENXIO;
 +      return MAP_FAILED;
 +   }
@@ -3887,7 +4316,7 @@ index 635db13..19293ee 100644
     WINMALI_BO_MAP_CPU req = {
        .Handle = bo->handle,
        .Prot   = (prot & PROT_READ ? 1 : 0) | (prot & PROT_WRITE ? 2 : 0),
-@@ -790,6 +1043,31 @@ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
+@@ -790,6 +1062,31 @@ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
        errno = -err;
        return MAP_FAILED;
     }
@@ -3919,7 +4348,7 @@ index 635db13..19293ee 100644
     return (void *)(uintptr_t)req.CpuAddr;
  }
  
-@@ -803,6 +1081,18 @@ winmali_kmod_present_to_hdc(struct pan_kmod_dev *dev,
+@@ -803,6 +1100,18 @@ winmali_kmod_present_to_hdc(struct pan_kmod_dev *dev,
                              uint32_t dst_x, uint32_t dst_y)
  {
     (void)dev;
@@ -3938,7 +4367,7 @@ index 635db13..19293ee 100644
     WINMALI_PRESENT_TO_HDC req = {
        .Hdc      = (uint64_t)(uintptr_t)hdc,
        .BoHandle = bo->handle,
-@@ -816,6 +1106,350 @@ winmali_kmod_present_to_hdc(struct pan_kmod_dev *dev,
+@@ -816,6 +1125,355 @@ winmali_kmod_present_to_hdc(struct pan_kmod_dev *dev,
     return escape_simple(WinMaliEscapeOp_PresentToHdc, &req, sizeof(req));
  }
  
@@ -4068,7 +4497,7 @@ index 635db13..19293ee 100644
 +   uint32_t      count;
 +   uint32_t      cap;
 +   struct { uint32_t kmt; uint32_t id; uint32_t id_hi;
-+            void *cpu; uint64_t size; } *ent;
++            void *cpu; uint64_t size; uint32_t pitch; } *ent;
 +} g_kmt_alloc_ids = { SIMPLE_MTX_INITIALIZER, 0, 0, NULL };
 +
 +/* ★ The locked CPU VA of a dxgk allocation, from pfnLockCb(LockEntire).
@@ -4080,7 +4509,7 @@ index 635db13..19293ee 100644
 + * escape submission, because dxgk never learns the surface is needed and so
 + * never pages it in (measured: 0x92 returns -EAGAIN forever, even on re-import). */
 +static void
-+winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
++winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size, uint32_t pitch)
 +{
 +   if (kmt == 0 || cpu == NULL || size == 0)
 +      return;
@@ -4088,8 +4517,9 @@ index 635db13..19293ee 100644
 +   simple_mtx_lock(&g_kmt_alloc_ids.lock);
 +   for (uint32_t i = 0; i < g_kmt_alloc_ids.count; i++) {
 +      if (g_kmt_alloc_ids.ent[i].kmt == kmt) {
-+         g_kmt_alloc_ids.ent[i].cpu  = cpu;
-+         g_kmt_alloc_ids.ent[i].size = size;
++         g_kmt_alloc_ids.ent[i].cpu   = cpu;
++         g_kmt_alloc_ids.ent[i].size  = size;
++         if (pitch) g_kmt_alloc_ids.ent[i].pitch = pitch;
 +         simple_mtx_unlock(&g_kmt_alloc_ids.lock);
 +         return;
 +      }
@@ -4106,25 +4536,29 @@ index 635db13..19293ee 100644
 +   g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].kmt  = kmt;
 +   g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].cpu  = cpu;
 +   g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].size = size;
++   g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].pitch = pitch;
 +   g_kmt_alloc_ids.count++;
 +   simple_mtx_unlock(&g_kmt_alloc_ids.lock);
 +}
 +
 +void
-+winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
++winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size,
++                                uint32_t pitch)
 +{
-+   winmali_record_alloc_cpu(kmt, cpu, size);
++   winmali_record_alloc_cpu(kmt, cpu, size, pitch);
 +}
 +
 +static void
-+winmali_alloc_cpu_for_kmt(uint32_t kmt, void **cpu, uint64_t *size)
++winmali_alloc_cpu_for_kmt(uint32_t kmt, void **cpu, uint64_t *size,
++                          uint32_t *pitch)
 +{
-+   *cpu = NULL; *size = 0;
++   *cpu = NULL; *size = 0; if (pitch) *pitch = 0;
 +   simple_mtx_lock(&g_kmt_alloc_ids.lock);
 +   for (uint32_t i = 0; i < g_kmt_alloc_ids.count; i++) {
 +      if (g_kmt_alloc_ids.ent[i].kmt == kmt) {
 +         *cpu  = g_kmt_alloc_ids.ent[i].cpu;
 +         *size = g_kmt_alloc_ids.ent[i].size;
++         if (pitch) *pitch = g_kmt_alloc_ids.ent[i].pitch;
 +         break;
 +      }
 +   }
@@ -4289,7 +4723,7 @@ index 635db13..19293ee 100644
  struct pan_kmod_bo *
  winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
                                  uint32_t kmt_allocation_handle,
-@@ -832,7 +1466,27 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
+@@ -832,7 +1490,27 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
      * backbuffer created by the D3D runtime). Address it via GpuMmu (vm_bind ->
      * pfnMapGpuVirtualAddressCb) - NO BoFromAllocation escape, so no cross-device
      * pfnEscapeCb round-trip (which crashed d3d11's escape telemetry) and no
@@ -4318,13 +4752,79 @@ index 635db13..19293ee 100644
     uint32_t h = 0;
     int serr = syncobj_create_timeline(&h);
     if (serr) {
-@@ -846,9 +1500,257 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
+@@ -844,11 +1522,328 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
+    wbo->sync.read_point  = 0;
+    wbo->sync.write_point = 0;
     wbo->wddm_kmt_handle  = kmt_allocation_handle;
-    wbo->wddm_cpu_va      = NULL;   /* GPU-only: DWM composites it, not the CPU. */
+-   wbo->wddm_cpu_va      = NULL;   /* GPU-only: DWM composites it, not the CPU. */
  
 -   /* Mark the BO as imported so callers don't try to re-export it. */
 -   pan_kmod_bo_init(&wbo->base, dev, NULL, size,
 -                    flags | PAN_KMOD_BO_FLAG_IMPORTED, kmt_allocation_handle);
++   /* ⛔ THIS USED TO BE A HARD `NULL` WITH THE COMMENT "GPU-only: DWM composites
++    * it, not the CPU" - AND THAT ASSUMPTION IS NOW THE THING BLOCKING PIXELS.
++    *
++    * Measured 2026-08-16, clean boot, real traffic: the GPU completes every
++    * submit (CsSubmits 886 / CsOk 886 / CsTimeouts 0) and the surface the present
++    * worker scans holds a full desktop (StatSrcNonBlack 646/646, 639 edges) - but
++    * its change counter is FLAT. Rendering lands in panfrost's own GPU BOs;
++    * delivery into this imported primary is a CPU copy
++    * (panfrost_resource_copy_region), and that copy dies here: with
++    * wddm_cpu_va == NULL, winmali_kmod_bo_map_cpu() refuses every KMT-imported
++    * destination (it must - the escape addresses BOs by a handle meaningless for
++    * an imported surface), so `mapping dst-texture failed` and the frame is
++    * dropped. The scanned pages therefore keep whatever was in them at logon.
++    *
++    * The premise no longer holds: since escape 0x93 the UMD locks these surfaces
++    * and registers the resulting user VA, and the KMD wraps THOSE EXACT PAGES as
++    * the scanout source. So the CPU VA is both known and precisely the memory the
++    * panel reads. Hand it back.
++    *
++    * ⚠ Only when the registered extent covers the whole BO. A short mapping here
++    * is a heap corruptor that passes every `if (!ptr)` check - the same trap
++    * bo_map_cpu already guards with its MappedBytes contract check. */
++   {
++      void *reg_cpu = NULL;
++      uint64_t reg_size = 0;
++      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &reg_cpu, &reg_size, NULL);
++      /* ⛔★★★★★ COMPARE PAGE-GRANULAR, NOT BYTE-EXACT.
++       *
++       * `size` is the BO size, which the allocator PAGE-ROUNDS. `reg_size` is the
++       * registered extent, which is the real pixel data (stride * height). For a
++       * surface whose data is not a whole number of pages these differ by up to
++       * one page, and a byte-exact `reg_size >= size` then rejects a surface
++       * every byte of which IS registered.
++       *
++       * MEASURED 2026-08-17, dwm's own log:
++       *   kmt=0xc0005740 NO usable CPU VA (reg_size=1483776 bo_size=1486848)
++       *   OpenResource: OPENED shared surface 2944x126 stride=11776
++       *   126 * 11776 == 1483776 exactly; the BO is 3072 B (< 1 page) larger.
++       * That surface is 2944x126 - a full-width 126px strip, i.e. THE TASKBAR,
++       * the one element that never appears on the panel. Every other import
++       * adopted its VA and only this one was refused.
++       *
++       * Rounding UP is safe here specifically because the VA comes from a
++       * probe-locked MDL and MDLs lock WHOLE PAGES: the bytes between reg_size
++       * and the page boundary are really mapped, so a copy that runs to the end
++       * of the final page cannot leave the locked region. This is NOT the "short
++       * mapping" hazard the comment above warns about - that is a mapping which
++       * ends before the real data does, which this still refuses. */
++      const uint64_t reg_pages = (reg_size + 4095ull) & ~4095ull;
++      if (reg_cpu != NULL && reg_pages >= size) {
++         wbo->wddm_cpu_va = reg_cpu;
++         mesa_loge("wm: imported kmt=0x%x ADOPTS registered CPU VA %p (%llu >= %llu)"
++                   " - CPU delivery into the scanout source is now possible",
++                   kmt_allocation_handle, reg_cpu,
++                   (unsigned long long)reg_size, (unsigned long long)size);
++      } else {
++         wbo->wddm_cpu_va = NULL;
++         mesa_loge("wm: imported kmt=0x%x has NO usable CPU VA (cpu=%p reg_size=%llu"
++                   " bo_size=%llu) - CPU delivery will be refused for it",
++                   kmt_allocation_handle, reg_cpu,
++                   (unsigned long long)reg_size, (unsigned long long)size);
++      }
++   }
++
 +   /* ★★★ THE COLLISION FIX ★★★
 +    *
 +    * This used to call winmali_handle_for_kmt(), a SECOND handle minter that
@@ -4445,13 +4945,19 @@ index 635db13..19293ee 100644
 +       * PFNs with no paging operation at all. */
 +      void    *lock_cpu  = NULL;
 +      uint64_t lock_size = 0;
-+      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &lock_cpu, &lock_size);
++      uint32_t lock_pitch = 0;
++      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &lock_cpu, &lock_size,
++                                &lock_pitch);
 +      if (lock_cpu != NULL && lock_size != 0) {
 +         WINMALI_BO_FROM_USER_VA fv;
 +         memset(&fv, 0, sizeof fv);
 +         fv.UserVa = (uint64_t)(uintptr_t)lock_cpu;
 +         fv.Size   = lock_size;
 +         fv.Flags  = flags & 0xff;
++         /* ★ TELL THE KERNEL THE SHAPE. Without this the present worker copies
++            every candidate at the panel pitch, which turns any surface with a
++            different stride into a squashed partial frame. */
++         fv.SrcPitch = lock_pitch;
 +
 +         int verr = escape_simple(WinMaliEscapeOp_BoFromUserVa, &fv, sizeof fv);
 +         if (verr == 0 && fv.BoHandle != 0) {
@@ -4460,9 +4966,9 @@ index 635db13..19293ee 100644
 +            cerr = 0;
 +            used_real_pages = true;
 +            mesa_loge("wm: import kmt=0x%x va=%p -> bo=%u size=%llu "
-+                      "(REAL PAGES via 0x93)",
++                      "(REAL PAGES via 0x93) pitch=%u",
 +                      kmt_allocation_handle, lock_cpu, fv.BoHandle,
-+                      (unsigned long long)fv.MappedBytes);
++                      (unsigned long long)fv.MappedBytes, lock_pitch);
 +         } else {
 +            mesa_loge("wm: 0x93 BoFromUserVa va=%p size=%llu failed (%d)",
 +                      lock_cpu, (unsigned long long)lock_size, verr);
@@ -4579,7 +5085,7 @@ index 635db13..19293ee 100644
     return &wbo->base;
  }
  
-@@ -955,6 +1857,46 @@ winmali_kmod_vm_destroy(struct pan_kmod_vm *vm)
+@@ -955,6 +1950,46 @@ winmali_kmod_vm_destroy(struct pan_kmod_vm *vm)
     pan_kmod_dev_free(vm->dev, wvm);
  }
  
@@ -4626,7 +5132,7 @@ index 635db13..19293ee 100644
  static uint64_t
  winmali_kmod_vm_alloc_va(struct winmali_kmod_vm *wvm, uint64_t size)
  {
-@@ -1055,10 +1997,36 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
+@@ -1055,10 +2090,36 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
     if (op_count == 0)
        return 0;
  
@@ -4667,7 +5173,7 @@ index 635db13..19293ee 100644
        int rc = winmali_vm_bind_dxgk(wvm, ops, op_count);
        if (rc != -ENOTSUP)
           return rc;
-@@ -1119,6 +2087,31 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
+@@ -1119,6 +2180,31 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
  
        switch (op->type) {
        case PAN_KMOD_VM_OP_TYPE_MAP:
@@ -4699,7 +5205,7 @@ index 635db13..19293ee 100644
           out->Flags = WINMALI_VM_BIND_OP_TYPE_MAP
                      | (op->map.bo->flags & 0xff);
           out->BoHandle = op->map.bo->handle;
-@@ -1416,7 +2409,32 @@ winmali_ioctl_group_submit(void *arg)
+@@ -1416,7 +2502,32 @@ winmali_ioctl_group_submit(void *arg)
      * the same syncobj handles/points the escape GroupSubmit would have signalled.
      * This makes downstream mesa syncobj waits (pan_csf completion, fence export)
      * complete instead of hanging. */
@@ -4733,7 +5239,7 @@ index 635db13..19293ee 100644
        uint32_t vm_id = winmali_group_vm_lookup(gs->group_handle);
        int rerr = 0;
  
-@@ -1452,8 +2470,10 @@ winmali_ioctl_group_submit(void *arg)
+@@ -1452,8 +2563,10 @@ winmali_ioctl_group_submit(void *arg)
           }
           return 0;
        }
@@ -4746,7 +5252,7 @@ index 635db13..19293ee 100644
        /* fall through to the escape path */
     }
  
-@@ -1514,8 +2534,19 @@ winmali_ioctl_group_submit(void *arg)
+@@ -1514,8 +2627,19 @@ winmali_ioctl_group_submit(void *arg)
     }
  
     int err = winmali_d3dkmt_escape(buf, (uint32_t)total);
@@ -4768,7 +5274,7 @@ index 635db13..19293ee 100644
     free(buf);
     return err;
  }
-@@ -1543,6 +2574,28 @@ winmali_kmod_ioctl(unsigned long request, void *arg)
+@@ -1543,6 +2667,28 @@ winmali_kmod_ioctl(unsigned long request, void *arg)
        break;
     }
  
@@ -4797,7 +5303,7 @@ index 635db13..19293ee 100644
     /* The struct size is in the high bits of the ioctl encoding. _IOWR
      * puts size in bits 16..29. The remaining ops (group/heap destroy,
      * group get-state) are layout-compatible with their WINMALI_* structs. */
-@@ -1586,6 +2639,21 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo,
+@@ -1586,6 +2732,21 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo,
  {
     struct winmali_kmod_bo *wbo = to_winmali_bo(bo);
  
@@ -4819,7 +5325,7 @@ index 635db13..19293ee 100644
     /* For exclusive_vm BOs we share the VM's syncobj — caller passes
      * vm->sync.handle, and write/read points are tracked relative to
      * that timeline. For unshared BOs we use our own. The two cases
-@@ -1614,6 +2682,24 @@ int
+@@ -1614,6 +2775,24 @@ int
  panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
                                 uint64_t *sync_point, bool read_only)
  {
@@ -4845,10 +5351,10 @@ index 635db13..19293ee 100644
     if (sync_handle)
        *sync_handle = wbo->sync.handle;
 diff --git a/src/panfrost/lib/kmod/winmali/winmali_kmod.h b/src/panfrost/lib/kmod/winmali/winmali_kmod.h
-index 9fe65fc..751d7da 100644
+index 9fe65fc..bbeeff1 100644
 --- a/src/panfrost/lib/kmod/winmali/winmali_kmod.h
 +++ b/src/panfrost/lib/kmod/winmali/winmali_kmod.h
-@@ -51,10 +51,56 @@ int winmali_kmod_ioctl(unsigned long request, void *arg);
+@@ -51,10 +51,60 @@ int winmali_kmod_ioctl(unsigned long request, void *arg);
   * compositor-visible kernel allocation becomes a BO the panfrost
   * driver can VM-bind and render to. Returns NULL on failure with errno
   * set. */
@@ -4861,7 +5367,11 @@ index 9fe65fc..751d7da 100644
 + * aperture-maps the surface and 0x81/0x92 therefore cannot see its pages.
 + * Call it wherever the allocation is locked, and pass the same size the lock
 + * covers. Safe to call repeatedly; the newest pointer wins. */
-+void winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size);
++/* pitch = the allocation's row stride in bytes. The KMD's present worker has
++ * no other way to learn the shape of the surface it copies - 0x93 used to carry
++ * only VA+size, so it assumed the PANEL pitch for everything. */
++void winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size,
++                                     uint32_t pitch);
 +
  struct pan_kmod_bo *winmali_kmod_bo_from_allocation(
     struct pan_kmod_dev *dev, uint32_t kmt_allocation_handle,

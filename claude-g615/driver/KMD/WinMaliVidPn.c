@@ -645,6 +645,66 @@ WinMaliKmdSetVidPnSourceAddress(_In_ CONST HANDLE hAdapter,
                                 (LONG)pArgs->Flags.Value);
             (VOID)InterlockedIncrement64(&adapter->FlipLatchCount);
         }
+
+        /* ★ dxgk NAMES THE SURFACE IT SCANS OUT - AND WE HAVE BEEN IGNORING IT.
+         *
+         * The present source is currently CHOSEN BY A HEURISTIC (UvSrcAcquireBest
+         * scores imported surfaces and picks the freshest). Measured result: a
+         * full desktop with NO taskbar and NO cursor, StatSrcNonBlack 646/646
+         * with Chg 0 - i.e. we latched a PRE-COMPOSITION layer that DWM painted
+         * once and abandoned. A heuristic cannot tell that from the composed
+         * frame; dxgk can, and does, on every single flip.
+         *
+         * pArgs->hAllocation is the hDeviceSpecificAllocation we handed back from
+         * DxgkDdiOpenAllocation, i.e. our own WINMALI_KMD_ALLOCATION. Record its
+         * identity so the worker can be pointed at the RIGHT surface instead of
+         * guessing at it.
+         *
+         * ⚠ DIRQL-safe: interlocked stores only, no registry, no dereference
+         * beyond the magic check. Recording ONLY for now - the worker is not
+         * rewired until these numbers prove the handle resolves. */
+        {
+            PWINMALI_KMD_ALLOCATION fa = (PWINMALI_KMD_ALLOCATION)pArgs->hAllocation;
+            if (fa != NULL && fa->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocW,      (LONG)fa->Width);
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocH,      (LONG)fa->Height);
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocPitch,  (LONG)fa->Pitch);
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocFmt,    (LONG)fa->Format);
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocSize,   (LONG)(ULONG)fa->Size);
+                (VOID)InterlockedExchange(&g_WinMaliFlipAllocId,     (LONG)fa->AllocId);
+                /* ★ THE WHOLE QUESTION IN ONE BIT: do we have its PAGES?
+                 *
+                 * We only DESCRIBE this allocation at CreateAllocation - VidMm
+                 * owns the memory, and the only way we ever see an MDL for it is
+                 * BuildPagingBuffer MAP_APERTURE_SEGMENT. Under escape submit
+                 * dxgk is not expected to aperture-map at all, which would leave
+                 * ApertureMdl NULL forever and make the true scanout surface
+                 * unreadable no matter how well we identify it.
+                 *
+                 * If this reads non-NULL, the present worker can be pointed
+                 * straight at the composed frame and the taskbar/cursor problem
+                 * is over. If it reads NULL, identifying the surface was never
+                 * going to be enough and the next move is getting its pages
+                 * (UMD-side lock + 0x93, or a real aperture mapping). */
+                /* ⚠ SAMPLED AT THE WRONG MOMENT. Flips happen at mode-set (2 of
+                   them), residency arrives later - so reading ApertureMdl HERE
+                   reports NULL even though dxgk went on to map this very
+                   allocation (ApMapMaxSize == 21,667,840 == its size). Keep the
+                   pointer instead and let the present worker, which runs
+                   continuously, look at the MDL when it actually matters. */
+                (VOID)InterlockedExchangePointer((PVOID*)&g_WinMaliFlipAlloc, fa);
+                (VOID)InterlockedExchange(&g_WinMaliFlipHasMdl,
+                                          (LONG)(fa->ApertureMdl != NULL ? 1 : 0));
+                (VOID)InterlockedExchange(&g_WinMaliFlipMdlPages,
+                                          (LONG)fa->AperturePageCount);
+                (VOID)InterlockedIncrement(&g_WinMaliFlipAllocOk);
+            } else {
+                /* NULL or wrong magic: either dxgk flips an allocation we never
+                   opened, or OpenAllocation handed back NULL for it (it does, on
+                   the path that knowingly returns success with a NULL cookie). */
+                (VOID)InterlockedIncrement(&g_WinMaliFlipAllocBad);
+            }
+        }
     }
     return STATUS_SUCCESS;
 }

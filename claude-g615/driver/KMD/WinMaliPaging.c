@@ -183,8 +183,35 @@ WinMaliPagingMapApertureSegment_(
     {
         PWINMALI_KMD_ALLOCATION ka =
             (PWINMALI_KMD_ALLOCATION)pBpb->MapApertureSegment.hAllocation;
+        /* ★ IS THE SCANOUT PRIMARY EVER APERTURE-MAPPED AT ALL?
+         *
+         * Measured: the allocation dxgk scans out (2944x1840, 21,667,840 B,
+         * named by hAllocation on every flip) has ApertureMdl == NULL, so the
+         * composed frame is unreadable. Two very different explanations:
+         *   - it IS mapped and something clears or misses the stash, or
+         *   - it is NEVER mapped, because nothing in dxgk's data plane
+         *     references it while we submit through the escape.
+         * The LARGEST allocation ever mapped settles it in one number: if that
+         * never approaches 21.6 MB, the primary is simply never made resident,
+         * and the fix is the dxgk-native data plane rather than bookkeeping. */
+        (VOID)InterlockedIncrement(&g_WinMaliApMapOps);
         if (ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC) {
             ULONG s;
+            /* Map ONCE, here, where VidMm has just handed us the MDL and it is
+               guaranteed valid. The worker then only dereferences a pointer.
+               See the ApertureVa comment in WinMaliAlloc.h - doing this per-tick
+               from the worker reboot-looped the box. */
+            if (ka->ApertureVa == NULL) {
+                ka->ApertureVa = MmGetSystemAddressForMdlSafe(
+                    pBpb->MapApertureSegment.pMdl,
+                    NormalPagePriority | MdlMappingNoExecute);
+            }
+            (VOID)InterlockedExchange(&g_WinMaliApMapLastSize, (LONG)(ULONG)ka->Size);
+            if ((LONG)(ULONG)ka->Size >
+                InterlockedCompareExchange(&g_WinMaliApMapMaxSize, 0, 0)) {
+                (VOID)InterlockedExchange(&g_WinMaliApMapMaxSize,
+                                          (LONG)(ULONG)ka->Size);
+            }
 
             /* ★★★ ACCUMULATE THE MAPPED EXTENT - DO NOT OVERWRITE IT.
              *
@@ -283,6 +310,10 @@ WinMaliPagingUnmapApertureSegment_(
                     adapter->ApertureAllocs[s] = NULL;
                 }
             }
+            /* Clear the cached VA BEFORE the MDL pointer: the worker tests the
+               MDL and then reads the VA, so dropping the VA first means it can
+               never see "MDL present, VA stale". */
+            ka->ApertureVa        = NULL;
             ka->ApertureMdl       = NULL;
             ka->ApertureMdlOffset = 0;
             ka->AperturePageCount = 0;

@@ -98,6 +98,24 @@ WinMaliBoFree_(_Inout_ PWINMALI_BO Bo)
     if (Bo == NULL) {
         return;
     }
+
+    /* ⛔★★★★★★ REVOKE FIRST. BEFORE ANY UNMAP. THIS ORDER IS THE WHOLE FIX.
+     *
+     * This call used to sit at the BOTTOM of the function, guarding only
+     * MmUnlockPages - while the system-VA teardown for a 0x93 BO
+     * (MmUnmapLockedPages on Mdl->MappedSystemVa, where Mdl == ProbeMdl) ran
+     * about twenty lines EARLIER, holding no lock at all. That mapped system VA
+     * is exactly the `srcVa` the present worker copies from, so a BO freed
+     * mid-copy pulled the mapping out from under an active RtlCopyMemory.
+     * A read through an unmapped system VA is not catchable - the machine is
+     * simply gone, and UFS records no dump, so it looked like a mysterious hang.
+     *
+     * Revoke now marks the candidate dying and BLOCKS until the worker's
+     * in-flight copy releases its use-ref, so every teardown below this line is
+     * unobserved by definition. Safe to call unconditionally: it no-ops for a BO
+     * that was never published as a candidate. */
+    WinMaliUvSrcRevoke(Bo->Handle);
+
     if (Bo->UserVa != NULL && Bo->Mdl != NULL) {
         /* Only safe to unmap if we're still in the process that owns the
            mapping. If not, document the leak - the process is normally
@@ -141,10 +159,9 @@ WinMaliBoFree_(_Inout_ PWINMALI_BO Bo)
         Bo->Mdl = NULL;
     }
     if (Bo->ProbeMdl != NULL) {
-        /* ⚠ REVOKE BEFORE UNLOCKING. This blocks until the present worker has
-           finished any copy in progress out of this MDL - the whole reason the
-           candidate table uses a mutex rather than a spinlock. */
-        WinMaliUvSrcRevoke(Bo->Handle);
+        /* Revoke already ran at the TOP of this function, before any unmap -
+           see the note there. It used to be here, which was too late by twenty
+           lines and cost every armed run. */
         /* The user pages this BO wrapped stay pinned until here. MmUnlockPages
            finds the owning process from the MDL itself, so it is safe even when
            rundown happens on another thread. IoFreeMdl, never ExFreePool. */
@@ -388,6 +405,33 @@ typedef struct _WINMALI_UVSRC_ENT {
        locks onto whichever stale frame looks busiest. "Most RECENTLY written"
        follows DWM across its backbuffers instead. */
     ULONG  LastChangeTick;
+    /* ⛔★★★★★★ THE WEDGE LIVED HERE.
+     *
+     * The present worker copies out of this MDL's SYSTEM VA while holding NO
+     * lock (holding one across a 2 MB copy wedges DWM, which needs the same
+     * mutex from its 0x93 escape). WinMaliBoFree_ meanwhile did:
+     *     line 127  MmUnmapLockedPages(Mdl->MappedSystemVa, Mdl)   <-- LOCK-FREE
+     *     line 147  WinMaliUvSrcRevoke(Handle)                     <-- takes mutex
+     * i.e. it tore down the very system mapping the worker was reading, twenty
+     * lines BEFORE the call that was supposed to make that safe. The comment on
+     * the Revoke says "blocks until the present worker has finished any copy in
+     * progress" - it does, but only for MmUnlockPages; the system-VA unmap had
+     * already happened. Reading an unmapped system VA is an UNCATCHABLE fault:
+     * hard wedge, and with no dump mode on UFS, no bugcheck is ever recorded.
+     *
+     * MEASURED: with the aperture fallback still live (most ticks avoided this
+     * path) a run reached 203 sweeps. With the aperture path gated off - forcing
+     * every tick onto 0x93 - the very next boot died after TWO redraws. Maximal
+     * exposure, immediate death: exactly this race.
+     *
+     * InUse is a use-count taken under the mutex at selection and dropped after
+     * the copy. Revoke marks Dying (so no new use can start), then WAITS for
+     * InUse to fall to zero before letting BoFree_ unmap anything. */
+    LONG    InUse;
+    BOOLEAN Dying;
+    /* Row pitch in bytes as reported by the UMD via 0x93; 0 = unknown.
+       Without it the worker assumes the PANEL pitch for every candidate. */
+    ULONG   Pitch;
 } WINMALI_UVSRC_ENT;
 
 /* Monotonic scan counter, the timebase for LastChangeTick. */
@@ -428,7 +472,8 @@ WinMaliUvSrcUnlock_(VOID)
 }
 
 VOID
-WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size)
+WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size,
+                    _In_ ULONG SrcPitch)
 {
     ULONG i, slot;
 
@@ -472,12 +517,17 @@ WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size)
     g_WinMaliUvSrc[slot].Handle = Handle;
     g_WinMaliUvSrc[slot].Mdl    = Mdl;
     g_WinMaliUvSrc[slot].Size   = Size;
+    g_WinMaliUvSrc[slot].Pitch  = SrcPitch;
     g_WinMaliUvSrc[slot].Pid    = HandleToULong(PsGetCurrentProcessId());
     WinMaliUvSrcUnlock_();
 }
 
+/* Drop a use-count taken by AcquireBest/ReacquireVa. MUST be called once per
+   successful acquisition, on every path, or Revoke below will stall its full
+   timeout on every teardown. The worker guarantees this with a pending-use
+   sweep at the top of each iteration. */
 VOID
-WinMaliUvSrcRevoke(_In_ ULONG Handle)
+WinMaliUvSrcEndUse(_In_ ULONG Handle)
 {
     ULONG i;
 
@@ -487,8 +537,55 @@ WinMaliUvSrcRevoke(_In_ ULONG Handle)
     WinMaliUvSrcLock_();
     for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
         if (g_WinMaliUvSrc[i].Handle == Handle) {
+            if (g_WinMaliUvSrc[i].InUse > 0) {
+                g_WinMaliUvSrc[i].InUse--;
+            }
+            break;
+        }
+    }
+    WinMaliUvSrcUnlock_();
+}
+
+/* ⛔★★★★★★ MUST COMPLETE BEFORE THE CALLER UNMAPS ANYTHING.
+ *
+ * Marks the slot dying so no new use can begin, then waits for any in-flight
+ * copy to finish. The wait is BOUNDED: a leaked use-count must not turn a BO
+ * teardown into a permanent hang - that would be trading one wedge for another.
+ * A 2 MB copy at write-combined speed is sub-millisecond, so 1 s is enormous
+ * headroom; if it ever expires we proceed anyway (no worse than the old
+ * behaviour, which never waited at all) and count it so it is visible. */
+VOID
+WinMaliUvSrcRevoke(_In_ ULONG Handle)
+{
+    ULONG i, spins;
+
+    if (Handle == 0 || InterlockedCompareExchange(&g_WinMaliUvSrcReady, 0, 0) == 0) {
+        return;
+    }
+    WinMaliUvSrcLock_();
+    for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
+        if (g_WinMaliUvSrc[i].Handle != Handle) {
+            continue;
+        }
+        g_WinMaliUvSrc[i].Dying = TRUE;   /* no new acquisitions from here on */
+
+        for (spins = 0; g_WinMaliUvSrc[i].InUse > 0 && spins < 200; spins++) {
+            LARGE_INTEGER delay;
+            WinMaliUvSrcUnlock_();        /* the user needs this mutex to finish */
+            delay.QuadPart = -50000LL;    /* 5 ms, relative */
+            (VOID)KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            WinMaliUvSrcLock_();
+            if (g_WinMaliUvSrc[i].Handle != Handle) {
+                break;                    /* slot recycled underneath us */
+            }
+        }
+        if (g_WinMaliUvSrc[i].Handle == Handle && g_WinMaliUvSrc[i].InUse > 0) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvRevokeTimeout);
+        }
+        if (g_WinMaliUvSrc[i].Handle == Handle) {
             RtlZeroMemory(&g_WinMaliUvSrc[i], sizeof(g_WinMaliUvSrc[i]));
         }
+        break;
     }
     WinMaliUvSrcUnlock_();
 }
@@ -498,15 +595,28 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                         _In_ ULONG Stride,
                         _In_ ULONG Height,
                         _Out_ ULONG* OutHandle,
-                        _Out_ ULONG* OutHits)
+                        _Out_ ULONG* OutHits,
+                        _Out_opt_ ULONG* OutPitch,
+                        _Out_opt_ SIZE_T* OutSize)
 {
     ULONG  i, nCand = 0, bestPid = 0, bestChg = 0, bestTick = 0;
     PVOID  bestVa = NULL;
     ULONG  bestHits = 0;
     SIZE_T bestSize = 0;
+    ULONG  bestIdx = WINMALI_UVSRC_SLOTS;
+    ULONG  bestCoverage = 0;   /* winner's painted extent, percent of its rows */
+    /* ⛔ THE WINNER'S COVERAGE ALONE CANNOT SAY WHY IT IS LOW. 0% could mean
+       'selection picked badly' or 'nothing better was on offer' - opposite bugs
+       needing opposite fixes. maxCoverage is the best coverage ANY candidate had
+       this tick, so the pair splits them: max high + best low = we chose wrong;
+       both low = the composed frame is not among the candidates at all. */
+    ULONG  maxCoverage = 0;
+    ULONG  nQual = 0;   /* candidates that passed the size gate THIS tick */
 
     *OutHandle = 0;
     *OutHits   = 0;
+    if (OutPitch != NULL) { *OutPitch = 0; }
+    if (OutSize  != NULL) { *OutSize  = 0; }
     if (NeedBytes == 0) {
         return NULL;
     }
@@ -520,19 +630,47 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         PUCHAR base;
         ULONG  hits = 0, nonBlack = 0, y;   /* hits = TRANSITIONS, not non-black */
         ULONG  sum = 2166136261u, changes = 0, lastTick = 0;
+        ULONG  lastNz = 0, coverage = 0;    /* how far down content reaches, % */
 
-        if (g_WinMaliUvSrc[i].Handle == 0 || g_WinMaliUvSrc[i].Mdl == NULL) {
-            continue;
+        if (g_WinMaliUvSrc[i].Handle == 0 || g_WinMaliUvSrc[i].Mdl == NULL ||
+            g_WinMaliUvSrc[i].Dying) {
+            continue;   /* Dying: BoFree is waiting to unmap this - never adopt it */
         }
         /* ★ COUNT THE POPULATION SEPARATELY FROM THE WINNER. A bare "uvBo=0"
            cannot tell "nothing was ever published" from "published but all too
            small" from "big enough but unpainted" - three different bugs with
            three different fixes. Publish all three. */
         (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcCands);
-        if (g_WinMaliUvSrc[i].Size < NeedBytes) {
-            (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcTooSmall);
-            continue;   /* too small to be the composed primary */
+        {
+            /* ⛔★★★★★ SIZE THE GATE BY THE CANDIDATE'S OWN PITCH.
+             *
+             * NeedBytes is the PANEL's frame size (Height x 11776). But a
+             * candidate is laid out at ITS pitch, and the surfaces DWM actually
+             * registers are pitch 11904 - so covering the same 1840 rows needs
+             * 21,903,360 B, not 21,667,840. Comparing every candidate against a
+             * single panel-derived constant asks the wrong question of anything
+             * whose stride is not the panel's: it lets through a wide-pitch
+             * buffer that is too SHORT to fill the screen, and (with a narrower
+             * pitch) would reject one that is tall enough.
+             * ⇒ Require enough bytes for a full screen AT THIS SLOT'S PITCH. */
+            ULONG  gp   = (g_WinMaliUvSrc[i].Pitch != 0) ? g_WinMaliUvSrc[i].Pitch
+                                                         : Stride;
+            SIZE_T need = (SIZE_T)Height * gp;
+            if (need < NeedBytes) { need = NeedBytes; }
+            if (g_WinMaliUvSrc[i].Size < need) {
+                (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcTooSmall);
+                continue;   /* cannot cover the panel at its own stride */
+            }
         }
+        /* ★ HOW MANY CANDIDATES ACTUALLY REACHED THE COVERAGE SCAN THIS TICK.
+         *
+         * Without this, maxCoverage=0 is AMBIGUOUS - it reads identically for
+         * "every qualifying surface was blank" and "nothing qualified at all",
+         * which are opposite problems. MEASURED: the first read of StatUvMaxCov
+         * printed 0 on a tick with no winner (StatUvSrcPid/Pages both 0), and I
+         * nearly took it as "the composed frame never reaches the KMD".
+         * ⇒ A summary counter needs a DENOMINATOR or it is not an oracle. */
+        nQual++;
         base = (PUCHAR)MmGetSystemAddressForMdlSafe(
                    g_WinMaliUvSrc[i].Mdl, NormalPagePriority | MdlMappingNoExecute);
         if (base == NULL) {
@@ -563,7 +701,13 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
          * documented "device wrote it, CPU is about to read it" invalidate, and
          * it is the same call WinMaliBoFlushVm already uses. PASSIVE_LEVEL, and
          * cheap next to the 21 MB copy that follows. */
-        KeFlushIoBuffers(g_WinMaliUvSrc[i].Mdl, TRUE, TRUE);
+        /* ⚠ Now gated: correct when the GPU was the last writer, but once the
+           frame is delivered by a CPU copy into these same pages an invalidate
+           can discard lines that copy just dirtied, making a working delivery
+           read as a frozen surface. Parameters\UvSrcInvalidate=0 flips it. */
+        if (g_WinMaliUvSrcInvalidate) {
+            KeFlushIoBuffers(g_WinMaliUvSrc[i].Mdl, TRUE, TRUE);
+        }
 
         /* ⛔ DO NOT SCORE BY "COUNT OF NON-BLACK PIXELS". THAT IS WHAT PUT A
            FULLY WHITE SCREEN ON THE PANEL.
@@ -584,12 +728,28 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         {
             ULONG prev = 0;
             BOOLEAN havePrev = FALSE;
-            for (y = 0; y < Height; y += 97) {
-                const ULONG *row = (const ULONG *)(base + (SIZE_T)y * Stride);
+            /* ⛔★★★★★ SCAN EACH CANDIDATE AT **ITS OWN** PITCH.
+             *
+             * This walked every candidate at the caller's Stride - the PANEL
+             * pitch, 11776 - but the surfaces DWM and Explorer actually register
+             * are pitch 11904 (2976x1856, MEASURED as StatWinPitch). Sampling an
+             * 11904-pitch buffer in 11776 steps drifts one row every ~92 rows, so
+             * the "grid" sheared across the image and both the structure score and
+             * the change-detect hash described a diagonal smear rather than the
+             * frame. Every selection decision rested on that.
+             * ★ The pitch has been available per-slot since the UMD started
+             * reporting it; this is the code that was still assuming. */
+            ULONG sp   = (g_WinMaliUvSrc[i].Pitch != 0) ? g_WinMaliUvSrc[i].Pitch
+                                                        : Stride;
+            ULONG rows = (ULONG)(g_WinMaliUvSrc[i].Size / sp);
+            if (rows > Height) { rows = Height; }
+            for (y = 0; y < rows; y += 97) {
+                const ULONG *row = (const ULONG *)(base + (SIZE_T)y * sp);
                 ULONG x;
-                for (x = 0; x < (Stride / 4); x += 89) {
+                BOOLEAN rowNz = FALSE;
+                for (x = 0; x < (sp / 4); x += 89) {
                     ULONG px = row[x] & 0x00FFFFFFu;
-                    if (px != 0) { nonBlack++; }
+                    if (px != 0) { nonBlack++; rowNz = TRUE; }
                     if (havePrev && px != prev) { hits++; }
                     /* Order-sensitive so a permutation of the same pixels still
                        registers as a change. */
@@ -597,7 +757,16 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                     prev = px;
                     havePrev = TRUE;
                 }
+                /* ★ HOW FAR DOWN THE SURFACE DOES CONTENT REACH? A fully composed
+                   desktop paints to the bottom; a partial-update surface does not.
+                   That distinction is the one thing size and freshness cannot make,
+                   and MEASURED it is exactly what goes wrong: StatSrcLastRow=144
+                   with 19 non-black rows means the latched winner held only a top
+                   strip while 25,476 of 25,549 candidates were rejected on size
+                   alone. */
+                if (rowNz) { lastNz = y; }
             }
+            coverage = (rows != 0) ? ((lastNz * 100u) / rows) : 0u;
         }
 
         /* Liveness, tracked per slot across ticks. */
@@ -634,6 +803,11 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         /* ⛔ HARD REJECT A UNIFORM SURFACE. zero transitions = one flat colour
            across the whole grid. That is a cleared/blank buffer, never a composed
            desktop - and adopting one is exactly how the panel went solid white. */
+        /* Track the best coverage on offer BEFORE any rejection, so a candidate
+           that is dropped for being uniform still counts toward "was anything
+           better available". */
+        if (coverage > maxCoverage) { maxCoverage = coverage; }
+
         if (hits == 0) {
             (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcUniform);
             continue;
@@ -645,14 +819,42 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
            composed just after logon and abandoned. That is precisely why the
            taskbar (drawn later) and the cursor (moving constantly) never appear.
            Following the freshest surface tracks DWM across its backbuffers. */
-        if (bestVa == NULL ||
-            lastTick > bestTick ||
-            (lastTick == bestTick && hits > bestHits) ||
-            (lastTick == bestTick && hits == bestHits &&
-             g_WinMaliUvSrc[i].Size < bestSize)) {
+        /* ⛔★★★★★★ COVERAGE FIRST, THEN FRESHNESS.
+         *
+         * "Most recently written wins" is right for tracking DWM across its
+         * backbuffers, but on a LIVE desktop the most recently written surface is
+         * usually a small partial-update one, and among the size-qualifying
+         * candidates it can still be a buffer holding only a strip. MEASURED on
+         * the running desktop: the winner had content to row 144 of 1820 while
+         * the panel showed icons over white - a real frame underneath, and we
+         * kept latching onto scratch.
+         *
+         * Coverage - how far down the surface content actually reaches - is the
+         * one signal that separates "the composed screen" from "a piece of it",
+         * and it costs nothing: the scan above already walks the rows.
+         *
+         * Bucketed to 10% so tiny scan-to-scan jitter cannot flip the winner and
+         * reintroduce the mid-frame source changes the latch was added to stop;
+         * within a bucket the freshest still wins, exactly as before. */
+        {
+            ULONG covBucket     = coverage / 10u;
+            ULONG bestCovBucket = bestCoverage / 10u;
+            BOOLEAN better =
+                (bestVa == NULL) ||
+                (covBucket > bestCovBucket) ||
+                (covBucket == bestCovBucket && lastTick > bestTick) ||
+                (covBucket == bestCovBucket && lastTick == bestTick &&
+                 hits > bestHits) ||
+                (covBucket == bestCovBucket && lastTick == bestTick &&
+                 hits == bestHits && g_WinMaliUvSrc[i].Size < bestSize);
+            if (!better) { continue; }
+        }
+        {
             bestVa    = base;
             bestHits  = hits;
             bestSize  = g_WinMaliUvSrc[i].Size;
+            bestIdx   = i;
+            bestCoverage = coverage;
             *OutHandle = g_WinMaliUvSrc[i].Handle;
             bestPid    = g_WinMaliUvSrc[i].Pid;
             bestChg    = changes;
@@ -678,10 +880,22 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcPages,
                               (LONG)(bestSize >> PAGE_SHIFT));
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcNCand, (LONG)nCand);
+    /* The winner's painted extent - the new selection signal, published so a bad
+       pick is visible as a number instead of only as a wrong picture. */
+    (VOID)InterlockedExchange(&g_WinMaliStatUvSrcCoverage, (LONG)bestCoverage);
+    (VOID)InterlockedExchange(&g_WinMaliStatUvSrcMaxCov, (LONG)maxCoverage);
+    (VOID)InterlockedExchange(&g_WinMaliStatUvSrcQual, (LONG)nQual);
 
     *OutHits = bestHits;
     if (bestVa == NULL) {
         WinMaliUvSrcUnlock_();   /* nothing to hold the lock for */
+    } else if (bestIdx < WINMALI_UVSRC_SLOTS) {
+        if (OutPitch != NULL) { *OutPitch = g_WinMaliUvSrc[bestIdx].Pitch; }
+        if (OutSize  != NULL) { *OutSize  = g_WinMaliUvSrc[bestIdx].Size; }
+        /* ★ TAKE THE USE-REF UNDER THE LOCK WE STILL HOLD. From here until the
+           caller's WinMaliUvSrcEndUse, WinMaliUvSrcRevoke will WAIT rather than
+           let BoFree unmap the system VA the caller is about to read. */
+        g_WinMaliUvSrc[bestIdx].InUse++;
     }
     return bestVa;
 }
@@ -692,11 +906,103 @@ WinMaliUvSrcRelease(VOID)
     WinMaliUvSrcUnlock_();
 }
 
+/* ⛔★★★★★ IS THE CANDIDATE WE SELECTED STILL ALIVE?
+ *
+ * The present worker used to hold this table's mutex across the whole 2 MB copy.
+ * That WEDGED THE MACHINE: WinMaliUvSrcPublish takes the same mutex from the 0x93
+ * ESCAPE path, so DWM blocked in its escape while we copied, and everything behind
+ * DWM froze. (Symptom: the EDK2 spinner frozen while our bar kept flashing - the
+ * worker was alive precisely because it owned the lock.)
+ *
+ * Releasing it immediately after selection fixed the wedge and introduced the
+ * opposite bug: the entry can now be freed by BoFree (MmUnlockPages) WHILE we read
+ * it. MEASURED 1207: StatDbgPass=18 / StatDbgDone=17 - died INSIDE pass 18 - with
+ * StatUvSrcHits=0 and StatUvSrcBo=0, i.e. the candidate had gone away underneath
+ * the copy.
+ *
+ * So: neither hold-throughout nor no-check. Re-validate BETWEEN SLICES with a
+ * SHORT hold - selection stays protected, the copy does not monopolise the mutex,
+ * and a candidate that disappears aborts the frame instead of faulting.
+ *
+ * Returns TRUE while Handle is still present with a live MDL. */
+BOOLEAN
+WinMaliUvSrcStillValid(_In_ ULONG Handle)
+{
+    ULONG   i;
+    BOOLEAN ok = FALSE;
+
+    if (Handle == 0) {
+        return FALSE;
+    }
+    WinMaliUvSrcLock_();
+    for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
+        if (g_WinMaliUvSrc[i].Handle == Handle &&
+            g_WinMaliUvSrc[i].Mdl    != NULL &&
+            !g_WinMaliUvSrc[i].Dying) {
+            ok = TRUE;
+            break;
+        }
+    }
+    WinMaliUvSrcUnlock_();
+    return ok;
+}
+
+/* ⛔★★★★★ RE-RESOLVE A LATCHED CANDIDATE'S SYSTEM VA.
+ *
+ * AcquireBest picks a winner EVERY WAKE, and a wake copies only a 2 MB slice of
+ * the 21,667,840 B frame - so a full sweep is ~11 wakes, each free to select a
+ * DIFFERENT buffer. The scanout then holds strips composed at different instants
+ * from different surfaces, which is precisely the reported symptom: "the lines
+ * were changing places on every reprint".
+ *
+ * The cure is to latch ONE source for a whole sweep. That needs a way to get the
+ * same VA back on later wakes without re-running the beauty contest - this.
+ *
+ * Returns NULL if the handle is no longer a live candidate, which is the signal
+ * to abandon the sweep and re-select from the top. Takes the table lock only for
+ * the lookup, never across the copy (holding it there wedges DWM). */
+PVOID
+WinMaliUvSrcReacquireVa(_In_ ULONG Handle, _Out_opt_ ULONG* OutPitch,
+                        _Out_opt_ SIZE_T* OutSize)
+{
+    ULONG i;
+    PVOID va = NULL;
+
+    if (OutPitch != NULL) { *OutPitch = 0; }
+    if (OutSize  != NULL) { *OutSize  = 0; }
+    if (Handle == 0) {
+        return NULL;
+    }
+    WinMaliUvSrcLock_();
+    for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
+        if (g_WinMaliUvSrc[i].Handle == Handle &&
+            g_WinMaliUvSrc[i].Mdl    != NULL &&
+            !g_WinMaliUvSrc[i].Dying) {
+            /* Same mapping AcquireBest handed out: MmGetSystemAddressForMdlSafe
+               is idempotent for the MDL's lifetime. */
+            va = MmGetSystemAddressForMdlSafe(
+                     g_WinMaliUvSrc[i].Mdl,
+                     NormalPagePriority | MdlMappingNoExecute);
+            if (va != NULL) {
+                if (OutPitch != NULL) { *OutPitch = g_WinMaliUvSrc[i].Pitch; }
+                if (OutSize  != NULL) { *OutSize  = g_WinMaliUvSrc[i].Size; }
+                /* Same use-ref contract as AcquireBest - the caller is about to
+                   read this VA, so Revoke must wait for it. */
+                g_WinMaliUvSrc[i].InUse++;
+            }
+            break;
+        }
+    }
+    WinMaliUvSrcUnlock_();
+    return va;
+}
+
 int
 WinMaliBoCreateFromUserVa(_Inout_ PWINMALI_ADAPTER Adapter,
                           _In_ PVOID UserVa,
                           _In_ SIZE_T Size,
                           _In_ ULONG Flags,
+                          _In_ ULONG SrcPitch,
                           _In_opt_ PVOID OwnerDevice,
                           _Out_ ULONG* OutHandle,
                           _Out_opt_ UINT64* OutMappedBytes)
@@ -786,7 +1092,7 @@ WinMaliBoCreateFromUserVa(_Inout_ PWINMALI_ADAPTER Adapter,
        us WHICH surface DWM composed into (its presents are not ours and carry
        no allocation list), so identify it by the only property the primary must
        have - big enough, and painted. */
-    WinMaliUvSrcPublish(bo->Handle, mdl, Size);
+    WinMaliUvSrcPublish(bo->Handle, mdl, Size, SrcPitch);
 
     *OutHandle = bo->Handle;
     if (OutMappedBytes != NULL) {

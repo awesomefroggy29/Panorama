@@ -261,6 +261,45 @@ WinMaliKmdCreateAllocation(
             ka->AllocIdHi = bbPriv->AllocIdHi;
             WinMaliAllocRegisterById(adapter, ka);
         }
+        /* ⛔★★★★★ 'PaWM' ALLOCATIONS COULD NEVER BIND A COOKIE - BY CONSTRUCTION.
+         *
+         * Binding has exactly two routes and one is dead:
+         *   - DxgkCbGetHandleData resolves ZERO, ALWAYS. MEASURED over 542 opens:
+         *     byId == resolved, so 100% of successful binds came from the AllocId
+         *     fallback and none from the callback.
+         *   - That fallback only understands WINMALI_ALLOCATION_PRIVATE ('WMAl'),
+         *     which carries AllocId/AllocIdHi.
+         * WINMALI_ALLOC_PRIV ('PaWM') has NO id field at all, so such an
+         * allocation has no path to a cookie - ever. MEASURED: the 2 opens that
+         * fail carry pdMagic=0x5061574D, which IS 'PaWM' (that is simply how a C
+         * multi-char literal packs; it is not corruption).
+         *
+         * The proper fix adds an id to the shared 'PaWM' struct - a UMD + KMD ABI
+         * change touching BOTH copies of the shared header. This is the cheap
+         * KMD-ONLY test of the same hypothesis first: dxgk re-presents the
+         * creator's blob VERBATIM at open, so a hash over the blob is a stable
+         * identity computable at both ends with no UMD change.
+         *
+         * ⚠ A hash can collide for two surfaces created with identical
+         * parameters, which would bind a present to the WRONG surface. Namespaced
+         * under AllocIdHi='PaWM' so it can never alias a real 'WMAl' id, and
+         * accepted only because this is a diagnostic step - if it unblocks the
+         * presents, do the real ABI change rather than shipping the hash. */
+        if (bbPriv == NULL && priv != NULL && adapter != NULL &&
+            ka->AllocId == 0 && ka->AllocIdHi == 0 &&
+            info->pPrivateDriverData != NULL &&
+            info->PrivateDriverDataSize >= sizeof(WINMALI_ALLOC_PRIV)) {
+            const UCHAR* b = (const UCHAR*)info->pPrivateDriverData;
+            ULONG h = 2166136261u, bi;
+            for (bi = 0; bi < sizeof(WINMALI_ALLOC_PRIV); bi++) {
+                h = (h ^ b[bi]) * 16777619u;
+            }
+            if (h == 0) { h = 1; }          /* 0 means "no id" downstream */
+            ka->AllocId   = h;
+            ka->AllocIdHi = WINMALI_ALLOC_PRIV_MAGIC;
+            WinMaliAllocRegisterById(adapter, ka);
+            (VOID)InterlockedIncrement(&g_WinMaliStatPawmRegistered);
+        }
 
         /* pdSize + pdMagic + bbPriv are printed because the id arrives ZERO
            here while OpenAllocation sees a NON-ZERO id for the same blob
@@ -418,6 +457,17 @@ WinMaliKmdOpenAllocation(
         DXGK_OPENALLOCATIONINFO* oi = &pOpenAllocation->pOpenAllocation[i];
         PWINMALI_KMD_ALLOCATION  ka = NULL;
 
+        /* ⛔★★★★★ THIS PATH HAD NO REGISTRY COUNTER AT ALL.
+         *
+         * Whether a cookie ever gets bound is THE central unknown behind
+         * StatPresentNullCookie = 23/23 - and every diagnostic here goes only to
+         * WINMALI_TRACE/WARN, i.e. the EDK2 ring, which is FILL-ONCE and has been
+         * full for a long time. So "OpenAllocation resolves now" has been an
+         * assumption riding on a channel that cannot report.
+         * These make it a number: Calls == Resolved + Failed, with ById the
+         * subset that needed the AllocId fallback. */
+        (VOID)InterlockedIncrement(&g_WinMaliStatOpenCalls);
+
         /* Flat model: the per-device cookie we hand back through
            hDeviceSpecificAllocation is the WINMALI_KMD_ALLOCATION* from
            CreateAllocation. Resolve dxgk's global allocation handle to it
@@ -542,6 +592,27 @@ WinMaliKmdOpenAllocation(
          *
          * Old 32-byte blobs (created by a previously-installed UMD) carry no id;
          * they simply miss and fall through to the warning, exactly as today. */
+        /* ★ THE 'PaWM' SIDE OF THE SAME FALLBACK. Recompute the blob hash that
+           CreateAllocation registered and look it up. dxgk hands back the
+           creator's blob verbatim, so the hash matches by construction. */
+        if ((ka == NULL || ka->Magic != WINMALI_KMD_ALLOC_MAGIC) && adapter != NULL &&
+            oi->pPrivateDriverData != NULL &&
+            oi->PrivateDriverDataSize >= sizeof(WINMALI_ALLOC_PRIV) &&
+            *(const ULONG*)oi->pPrivateDriverData == WINMALI_ALLOC_PRIV_MAGIC) {
+            const UCHAR* b = (const UCHAR*)oi->pPrivateDriverData;
+            ULONG h = 2166136261u, bi;
+            PWINMALI_KMD_ALLOCATION byHash;
+            for (bi = 0; bi < sizeof(WINMALI_ALLOC_PRIV); bi++) {
+                h = (h ^ b[bi]) * 16777619u;
+            }
+            if (h == 0) { h = 1; }
+            byHash = WinMaliAllocLookupById(adapter, h, WINMALI_ALLOC_PRIV_MAGIC);
+            if (byHash != NULL && byHash->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+                ka = byHash;
+                (VOID)InterlockedIncrement(&g_WinMaliStatOpenByPawm);
+            }
+        }
+
         if ((ka == NULL || ka->Magic != WINMALI_KMD_ALLOC_MAGIC) && adapter != NULL &&
             oi->pPrivateDriverData != NULL &&
             oi->PrivateDriverDataSize >= sizeof(WINMALI_ALLOCATION_PRIVATE)) {
@@ -553,6 +624,7 @@ WinMaliKmdOpenAllocation(
                     WinMaliAllocLookupById(adapter, op->AllocId, op->AllocIdHi);
                 if (byId != NULL && byId->Magic == WINMALI_KMD_ALLOC_MAGIC) {
                     ka = byId;
+                    (VOID)InterlockedIncrement(&g_WinMaliStatOpenById);
                     WINMALI_TRACE("OpenAllocation[%u]: RESOLVED-BY-ID hAlloc=0x%x "
                                   "id=%08x:%08x ka=%p (GetHandleData had failed)",
                                   i, (ULONG)oi->hAllocation,
@@ -567,6 +639,8 @@ WinMaliKmdOpenAllocation(
 
         if (ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC) {
             InterlockedIncrement(&ka->OpenCount);
+            (VOID)InterlockedIncrement(&g_WinMaliStatOpenResolved);
+            (VOID)InterlockedExchange(&g_WinMaliStatOpenLastId, (LONG)ka->AllocId);
             oi->hDeviceSpecificAllocation = (HANDLE)ka;
         } else {
             /* Two VERY different failures produced an identical message before:
@@ -593,6 +667,16 @@ WinMaliKmdOpenAllocation(
                open fail hard, and the device is currently unbootable to test on.
                Decide once the Flags.Create correlation above identifies WHICH
                opens fail. */
+            (VOID)InterlockedIncrement(&g_WinMaliStatOpenFailed);
+            /* Publish WHY, not just that it failed: the private blob's magic and
+               size say whether this surface was created by our UMD at all
+               ('WMAl'/'PaWM') or by dxgk without us. */
+            (VOID)InterlockedExchange(&g_WinMaliStatOpenFailPdMagic,
+                (LONG)((oi->pPrivateDriverData != NULL &&
+                        oi->PrivateDriverDataSize >= sizeof(ULONG))
+                         ? *(const ULONG *)oi->pPrivateDriverData : 0u));
+            (VOID)InterlockedExchange(&g_WinMaliStatOpenFailPdSize,
+                (LONG)oi->PrivateDriverDataSize);
             oi->hDeviceSpecificAllocation = NULL;
         }
     }

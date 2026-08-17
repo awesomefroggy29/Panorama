@@ -1270,6 +1270,22 @@ WinMaliKmdResetEngine(
    lines in the ring" was mistaken for "DWM never presents" - it proved
    nothing. Both early-outs return STATUS_SUCCESS silently, so a present can
    vanish with no symptom anywhere. Calls == NotBlt + NullCookie + Blts. */
+/* DxgkDdiOpenAllocation outcomes. Calls == Resolved + Failed; ById is the
+   subset of Resolved that needed the AllocId fallback because DxgkCbGetHandleData
+   returned nothing. A NULL cookie here is exactly what makes DxgkDdiPresent drop
+   the frame - and this path had NO registry counter at all until now. */
+/* 'PaWM' blob-hash binding: Registered = created with a hash id, ByPawm =
+   opens that resolved through it. Both zero => the hypothesis is untested, not
+   refuted. */
+LONG g_WinMaliStatPawmRegistered    = 0;
+LONG g_WinMaliStatOpenByPawm        = 0;
+LONG g_WinMaliStatOpenCalls         = 0;
+LONG g_WinMaliStatOpenResolved      = 0;
+LONG g_WinMaliStatOpenById          = 0;
+LONG g_WinMaliStatOpenFailed        = 0;
+LONG g_WinMaliStatOpenLastId        = 0;
+LONG g_WinMaliStatOpenFailPdMagic   = 0;
+LONG g_WinMaliStatOpenFailPdSize    = 0;
 LONG g_WinMaliStatPresentCalls      = 0;
 LONG g_WinMaliStatPresentNotBlt     = 0;
 LONG g_WinMaliStatPresentNullCookie = 0;
@@ -1279,6 +1295,16 @@ LONG g_WinMaliStatPresentLastFlags  = 0;
 LONG g_WinMaliStatPresentLastCounts = 0;
 LONG g_WinMaliStatPresentSrcHandle  = 0;
 LONG g_WinMaliStatPresentDstHandle  = 0;
+/* Full present geometry - never captured before. Rects packed two shorts per
+   DWORD to stay inside the 127-value registry budget. */
+LONG g_WinMaliStatPresSrcRectTL     = 0;
+LONG g_WinMaliStatPresSrcRectBR     = 0;
+LONG g_WinMaliStatPresDstRectTL     = 0;
+LONG g_WinMaliStatPresDstRectBR     = 0;
+LONG g_WinMaliStatPresSubRectCnt    = 0;
+LONG g_WinMaliStatPresDmaSize       = 0;
+LONG g_WinMaliStatPresMultipass     = 0;
+LONG g_WinMaliStatPresColor         = 0;
 LONG g_WinMaliStatPresentDmaPrivSize = 0;
 LONG g_WinMaliStatPresentPrivSize   = 0;
 LONG g_WinMaliStatPresentPrivHits   = 0;
@@ -1337,6 +1363,68 @@ LONG g_WinMaliStatSubmitSyncErr     = 0;
 LONG g_WinMaliStatSyncBadHandle     = 0;
 LONG g_WinMaliStatSyncBadFlags      = 0;
 LONG g_WinMaliStatSyncWaitTimeout   = 0;
+LONG g_WinMaliStatSubmitSignalFail  = 0;
+LONG g_WinMaliStatSignalErr         = 0;
+LONG g_WinMaliStatSignalBadHandle   = 0;
+LONG g_WinMaliFlipAllocW            = 0;
+LONG g_WinMaliFlipAllocH            = 0;
+LONG g_WinMaliFlipAllocPitch        = 0;
+LONG g_WinMaliFlipAllocFmt          = 0;
+LONG g_WinMaliFlipAllocSize         = 0;
+LONG g_WinMaliFlipAllocId           = 0;
+LONG g_WinMaliApMapOps             = 0;
+LONG g_WinMaliApMapLastSize        = 0;
+LONG g_WinMaliApMapMaxSize         = 0;
+PVOID g_WinMaliFlipAlloc          = NULL;
+LONG g_WinMaliStatFlipSrcUsed      = 0;
+LONG g_WinMaliStatFlipSrcMapFail   = 0;
+LONG g_WinMaliFlipWorkerMdl        = 0;
+LONG g_WinMaliFlipWorkerPages      = 0;
+/* Present-worker chunked-copy accounting. StatCopyAbort counts frames where the
+   flip allocation moved mid-copy (we bail and leave the rest stale rather than
+   fault); StatCopyDone is KB copied on the last pass, so a partial frame is
+   visible as a number instead of only as a half-painted panel. */
+LONG g_WinMaliStatCopyAbort        = 0;
+LONG g_WinMaliStatCopyDone         = 0;
+/* ⛔★★★★★ ONE SOURCE PER SWEEP.
+   A wake copies a 2 MB slice, so a full 21,667,840 B frame takes ~11 wakes - and
+   the selection used to re-run on EVERY wake, letting consecutive strips come
+   from different surfaces. USER-OBSERVED on 1208: "the lines were changing
+   places on every reprint". LatchBo holds the winner for the whole sweep;
+   LatchDrop counts sweeps abandoned because the latched candidate died. */
+LONG g_WinMaliUvLatchBo            = 0;
+/* Last source we successfully adopted, kept ACROSS sweeps. On a tick where
+   nothing qualifies we repaint from this instead of skipping the frame - the
+   freeze half of the user-observed 'flash, render, freeze, repeat'. */
+LONG g_WinMaliUvLastGoodBo         = 0;
+LONG g_WinMaliStatUvHeldOver       = 0;
+LONG g_WinMaliStatLatchDrop        = 0;
+LONG g_WinMaliStatSweeps           = 0;   /* full frames completed */
+/* Times WinMaliUvSrcRevoke gave up waiting for an in-flight copy to release its
+   use-ref (1 s bound). Should be 0; anything else means a use-ref was leaked and
+   a BO teardown proceeded while the worker might still have been reading. */
+LONG g_WinMaliStatUvRevokeTimeout  = 0;
+/* Times SetPowerState stopped the present worker. Was a pure stub: a remote
+   shutdown was accepted and then hung for 20 minutes with the worker still
+   painting through it, needing a hard reset. */
+LONG g_WinMaliStatPowerStop        = 0;
+/* Painted extent of the adopted source, percent of its own rows. Selection now
+   prefers coverage over pure recency: on a live desktop the freshest
+   size-qualifying surface is often a partial-update strip. */
+LONG g_WinMaliStatUvSrcCoverage    = 0;
+LONG g_WinMaliStatUvSrcMaxCov      = 0;
+/* Denominator for MaxCov: candidates that passed the size gate this tick.
+   MaxCov=0 with Qual=0 means 'nothing qualified', with Qual>0 means 'all blank'
+   - opposite problems that read identically without this. */
+LONG g_WinMaliStatUvSrcQual        = 0;
+/* 1 = the scanout got a WRITE-COMBINED mapping, 0 = it fell back to UNCACHED.
+   Uncached is ~1000x slower for a 21 MB frame (~20 s vs ~30 ms) and was the
+   silent cause of the visible top-down paint AND of teardown hangs. */
+LONG g_WinMaliScanoutWc            = 0;
+LONG g_WinMaliFlipHasMdl           = 0;
+LONG g_WinMaliFlipMdlPages         = 0;
+LONG g_WinMaliFlipAllocOk           = 0;
+LONG g_WinMaliFlipAllocBad          = 0;
 LONG g_WinMaliStatCsSubmitCount     = 0;
 LONG g_WinMaliStatCsOkCount         = 0;
 LONG g_WinMaliStatRingInsert        = 0;
@@ -1460,6 +1548,7 @@ WinMaliKmdPresent(
         if (pPresent->Flags.Flip &&
             pPresent->pAllocationList != NULL &&
             pPresent->NumSrcAllocations >= 1) {
+            /* Same union/stride correction as the Blt path below. */
             PWINMALI_KMD_ALLOCATION fsrc = (PWINMALI_KMD_ALLOCATION)
                 pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].hDeviceSpecificAllocation;
             if (fsrc != NULL && fsrc->Magic == WINMALI_KMD_ALLOC_MAGIC) {
@@ -1474,6 +1563,36 @@ WinMaliKmdPresent(
         return STATUS_SUCCESS;
     }
 
+    /* ⛔★★★★★★ THIS IS THE DOCUMENTED CONTRACT. DO NOT "FIX" IT AGAIN.
+     *
+     * I switched these reads to `pAllocationInfo` on the theory that a WDDM2 /
+     * GpuMmu driver is handed that union member (24 B vs 32 B stride, so indices
+     * 1 and 2 would land mid-struct and yield garbage). It was WRONG, and the
+     * MS documentation for DXGKARG_PRESENT says so in two places:
+     *
+     *   pAllocationInfo - "Reserved for system use. The display miniport driver
+     *                      should IGNORE this member."
+     *   pAllocationList - "The driver accesses the source allocation handle
+     *                      through the hDeviceSpecificAllocation member of the
+     *                      pAllocationList[DXGK_PRESENT_SOURCE_INDEX] element
+     *                      (that is, element 1)... destination ... element 2."
+     *
+     * ⇒ pAllocationList at indices 1/2 was correct all along. REVERTED.
+     *
+     * ★★★ AND THE NULL IS NOT AN ERROR:
+     *   "If a source or destination IS NOT PRESENT FOR THE OPERATION, the
+     *    hDeviceSpecificAllocation member of the respective element is NULL."
+     *   "The hDeviceSpecificAllocation member of the FIRST element (element 0)
+     *    is ALWAYS NULL."
+     * So StatPresentNullCookie counts presents that legitimately carry no
+     * source/destination allocation - it is NOT proof of a binding failure.
+     * MEASURED and consistent with that: OpenAllocation resolves 540/542, so
+     * cookies bind fine; these presents simply do not reference allocations.
+     *
+     * ⚠ ALSO WRONG: NumSrcAllocations/NumDstAllocations are documented as "the
+     * number of CONTEXT allocations in the source/destination" - nothing to do
+     * with whether a blt source exists. Reading 0/0 as "the list is empty" was
+     * an inference, not a fact. */
     src = (PWINMALI_KMD_ALLOCATION)
         pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].hDeviceSpecificAllocation;
     dst = (PWINMALI_KMD_ALLOCATION)
@@ -1484,11 +1603,47 @@ WinMaliKmdPresent(
            populated list at different indices - publish the raw hAllocation
            values so the DDI says which, instead of another inference. */
         (VOID)InterlockedExchange(&g_WinMaliStatPresentSrcHandle,
-                (LONG)pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].hDeviceSpecificAllocation);
+                (LONG)(ULONG_PTR)pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].hDeviceSpecificAllocation);
         (VOID)InterlockedExchange(&g_WinMaliStatPresentDstHandle,
-                (LONG)pPresent->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX].hDeviceSpecificAllocation);
+                (LONG)(ULONG_PTR)pPresent->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX].hDeviceSpecificAllocation);
         (VOID)InterlockedExchange(&g_WinMaliStatPresentDmaPrivSize,
                 (LONG)pPresent->DmaBufferPrivateDataSize);
+
+        /* ⛔★★★★★ CHARACTERISE THE PRESENT INSTEAD OF GUESSING AT IT.
+         *
+         * MEASURED with a trustworthy instrument at last: SRC and DST handles
+         * are BOTH genuinely 0. Per the DXGKARG_PRESENT docs that means neither
+         * a source nor a destination allocation is part of this operation - so
+         * it is not an allocation-to-allocation blt, and every theory built on
+         * "the cookies will not resolve" was chasing something that was never
+         * there.
+         *
+         * What IS it, then? The struct carries geometry we have never once
+         * looked at. Publish it: rects packed two-per-DWORD to stay inside the
+         * registry budget, plus the DMA sizing and the multipass cursor. A
+         * ColorFill would show Color set and Flags.ColorFill; a real blt shows
+         * meaningful rects; a degenerate/synchronisation present shows empty
+         * ones. That distinction is not inferable from what we log today. */
+        (VOID)InterlockedExchange(&g_WinMaliStatPresSrcRectTL,
+                (LONG)(((ULONG)(pPresent->SrcRect.left & 0xFFFF)) |
+                       ((ULONG)(pPresent->SrcRect.top  & 0xFFFF) << 16)));
+        (VOID)InterlockedExchange(&g_WinMaliStatPresSrcRectBR,
+                (LONG)(((ULONG)(pPresent->SrcRect.right  & 0xFFFF)) |
+                       ((ULONG)(pPresent->SrcRect.bottom & 0xFFFF) << 16)));
+        (VOID)InterlockedExchange(&g_WinMaliStatPresDstRectTL,
+                (LONG)(((ULONG)(pPresent->DstRect.left & 0xFFFF)) |
+                       ((ULONG)(pPresent->DstRect.top  & 0xFFFF) << 16)));
+        (VOID)InterlockedExchange(&g_WinMaliStatPresDstRectBR,
+                (LONG)(((ULONG)(pPresent->DstRect.right  & 0xFFFF)) |
+                       ((ULONG)(pPresent->DstRect.bottom & 0xFFFF) << 16)));
+        (VOID)InterlockedExchange(&g_WinMaliStatPresSubRectCnt,
+                (LONG)pPresent->SubRectCnt);
+        (VOID)InterlockedExchange(&g_WinMaliStatPresDmaSize,
+                (LONG)pPresent->DmaSize);
+        (VOID)InterlockedExchange(&g_WinMaliStatPresMultipass,
+                (LONG)pPresent->MultipassOffset);
+        (VOID)InterlockedExchange(&g_WinMaliStatPresColor,
+                (LONG)pPresent->Color);
 
         /* ★ RESOLVE THE SOURCE BY AllocId INSTEAD.
          *
