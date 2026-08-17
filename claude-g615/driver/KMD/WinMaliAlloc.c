@@ -474,7 +474,24 @@ WinMaliKmdOpenAllocation(
            via DxgkCbGetHandleData - this is what makes the allocation list
            entries in DxgkDdiPresent point at our structs (the private blob
            on oi is the UMD's creation blob, NOT a kernel pointer). */
-        if (adapter != NULL &&
+        /* ⛔★★★★★ THIS CALLBACK IS A WDDM-VERSION VIOLATION THAT RESOLVES NOTHING.
+         *
+         * Gated OFF by default (Parameters\AllowHandleDataCb=0). Two measurements,
+         * neither of them an inference:
+         *   - It has NEVER resolved an allocation: "0 of 195", then "ZERO, ALWAYS,
+         *     over 542 opens" (see the comments below, which predate this gate).
+         *     The AllocId table does 100% of the work - openCalls=1378,
+         *     openResolved=1378, openFailed=0 on the live device.
+         *   - dxgk emits ETW id=494 "WDDM2 driver calls WDDM1.x DDI!" ~2x per
+         *     REJECTED LogonUI present, on the SAME THREAD as the present, and the
+         *     block below makes exactly 2 calls per allocation (DeviceSpecific=0
+         *     then the =1 fallback). We report WDDMVersion=DXGKDDI_WDDMv3_2 and
+         *     then call a 1.x callback on the present path.
+         * So skipping it can only remove a violation; it cannot lose a resolution
+         * that never happened. If this does not change the present rejection, the
+         * knob restores the old behaviour without a rebuild. */
+        if (g_WinMaliAllowHandleDataCb != 0 &&
+            adapter != NULL &&
             adapter->DxgkInterface.DxgkCbGetHandleData != NULL &&
             oi->hAllocation != 0) {
             DXGKARGCB_GETHANDLEDATA ghd;

@@ -116,6 +116,43 @@ ULONG g_WinMaliTraceSubmit = 0;
    is NOT in StopDevice, so the next step is isolation, not another theory. */
 ULONG g_WinMaliPresentTimerHz = 30;
 
+/* Parameters\AllowHandleDataCb: 1 = still call DxgkCbGetHandleData, 0 = skip it.
+   DEFAULT 0.
+   ★ WHY OFF BY DEFAULT - two independent measurements say it is pure liability:
+     1. IT HAS NEVER ONCE WORKED. This file's own OpenAllocation comments record
+        "resolves 0 of 195 opens" and "resolves ZERO, ALWAYS, MEASURED over 542
+        opens"; 100% of successful binds come from the AllocId table instead
+        (live counters: openCalls=1378 openResolved=1378 openFailed=0).
+     2. dxgk COMPLAINS ABOUT IT, on the thread that then fails the present. ETW
+        Microsoft-Windows-DxgKrnl id=494 emits "WDDM2 driver calls WDDM1.x DDI!"
+        ~2x per rejected LogonUI present, same thread - and OpenAllocation calls
+        DxgkCbGetHandleData exactly TWICE per allocation (DeviceSpecific=0 then
+        the =1 fallback). We declare WDDMVersion=DXGKDDI_WDDMv3_2 and then use a
+        1.x callback on the present path.
+   So this removes a call that costs a WDDM-version violation and returns nothing.
+   Knob kept so the old behaviour is one registry value away. */
+ULONG g_WinMaliAllowHandleDataCb = 0;
+
+/* Parameters\SegmentShape: how we describe our ONE memory segment to dxgk.
+     0 = legacy: Aperture only                      (every build up to KMD_1236)
+     1 = Aperture + DirectFlip + PopulatedFromSystemMemory        <-- DEFAULT
+     2 = real MEMORY segment: Aperture=0, DirectFlip,
+         PopulatedFromSystemMemory, CpuTranslatedAddress = DmaSegmentPhys
+   ★ WHY. DXGK_SEGMENTFLAGS has a PER-SEGMENT DirectFlip bit (0x400,
+   "supports direct flip"). We have always sent Flags.Value=0 plus
+   Aperture|CacheCoherent|CpuVisible|ApplicationTarget|NonLocalBudgetGroup, so
+   DirectFlip=0: we tell dxgk that NOTHING allocated in our only segment may be
+   a flip target. dxgk then refuses LogonUI's RedirectedFlip with
+   STATUS_INVALID_PARAMETER - which is the CORRECT response to that declaration.
+   Measured: 9/9 rejected for us, while the stock driver accepts the identical
+   present shape 200/200 on the same machine.
+   Shape 2 is the honest description for a UMA part - the segment IS contiguous
+   system memory and we already know its physical base (DmaSegmentPhys, used for
+   the root page table) - but it changes how dxgk manages the segment, so it is
+   NOT the default: shape 1 is the minimal delta that tests the DirectFlip
+   hypothesis without disturbing the render path that currently works. */
+ULONG g_WinMaliSegmentShape = 1;
+
 /* Parameters\FailOnGpuFault: make a draw that FAULTED return a failed submit
    instead of reporting success.
    Default 0 (report + count only). A faulting draw used to be completely
@@ -241,6 +278,10 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     (VOID)WinMaliReadParamsDword(RegistryPath, L"ComputeOnly", 1, &g_WinMaliComputeOnly);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FeatureIface", 1, &g_WinMaliFeatureIface);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"HybridRole", 0, &g_WinMaliHybridRole);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowHandleDataCb", 0,
+                                 &g_WinMaliAllowHandleDataCb);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"SegmentShape", 1,
+                                 &g_WinMaliSegmentShape);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"TraceSubmit", 0, &g_WinMaliTraceSubmit);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTimerHz", 30,
                                  &g_WinMaliPresentTimerHz);
@@ -1505,6 +1546,13 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"QueryCapsOutSz",        g_WinMaliQaiOutSize);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QueryCapsSizeof",       g_WinMaliQaiCapsSizeof);
+                /* ★ The segment flags we actually sent. DirectFlip = 0x400 is the
+                   per-segment permission for an allocation to be a flip target;
+                   we shipped it as 0 until SegmentShape was added. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QuerySegFlags",         g_WinMaliQaiSegFlags);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QuerySegShape",         g_WinMaliSegmentShape);
                 {
                     /* One row per qualifying candidate: bo / pid / hits / pages.
                        Named individually so a plain registry read decodes them

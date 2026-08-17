@@ -515,10 +515,23 @@ extern LONG  g_WinMaliStatUvSrcCoverage; /* adopted source painted extent, %% */
    refutations or silent no-ops. If OutSize < CapsSizeof the running kernel has a
    SMALLER view of DXGK_DRIVERCAPS than our 26100 WDK, and our field offsets are
    addressing the wrong bytes. */
+/* 0 (default) = do NOT call the WDDM1.x DxgkCbGetHandleData callback. It has
+   never resolved a single allocation (0/542 measured; the AllocId table does
+   100%), and dxgk logs "WDDM2 driver calls WDDM1.x DDI!" for it ~2x per rejected
+   present - exactly the 2 calls OpenAllocation makes per allocation. */
+extern ULONG g_WinMaliAllowHandleDataCb;
+
+/* Segment description shape - see the long comment in WinMaliDriver.c.
+   0=legacy aperture, 1=aperture+DirectFlip(default), 2=real memory segment.
+   DXGK_SEGMENTFLAGS.DirectFlip (0x400) is what tells dxgk an allocation in this
+   segment is permitted to be a flip target; we shipped it as 0 forever. */
+extern ULONG g_WinMaliSegmentShape;
+
 extern ULONG g_WinMaliQaiFlipCapsValue;
 extern ULONG g_WinMaliQaiFlipCapsOff;
 extern ULONG g_WinMaliQaiOutSize;
 extern ULONG g_WinMaliQaiCapsSizeof;
+extern ULONG g_WinMaliQaiSegFlags;   /* DXGK_SEGMENTFLAGS we sent; DirectFlip=0x400 */
 
 extern LONG  g_WinMaliScanoutWc;      /* 1 = write-combined, 0 = UNCACHED (~1000x) */
 extern LONG  g_WinMaliFlipHasMdl;

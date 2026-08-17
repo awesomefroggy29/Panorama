@@ -51,6 +51,10 @@ ULONG g_WinMaliQaiFlipCapsValue = 0;
 ULONG g_WinMaliQaiFlipCapsOff   = 0;
 ULONG g_WinMaliQaiOutSize       = 0;
 ULONG g_WinMaliQaiCapsSizeof    = 0;
+/* The segment flags we actually handed dxgk. Same discipline as the caps above:
+   the DbgPrint is useless without a kernel debugger, so publish it. Expect
+   DirectFlip (0x400) set once SegmentShape >= 1. */
+ULONG g_WinMaliQaiSegFlags      = 0;
 
 NTSTATUS APIENTRY
 WinMaliKmdQueryAdapterInfo(
@@ -687,7 +691,6 @@ WinMaliKmdQueryAdapterInfo(
         if (segs != NULL) {
             RtlZeroMemory(segs, sizeof(DXGK_SEGMENTDESCRIPTOR3) * kNumSegs);
             segs[0].Flags.Value                     = 0;
-            segs[0].Flags.Aperture                  = 1;
             segs[0].Flags.CacheCoherent             = 1;
             segs[0].Flags.CpuVisible                = 1;
             segs[0].Flags.ApplicationTarget         = 1;
@@ -695,12 +698,41 @@ WinMaliKmdQueryAdapterInfo(
             segs[0].Flags.LocalBudgetGroup          = 0;
             segs[0].BaseAddress.QuadPart            = WINMALI_SYSMEM_GPU_BASE;
             segs[0].CpuTranslatedAddress.QuadPart   = 0;   /* Aperture: dxgk pins pages on demand */
+
+            /* ★★★★★ DirectFlip IS A **PER-SEGMENT** PERMISSION, AND WE HAVE
+             * ALWAYS SENT IT AS 0.
+             *
+             * DXGK_SEGMENTFLAGS.DirectFlip (0x400, "supports direct flip") says
+             * whether an allocation living in THIS segment is allowed to be a
+             * flip target. We have exactly one segment and shipped it without
+             * that bit, i.e. we told dxgk nothing we host may ever be flipped
+             * to - and dxgk then refused LogonUI's RedirectedFlip with
+             * STATUS_INVALID_PARAMETER, which is the correct response to that
+             * declaration. Measured 9/9 rejected here vs 200/200 accepted for the
+             * stock driver on the same box with the identical present shape.
+             * See Parameters\SegmentShape for the full matrix. */
+            if (g_WinMaliSegmentShape >= 1) {
+                segs[0].Flags.DirectFlip                = 1;
+                segs[0].Flags.PopulatedFromSystemMemory = 1;
+            }
+            if (g_WinMaliSegmentShape >= 2) {
+                /* Describe it as what it actually is: contiguous system memory
+                   whose physical base we already know and use for the root page
+                   table. Not an aperture. */
+                segs[0].Flags.Aperture                = 0;
+                segs[0].CpuTranslatedAddress.QuadPart = adapter->DmaSegmentPhys.QuadPart;
+            } else {
+                segs[0].Flags.Aperture                = 1;
+            }
+
             segs[0].Size                            = adapter->DmaSegmentBytes;
             segs[0].NbOfBanks                       = 0;
             segs[0].pBankRangeTable                 = NULL;
             segs[0].CommitLimit                     = adapter->DmaSegmentBytes;
             segs[0].SystemMemoryEndAddress          = 0;
-            DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 fill] OK (1 aperture seg, %lu MiB)\n",
+            g_WinMaliQaiSegFlags = (ULONG)segs[0].Flags.Value;
+            DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 fill] OK (shape=%lu flags=0x%08x, %lu MiB)\n",
+                     g_WinMaliSegmentShape, (unsigned)segs[0].Flags.Value,
                      (ULONG)(adapter->DmaSegmentBytes >> 20));
         } else {
             DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 probe] NbSegment=%u\n", kNumSegs);
@@ -743,7 +775,6 @@ WinMaliKmdQueryAdapterInfo(
         if (segs != NULL) {
             RtlZeroMemory(segs, sizeof(DXGK_SEGMENTDESCRIPTOR4) * kNumSegs);
             segs[0].Flags.Value                     = 0;
-            segs[0].Flags.Aperture                  = 1;
             segs[0].Flags.CacheCoherent             = 1;
             segs[0].Flags.CpuVisible                = 1;
             segs[0].Flags.ApplicationTarget         = 1;
@@ -751,11 +782,29 @@ WinMaliKmdQueryAdapterInfo(
             segs[0].Flags.LocalBudgetGroup          = 0;
             segs[0].BaseAddress.QuadPart            = WINMALI_SYSMEM_GPU_BASE;
             segs[0].CpuTranslatedAddress.QuadPart   = 0;
+
+            /* ★ Must MATCH QUERYSEGMENT3 exactly - dxgk reads whichever it
+               prefers, and a driver that describes the same segment two
+               different ways is worse than one that gets it wrong once.
+               See the long comment in the QUERYSEGMENT3 case above. */
+            if (g_WinMaliSegmentShape >= 1) {
+                segs[0].Flags.DirectFlip                = 1;
+                segs[0].Flags.PopulatedFromSystemMemory = 1;
+            }
+            if (g_WinMaliSegmentShape >= 2) {
+                segs[0].Flags.Aperture                = 0;
+                segs[0].CpuTranslatedAddress.QuadPart = adapter->DmaSegmentPhys.QuadPart;
+            } else {
+                segs[0].Flags.Aperture                = 1;
+            }
+
             segs[0].Size                            = adapter->DmaSegmentBytes;
             segs[0].CommitLimit                     = adapter->DmaSegmentBytes;
             segs[0].SystemMemoryEndAddress          = 0;
+            g_WinMaliQaiSegFlags = (ULONG)segs[0].Flags.Value;
             segs[0].NumInvalidMemoryRanges          = 0;
-            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 fill] OK (1 aperture seg, %lu MiB)\n",
+            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 fill] OK (shape=%lu flags=0x%08x, %lu MiB)\n",
+                     g_WinMaliSegmentShape, (unsigned)segs[0].Flags.Value,
                      (ULONG)(adapter->DmaSegmentBytes >> 20));
         } else {
             DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 probe] NbSegment=%u\n", kNumSegs);
