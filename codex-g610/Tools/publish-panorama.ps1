@@ -88,6 +88,13 @@ if ($origin -notmatch '(?i)(^|[/:])awesomefroggy29/panorama(?:\.git)?$') {
     throw "Unexpected Panorama origin '$origin'. Refusing to push to the wrong repository."
 }
 
+$branch = (Invoke-Git -Repository $panoramaRoot -Arguments @(
+    "branch", "--show-current"
+)).Output | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($branch)) {
+    throw "Panorama is in detached-HEAD state. Check out the intended branch first."
+}
+
 # Refuse to absorb changes belonging to the other developer or repository
 # root. Existing codex-g610 changes are in scope and will be replaced/staged.
 $panoramaStatus = (Invoke-Git -Repository $panoramaRoot -Arguments @(
@@ -183,25 +190,41 @@ $changed = Invoke-Git -Repository $panoramaRoot -Arguments @(
     "diff", "--cached", "--quiet", "--", "codex-g610"
 ) -AllowFailure
 if ($changed.ExitCode -eq 0) {
-    Write-Host "Panorama codex-g610 is already current ($copied files checked)."
-    exit 0
+    Write-Host "Panorama codex-g610 files are already current ($copied files checked)."
+    Write-Host "Checking for committed changes that still need to be pushed..."
 }
-if ($changed.ExitCode -ne 1) {
+elseif ($changed.ExitCode -ne 1) {
     throw "Unable to determine whether staged Panorama changes exist."
 }
-
-$branch = (Invoke-Git -Repository $panoramaRoot -Arguments @(
-    "branch", "--show-current"
-)).Output | Select-Object -First 1
-if ([string]::IsNullOrWhiteSpace($branch)) {
-    throw "Panorama is in detached-HEAD state. Check out the intended branch first."
+else {
+    Invoke-Git -Repository $panoramaRoot -Arguments @(
+        "commit", "-m", $CommitMessage, "--", "codex-g610"
+    ) | ForEach-Object { $_.Output } | Write-Host
 }
 
-Invoke-Git -Repository $panoramaRoot -Arguments @(
-    "commit", "-m", $CommitMessage, "--", "codex-g610"
-) | ForEach-Object { $_.Output } | Write-Host
-
 if (-not $NoPush) {
+    # A previous push can fail when another developer advances main. Fetch and
+    # replay only our local commits on top of the new remote tip, preserving a
+    # linear history and avoiding force-pushes. This also lets a later run push
+    # a commit created by an earlier run even when the mirrored files match.
+    Invoke-Git -Repository $panoramaRoot -Arguments @(
+        "fetch", "origin", $branch
+    ) | ForEach-Object { $_.Output } | Write-Host
+
+    $remoteBranch = "origin/$branch"
+    $remoteIsAncestor = Invoke-Git -Repository $panoramaRoot -Arguments @(
+        "merge-base", "--is-ancestor", $remoteBranch, "HEAD"
+    ) -AllowFailure
+    if ($remoteIsAncestor.ExitCode -eq 1) {
+        Write-Host "Remote $branch advanced; rebasing local commits onto $remoteBranch..."
+        Invoke-Git -Repository $panoramaRoot -Arguments @(
+            "rebase", $remoteBranch
+        ) | ForEach-Object { $_.Output } | Write-Host
+    }
+    elseif ($remoteIsAncestor.ExitCode -ne 0) {
+        throw "Unable to compare local HEAD with $remoteBranch."
+    }
+
     Invoke-Git -Repository $panoramaRoot -Arguments @(
         "push", "origin", $branch
     ) | ForEach-Object { $_.Output } | Write-Host
