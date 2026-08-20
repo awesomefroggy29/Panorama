@@ -2255,6 +2255,37 @@ WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
     return st;
 }
 
+/* Scheduler/TDR entry point. The scheduler has already quiesced its worker,
+   so serialize with escape submissions, abort any stalled AS transaction,
+   and rebuild CSG0 on the known-good bring-up address space. */
+NTSTATUS
+WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    WINMALI_FWCTX* fw;
+    ULONG faultedAs;
+    NTSTATUS terminateStatus;
+    NTSTATUS restartStatus;
+
+    if (Adapter == NULL || Adapter->FwCtx == NULL ||
+        (Adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) == 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    fw = (WINMALI_FWCTX*)Adapter->FwCtx;
+    KeWaitForSingleObject(&fw->SubmitLock, Executive, KernelMode, FALSE, NULL);
+    faultedAs = fw->CurrentCsgAs;
+    terminateStatus = WinMaliCsfTerminateCsg_(Adapter, fw);
+    if (faultedAs < WINMALI_AS_SLOT_MAX) {
+        WinMaliCsfRecoverFaultedAs_(Adapter, faultedAs);
+    }
+    restartStatus = WinMaliCsfRebindCsgAs_(
+        Adapter, fw, Adapter->GpuMmuBringupAs);
+    KeReleaseMutex(&fw->SubmitLock, FALSE);
+
+    WINMALI_TRACE("CSF reset: oldAS=%u terminate=0x%08x restart=0x%08x",
+                  faultedAs, terminateStatus, restartStatus);
+    return restartStatus;
+}
+
 /*
  * Cross-map the bring-up CSF ring, sync page and NOP-shader page into a UMD
  * group's VM at the same fixed low GPU VAs the CSG expects (RING/SYNC/SHADER

@@ -25,21 +25,30 @@ extern "C" {
 struct pan_kmod_dev;
 struct pipe_screen;
 
+/* Arm/complete the private syncobjs carried by a WDDM render descriptor.
+ * Arm runs before pfnRenderCb so a userspace wait cannot observe the old
+ * signalled state while dxgkrnl is still queueing the DMA buffer. */
+int winmali_wddm_syncobj_arm(uint32_t handle, uint64_t *inout_point);
+int winmali_wddm_syncobj_complete(uint32_t handle, uint64_t point);
+
 /* When installed, winmali_kmod_bo_alloc routes through these. NULL = escape
  * BoCreate (baseline). Any per-alloc failure falls back to escape BoCreate,
  * so a bug in this path can never brick boot. */
 struct winmali_wddm_alloc_ops {
    void *cookie;
 
-   /* Phase 3 UMD half: submit a render command stream through the dxgk
-    * render context (pfnRenderCb) instead of the escape GroupSubmit. The CS
-    * itself lives at stream_va in the UMD's escape VM (vm_id); this tags a
-    * dxgk DMA buffer's private data with WINMALI_CS_SUBMIT_DESC so the KMD's
-    * DxgkDdiSubmitCommandVirtual runs it on the CSG. Returns 0 on success.
+   /* Phase 3 UMD half: submit a render command stream through a dxgk GPUVA
+    * context (pfnSubmitCommandCb) instead of escape GroupSubmit. The CS
+    * itself lives at stream_va; WINMALI_CS_SUBMIT_DESC is passed as validated
+    * private submission data so DxgkDdiSubmitCommandVirtual can queue it on
+    * the CSG. sync_ops is the
+    * WINMALI_SYNC_OP array for this stream; the KMD executes waits before the
+    * CS and signals after terminal completion. Returns 0 once safely queued.
     * Opt-in: panfrost only calls this when WINMALI_DXGK_SUBMIT is set;
     * otherwise the working escape GroupSubmit path is used. */
    int (*render)(void *cookie, uint32_t vm_id, uint64_t stream_va,
-                 uint32_t stream_size);
+                 uint32_t stream_size, const void *sync_ops,
+                 uint32_t sync_count);
 
    /* Phase 2 UMD half: map/unmap a dxgk allocation into the GPU virtual address
     * space via pfnMapGpuVirtualAddressCb / pfnFreeGpuVirtualAddressCb, retiring

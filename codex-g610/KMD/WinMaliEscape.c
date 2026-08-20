@@ -601,9 +601,17 @@ WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
     ULONG id = 0;
     UINT64 granted = 0;
     int err;
+    WINMALI_TRACE("Escape VmCreate: ENTER device=%p owner=%p private=%p size=%u",
+                  pEscape->hDevice,
+                  WinMaliDeviceOwnerToken(pEscape->hDevice),
+                  pEscape->pPrivateDriverData,
+                  pEscape->PrivateDriverDataSize);
     if (args == NULL) {
+        WINMALI_WARN("Escape VmCreate: invalid payload");
         return WMERR_EINVAL;
     }
+    WINMALI_TRACE("Escape VmCreate: request flags=0x%x range=0x%llx",
+                  args->Flags, (ULONGLONG)args->UserVaRange);
     err = WinMaliVmCreate(adapter, args->Flags, args->UserVaRange,
                           WinMaliDeviceOwnerToken(pEscape->hDevice),
                           &id, &granted);
@@ -611,6 +619,8 @@ WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
         args->Id          = id;
         args->UserVaRange = granted;
     }
+    WINMALI_TRACE("Escape VmCreate: EXIT err=%d id=%u granted=0x%llx",
+                  err, id, (ULONGLONG)granted);
     return err;
 }
 
@@ -1277,6 +1287,15 @@ WinMaliKmdEscape(
     case WinMaliEscapeOp_SyncObjSignal:
         hdr->Status = WinMaliEscapeSyncObjSignal_(adapter, hdr, pEscape);
         break;
+    case WinMaliEscapeOp_SyncObjArm: {
+        WINMALI_SYNC_OBJ_SIGNAL* args =
+            (WINMALI_SYNC_OBJ_SIGNAL*)WinMaliEscapeAt_(
+                pEscape, sizeof(*hdr), sizeof(*args));
+        hdr->Status = (args != NULL)
+            ? WinMaliSyncObjArmSignal(adapter, args->Handle, &args->Point)
+            : WMERR_EINVAL;
+        break;
+    }
     case WinMaliEscapeOp_SyncObjWait:
         hdr->Status = WinMaliEscapeSyncObjWait_(adapter, hdr, pEscape);
         break;

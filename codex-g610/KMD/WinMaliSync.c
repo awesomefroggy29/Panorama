@@ -21,6 +21,7 @@
 #define WMERR_EINVAL      -22
 #define WMERR_ENOMEM      -12
 #define WMERR_ENOENT      -2
+#define WMERR_EIO         -5
 #define WMERR_ETIMEDOUT   -110
 
 VOID
@@ -38,6 +39,14 @@ WinMaliSyncObjFree_(_Inout_ PWINMALI_SYNCOBJ So)
     if (So != NULL) {
         So->Magic = 0;
         ExFreePoolWithTag(So, WINMALI_POOL_TAG);
+    }
+}
+
+static VOID
+WinMaliSyncObjPut_(_Inout_opt_ PWINMALI_SYNCOBJ So)
+{
+    if (So != NULL && InterlockedDecrement(&So->RefCount) == 0) {
+        WinMaliSyncObjFree_(So);
     }
 }
 
@@ -62,7 +71,7 @@ WinMaliSyncObjTableTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
 
     while (!IsListEmpty(&freeHead)) {
         entry = RemoveHeadList(&freeHead);
-        WinMaliSyncObjFree_(CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link));
+        WinMaliSyncObjPut_(CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link));
     }
 }
 
@@ -86,6 +95,8 @@ WinMaliSyncObjCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     so->Magic         = WINMALI_SYNCOBJ_MAGIC;
     so->IsTimeline    = (Flags & WINMALI_SYNC_OBJ_FLAG_TIMELINE) ? TRUE : FALSE;
     so->TimelineValue = (InitialState != 0) ? 1 : 0;
+    so->BinarySubmittedValue = 0;
+    so->BinaryCompletedValue = 0;
     so->RefCount      = 1;
     so->OwnerDevice   = OwnerDevice;
     KeInitializeSpinLock(&so->Lock);
@@ -149,6 +160,31 @@ WinMaliSyncObjGet_(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
     return found;
 }
 
+BOOLEAN
+WinMaliSyncObjValidate(_Inout_ PWINMALI_ADAPTER Adapter,
+                       _In_ ULONG Handle,
+                       _In_opt_ PVOID OwnerDevice,
+                       _In_ BOOLEAN ExpectTimeline)
+{
+    PWINMALI_SYNCOBJ so;
+    BOOLEAN valid;
+
+    if (Adapter == NULL || Handle == 0) {
+        return FALSE;
+    }
+
+    so = WinMaliSyncObjGet_(Adapter, Handle);
+    if (so == NULL) {
+        return FALSE;
+    }
+
+    valid = (so->Magic == WINMALI_SYNCOBJ_MAGIC &&
+             so->IsTimeline == ExpectTimeline &&
+             (OwnerDevice == NULL || so->OwnerDevice == OwnerDevice));
+    WinMaliSyncObjPut_(so);
+    return valid;
+}
+
 ULONG
 WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
                            _In_ PVOID OwnerDevice)
@@ -182,7 +218,7 @@ WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
                                                 WINMALI_SYNCOBJ, Link);
         WINMALI_TRACE("SyncObjRundown: handle=%u (owner device died without "
                       "SyncObjDestroy)", so->Handle);
-        WinMaliSyncObjFree_(so);
+        WinMaliSyncObjPut_(so);
         ++freed;
     }
     return freed;
@@ -196,7 +232,7 @@ WinMaliSyncObjDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
         return WMERR_ENOENT;
     }
     WINMALI_TRACE("SyncObjDestroy: handle=%u", so->Handle);
-    WinMaliSyncObjFree_(so);
+    WinMaliSyncObjPut_(so);
     return WMERR_OK;
 }
 
@@ -216,14 +252,86 @@ WinMaliSyncObjSignal(_Inout_ PWINMALI_ADAPTER Adapter,
             so->TimelineValue = Point;
         }
     } else {
-        so->TimelineValue = 1;
+        /* Point==0 is an explicit userspace signal. A queued GPU signal has
+           the generation assigned by WinMaliSyncObjArmSignal. */
+        if (Point == 0) {
+            so->BinaryCompletedValue = so->BinarySubmittedValue;
+        } else if (Point > so->BinaryCompletedValue) {
+            so->BinaryCompletedValue = Point;
+        }
     }
     KeReleaseSpinLock(&so->Lock, oldIrql);
     /* PulseEvent so any waiters re-check; for binary that's just "signal".
        NotificationEvent SetEvent semantics make it stay signalled until
        reset; we use SetEvent + the waiter re-checks on its own. */
     KeSetEvent(&so->Event, IO_NO_INCREMENT, FALSE);
-    InterlockedDecrement(&so->RefCount);
+    WinMaliSyncObjPut_(so);
+    return WMERR_OK;
+}
+
+int
+WinMaliSyncObjFail(_Inout_ PWINMALI_ADAPTER Adapter,
+                   _In_ ULONG Handle,
+                   _In_ UINT64 Point)
+{
+    PWINMALI_SYNCOBJ so = WinMaliSyncObjGet_(Adapter, Handle);
+    KIRQL oldIrql;
+
+    if (so == NULL) {
+        return WMERR_ENOENT;
+    }
+    KeAcquireSpinLock(&so->Lock, &oldIrql);
+    if (so->IsTimeline) {
+        if (Point > so->TimelineFailedValue) {
+            so->TimelineFailedValue = Point;
+        }
+    } else {
+        if (Point == 0) {
+            Point = so->BinarySubmittedValue;
+        }
+        if (Point > so->BinaryFailedValue) {
+            so->BinaryFailedValue = Point;
+        }
+    }
+    KeReleaseSpinLock(&so->Lock, oldIrql);
+    KeSetEvent(&so->Event, IO_NO_INCREMENT, FALSE);
+    WINMALI_ERROR("SyncObjFail: handle=%u point=%llu timeline=%u",
+                  Handle, (unsigned long long)Point, so->IsTimeline);
+    WinMaliSyncObjPut_(so);
+    return WMERR_OK;
+}
+
+int
+WinMaliSyncObjArmSignal(_Inout_ PWINMALI_ADAPTER Adapter,
+                        _In_ ULONG Handle,
+                        _Inout_ UINT64* InOutPoint)
+{
+    PWINMALI_SYNCOBJ so;
+    KIRQL oldIrql;
+
+    if (InOutPoint == NULL) {
+        return WMERR_EINVAL;
+    }
+    so = WinMaliSyncObjGet_(Adapter, Handle);
+    if (so == NULL) {
+        return WMERR_ENOENT;
+    }
+
+    KeAcquireSpinLock(&so->Lock, &oldIrql);
+    if (!so->IsTimeline) {
+        ++so->BinarySubmittedValue;
+        if (so->BinarySubmittedValue == 0) {
+            /* Generation zero means "no GPU fence installed". */
+            ++so->BinarySubmittedValue;
+        }
+        *InOutPoint = so->BinarySubmittedValue;
+        KeClearEvent(&so->Event);
+    }
+    KeReleaseSpinLock(&so->Lock, oldIrql);
+
+    WINMALI_TRACE("SyncObjArm: handle=%u point=%llu timeline=%u",
+                  Handle, (unsigned long long)*InOutPoint, so->IsTimeline);
+    WinMaliSyncObjPut_(so);
     return WMERR_OK;
 }
 
@@ -278,10 +386,15 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
             /* Re-check loop: each pulse may not bring us to the target. */
             for (;;) {
                 KIRQL oldIrql;
-                BOOLEAN reached;
+                BOOLEAN reached, failed;
                 KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
                 reached = (singleSo->TimelineValue >= target);
+                failed = (singleSo->TimelineFailedValue >= target && target != 0);
                 KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+                if (failed) {
+                    err = WMERR_EIO;
+                    break;
+                }
                 if (reached) {
                     err = WMERR_OK;
                     break;
@@ -292,7 +405,12 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                 /* Re-check after clear to avoid lost-wakeup. */
                 KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
                 reached = (singleSo->TimelineValue >= target);
+                failed = (singleSo->TimelineFailedValue >= target && target != 0);
                 KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+                if (failed) {
+                    err = WMERR_EIO;
+                    break;
+                }
                 if (reached) {
                     err = WMERR_OK;
                     break;
@@ -310,12 +428,64 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                 /* Loop and re-check counter. */
             }
         } else {
-            st = KeWaitForSingleObject(&singleSo->Event, Executive,
-                                       KernelMode, FALSE, pTimeout);
-            err = (st == STATUS_TIMEOUT) ? WMERR_ETIMEDOUT
-                : (NT_SUCCESS(st)        ? WMERR_OK : WMERR_EINVAL);
+            UINT64 target;
+            KIRQL oldIrql;
+
+            KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
+            target = singleSo->BinarySubmittedValue;
+            KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+
+            if (target == 0) {
+                /* No GPU fence has replaced the initial binary state. */
+                st = KeWaitForSingleObject(&singleSo->Event, Executive,
+                                           KernelMode, FALSE, pTimeout);
+                err = (st == STATUS_TIMEOUT) ? WMERR_ETIMEDOUT
+                    : (NT_SUCCESS(st)        ? WMERR_OK : WMERR_EINVAL);
+            } else {
+                /* Capture the fence installed when the wait began. Later
+                   submissions may replace the syncobj, but must not change
+                   which generation this already-issued wait observes. */
+                for (;;) {
+                    BOOLEAN reached, failed;
+                    KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
+                    reached = (singleSo->BinaryCompletedValue >= target);
+                    failed = (singleSo->BinaryFailedValue >= target);
+                    KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+                    if (failed) {
+                        err = WMERR_EIO;
+                        break;
+                    }
+                    if (reached) {
+                        err = WMERR_OK;
+                        break;
+                    }
+                    KeClearEvent(&singleSo->Event);
+                    KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
+                    reached = (singleSo->BinaryCompletedValue >= target);
+                    failed = (singleSo->BinaryFailedValue >= target);
+                    KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+                    if (failed) {
+                        err = WMERR_EIO;
+                        break;
+                    }
+                    if (reached) {
+                        err = WMERR_OK;
+                        break;
+                    }
+                    st = KeWaitForSingleObject(&singleSo->Event, Executive,
+                                               KernelMode, FALSE, pTimeout);
+                    if (st == STATUS_TIMEOUT) {
+                        err = WMERR_ETIMEDOUT;
+                        break;
+                    }
+                    if (!NT_SUCCESS(st)) {
+                        err = WMERR_EINVAL;
+                        break;
+                    }
+                }
+            }
         }
-        InterlockedDecrement(&singleSo->RefCount);
+        WinMaliSyncObjPut_(singleSo);
         return err;
     }
 
@@ -332,14 +502,14 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
             refs[i] = WinMaliSyncObjGet_(Adapter, Handles[i]);
             if (refs[i] == NULL) {
                 while (i > 0) {
-                    InterlockedDecrement(&refs[--i]->RefCount);
+                    WinMaliSyncObjPut_(refs[--i]);
                 }
                 return WMERR_ENOENT;
             }
             if (refs[i]->IsTimeline) {
                 /* Multi-handle timeline wait isn't implemented. */
                 while (i + 1 > 0) {
-                    InterlockedDecrement(&refs[i--]->RefCount);
+                    WinMaliSyncObjPut_(refs[i--]);
                     if (i == (ULONG)-1) {
                         break;
                     }
@@ -353,7 +523,7 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                                       Executive, KernelMode, FALSE,
                                       pTimeout, NULL);
         for (i = 0; i < Count; ++i) {
-            InterlockedDecrement(&refs[i]->RefCount);
+            WinMaliSyncObjPut_(refs[i]);
         }
         if (st == STATUS_TIMEOUT) {
             return WMERR_ETIMEDOUT;

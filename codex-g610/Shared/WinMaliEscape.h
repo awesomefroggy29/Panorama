@@ -156,6 +156,9 @@ typedef enum _WINMALI_ESCAPE_OP {
      * GPU-complete on return, so signalling the destination is correct.
      * Additive (ABI minor 1); older KMDs return -EOPNOTSUPP.            */
     WinMaliEscapeOp_SyncObjSignal       = 0x91,
+    /* Replace a syncobj's current binary fence with a new pending GPU
+     * generation before the corresponding WDDM render packet is queued. */
+    WinMaliEscapeOp_SyncObjArm          = 0x92,
 } WINMALI_ESCAPE_OP;
 
 /* -------------------------------------------------------------------------- */
@@ -722,12 +725,20 @@ typedef struct _WINMALI_ALLOCATION_PRIVATE {
    VM's AS. Unset = escape VmBind addressing (baseline): use VmId's AS. */
 #define WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR  0x00000001u
 
+/* Private DMA data is copied by dxgkrnl and again into the KMD scheduler
+   queue before SubmitCommandVirtual returns. Keep the bound finite so a bad
+   UMD cannot make the miniport copy an unbounded user-controlled tail. */
+#define WINMALI_CS_SUBMIT_MAX_SYNCS  32u
+
 typedef struct _WINMALI_CS_SUBMIT_DESC {
     uint32_t Magic;        /* WINMALI_CS_SUBMIT_DESC_MAGIC */
     uint32_t VmId;         /* UMD escape VM id -> KMD resolves to AS slot */
     uint64_t StreamGpuVa;  /* CS stream GPU VA valid in that VM's AS */
     uint32_t StreamSize;   /* bytes */
     uint32_t Flags;        /* WINMALI_CS_SUBMIT_FLAG_* */
+    uint32_t SyncCount;    /* valid entries in SyncOps[] */
+    uint32_t Reserved;
+    WINMALI_SYNC_OP SyncOps[WINMALI_CS_SUBMIT_MAX_SYNCS];
 } WINMALI_CS_SUBMIT_DESC, *PWINMALI_CS_SUBMIT_DESC;
 
 /* -------------------------------------------------------------------------- */

@@ -140,6 +140,10 @@ WinMaliKmdQueryAdapterInfo(
             caps->SchedulingCaps.CancelCommandAware     = 1;
             caps->SchedulingCaps.LowIrqlPreemptCommand  = 1;   /* WDDM 2.0+ */
             caps->SchedulingCaps.No64BitAtomics         = 1;   /* WDDM 2.0+ */
+            /* Bound dxgkrnl's outstanding packets well below both preallocated
+               rings. This makes queue exhaustion an invariant failure, not a
+               normal flow-control mechanism that can reorder fences. */
+            caps->SchedulingCaps.HwQueuePacketCap       = 8;
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, MemoryManagementCaps) +
             sizeof(caps->MemoryManagementCaps) <= lim) {

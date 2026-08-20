@@ -69,9 +69,12 @@ static NTSTATUS
 WinMaliMmuWaitAsIdle_(_In_ const WINMALI_HW* Hw, _In_ ULONG asNr)
 {
     ULONG spins;
+    WINMALI_TRACE("MmuWaitAsIdleDiag: ENTER AS%u", asNr);
     for (spins = 0; spins < 500000u; ++spins) {
         ULONG st = WinMaliHwRead32(Hw, WINMALI_AS_STATUS(asNr));
         if ((st & WINMALI_AS_STATUS_AS_ACTIVE) == 0) {
+            WINMALI_TRACE("MmuWaitAsIdleDiag: EXIT AS%u success spins=%u status=0x%08x",
+                          asNr, spins, st);
             return STATUS_SUCCESS;
         }
         KeStallExecutionProcessor(1);
@@ -785,13 +788,34 @@ WinMaliMmuGetContextAsSlot(_In_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
 {
     KIRQL irql;
     ULONG as;
+    ULONG i;
+    ULONG inUse;
+    ULONG present;
+    BOOLEAN bound[WINMALI_AS_SLOT_MAX];
+    HANDLE contexts[WINMALI_AS_SLOT_MAX];
+    UINT64 roots[WINMALI_AS_SLOT_MAX];
 
     if (Adapter == NULL || hContext == NULL) {
         return WINMALI_AS_SLOT_MAX;
     }
     KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
     as = WinMaliMmuFindAsForContext_(Adapter, hContext);
+    inUse = Adapter->AsSlotInUseMask;
+    present = Adapter->AsSlotPresentMask;
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        bound[i] = Adapter->AsBindings[i].Bound;
+        contexts[i] = Adapter->AsBindings[i].hContext;
+        roots[i] = Adapter->AsBindings[i].RootPtPa;
+    }
     KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+    WINMALI_TRACE("GetContextAsSlotDiag: requestedCtx=%p result=%u inUse=0x%x present=0x%x",
+                  hContext, as, inUse, present);
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        if (bound[i]) {
+            WINMALI_TRACE("GetContextAsSlotDiag: AS%u bound=1 ctx=%p root=0x%llx",
+                          i, contexts[i], (ULONGLONG)roots[i]);
+        }
+    }
     return as;
 }
 
@@ -980,6 +1004,8 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
     NTSTATUS status;
     ULONG as;
 
+    WINMALI_TRACE("MmuVmInitDiag: ENTER adapter=%p vmpt=%p regs=%u",
+                  Adapter, VmPt, Adapter != NULL ? Adapter->GpuRegsMapped : 0);
     RtlZeroMemory(VmPt, sizeof(*VmPt));
     InitializeListHead(&VmPt->AllocatedPages);
     ExInitializeFastMutex(&VmPt->Lock);
@@ -991,13 +1017,18 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
 
     root = WinMaliMmuPtAllocPage_(Adapter);
     if (root == NULL) {
+        WINMALI_WARN("MmuVmInitDiag: root page allocation failed");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    WINMALI_TRACE("MmuVmInitDiag: root allocated va=%p pa=0x%llx",
+                  root->Va, (ULONGLONG)root->Pa.QuadPart);
     VmPt->RootVa = root->Va;
     VmPt->RootPa = root->Pa;
     InsertTailList(&VmPt->AllocatedPages, &root->Link);
 
     as = WinMaliMmuVmPickAs_(Adapter);
+    WINMALI_TRACE("MmuVmInitDiag: picked AS%u inUseMask=0x%x",
+                  as, Adapter->AsSlotInUseMask);
     if (as >= WINMALI_AS_SLOT_MAX) {
         WinMaliMmuPtFreePage_(CONTAINING_RECORD(
             RemoveHeadList(&VmPt->AllocatedPages), WINMALI_VM_PT_PAGE, Link));
@@ -1007,9 +1038,14 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
     VmPt->AsSlot = as;
 
     WinMaliMmuGetDefaultAsParams(Adapter, &transcfg, &memattr);
+    WINMALI_TRACE("MmuVmInitDiag: enabling AS%u root=0x%llx transcfg=0x%llx memattr=0x%llx",
+                  as, (ULONGLONG)VmPt->RootPa.QuadPart,
+                  (ULONGLONG)transcfg, (ULONGLONG)memattr);
     status = WinMaliMmuAsEnable(Adapter, as,
                                 (UINT64)VmPt->RootPa.QuadPart,
                                 transcfg, memattr);
+    WINMALI_TRACE("MmuVmInitDiag: AsEnable AS%u returned 0x%08x",
+                  as, status);
     if (!NT_SUCCESS(status)) {
         WinMaliMmuVmReleaseAs_(Adapter, as);
         WinMaliMmuPtFreePage_(CONTAINING_RECORD(

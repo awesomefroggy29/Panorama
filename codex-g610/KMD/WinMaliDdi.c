@@ -375,6 +375,13 @@ WinMaliKmdCreateContext(
     PWINMALI_KMD_DEVICE  dev;
     PWINMALI_KMD_CONTEXT ctx;
 
+    WINMALI_TRACE("CreateContextDiag: ENTER hDevice=%p args=%p rtContext=%p node=%u engineAffinity=0x%x flags=0x%x",
+                  hDevice, pCreateContext,
+                  pCreateContext != NULL ? pCreateContext->hContext : NULL,
+                  pCreateContext != NULL ? pCreateContext->NodeOrdinal : 0,
+                  pCreateContext != NULL ? pCreateContext->EngineAffinity : 0,
+                  pCreateContext != NULL ? pCreateContext->Flags.Value : 0);
+
     if (pCreateContext == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -412,6 +419,13 @@ WinMaliKmdCreateContext(
     pCreateContext->hContext                            = (HANDLE)ctx;
     pCreateContext->ContextInfo.DmaBufferSize           = PAGE_SIZE;
     pCreateContext->ContextInfo.DmaBufferSegmentSet     = (1u << (WINMALI_SEGMENT_ID_SYSMEM - 1));
+    /* PhysicalAdapterCaps advertises node 1 as the adapter paging node.
+       Associate every virtual render context with that node so VidMm routes
+       its GPUVA page-table work through the topology we reported. */
+    if (!pCreateContext->Flags.SystemContext &&
+        pCreateContext->Flags.VirtualAddressing) {
+        pCreateContext->ContextInfo.PagingCompanionNodeId = 1;
+    }
     /* Non-system contexts get DMA private data big enough for the present
        Blt descriptor (DxgkDdiPresent stashes a WINMALI_BLT_DESC there and
        SubmitCommand executes it). With 0 here, Present's size check always
@@ -419,7 +433,8 @@ WinMaliKmdCreateContext(
        keep 0 so the paging path can never look like a blt. */
     pCreateContext->ContextInfo.DmaBufferPrivateDataSize =
         pCreateContext->Flags.SystemContext ? 0
-                                            : (UINT)sizeof(WINMALI_BLT_DESC);
+                                            : (UINT)max(sizeof(WINMALI_BLT_DESC),
+                                                        sizeof(WINMALI_CS_SUBMIT_DESC));
     /* System / paging contexts use static GPU VAs - no patching needed.
        Render contexts on a GpuMmu adapter also don't need patching since
        the UMD writes final GPU VAs directly into the DMA buffer. So set
@@ -438,6 +453,14 @@ WinMaliKmdCreateContext(
     WINMALI_TRACE("CreateContext: ctx=%p dev=%p node=%u flags=0x%x%s",
                   ctx, dev, ctx->NodeOrdinal, ctx->Flags,
                   (pCreateContext->Flags.SystemContext) ? " [SYSTEM]" : "");
+    WINMALI_TRACE("CreateContextDiag: EXIT status=0x%08x drvContext=%p rtContext=%p dma=%u private=%u allocList=%u patchList=%u caps=0x%x pagingCompanion=%u",
+                  STATUS_SUCCESS, pCreateContext->hContext, ctx->hRtContext,
+                  pCreateContext->ContextInfo.DmaBufferSize,
+                  pCreateContext->ContextInfo.DmaBufferPrivateDataSize,
+                  pCreateContext->ContextInfo.AllocationListSize,
+                  pCreateContext->ContextInfo.PatchLocationListSize,
+                  pCreateContext->ContextInfo.Caps.Value,
+                  pCreateContext->ContextInfo.PagingCompanionNodeId);
     return STATUS_SUCCESS;
 }
 
@@ -455,7 +478,7 @@ WinMaliKmdDestroyContext(
     /* Release the Mali AS slot bound to this context (if SetRootPageTable
        ever ran). MMU unbind is idempotent / a no-op when nothing was bound. */
     if (ctx->Adapter != NULL) {
-        (VOID)WinMaliMmuUnbindContext(ctx->Adapter, ctx->hRtContext);
+        (VOID)WinMaliMmuUnbindContext(ctx->Adapter, (HANDLE)ctx);
     }
     if (ctx->OwnerDevice != NULL) {
         InterlockedDecrement(&ctx->OwnerDevice->ContextCount);
@@ -463,6 +486,118 @@ WinMaliKmdDestroyContext(
     WINMALI_TRACE("DestroyContext: ctx=%p", ctx);
     ctx->Magic = 0;
     ExFreePoolWithTag(ctx, WINMALI_POOL_TAG);
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------ */
+/* DxgkDdiRender - translate one validated WinMali UMD command into a dxgk  */
+/* DMA buffer plus the private descriptor consumed by SubmitCommandVirtual. */
+/* ------------------------------------------------------------------------ */
+
+typedef struct _WINMALI_RENDER_DMA_TOKEN {
+    ULONG Magic;
+    ULONG StreamSize;
+} WINMALI_RENDER_DMA_TOKEN;
+
+_Function_class_(DXGKDDI_RENDER)
+NTSTATUS
+APIENTRY
+WinMaliKmdRender(
+    IN_CONST_HANDLE       hContext,
+    INOUT_PDXGKARG_RENDER pRender)
+{
+    PWINMALI_KMD_CONTEXT ctx = (PWINMALI_KMD_CONTEXT)hContext;
+    WINMALI_CS_SUBMIT_DESC cs;
+    WINMALI_RENDER_DMA_TOKEN token;
+    ULONG i;
+
+    WINMALI_TRACE("Render: ctx=%p args=%p", hContext, pRender);
+
+    if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC) {
+        WINMALI_ERROR("Render: invalid context=%p", hContext);
+        return STATUS_INVALID_HANDLE;
+    }
+    if (pRender == NULL) {
+        WINMALI_ERROR("Render: NULL arguments");
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (ctx->NodeOrdinal != 0) {
+        WINMALI_ERROR("Render: context=%p is not a node-0 render context node=%u flags=0x%x",
+                      ctx, ctx->NodeOrdinal, ctx->Flags);
+        return STATUS_INVALID_HANDLE;
+    }
+    if (pRender->MultipassOffset != 0) {
+        WINMALI_ERROR("Render: unexpected multipass offset=%u", pRender->MultipassOffset);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pRender->pCommand == NULL ||
+        pRender->CommandLength != sizeof(WINMALI_CS_SUBMIT_DESC)) {
+        WINMALI_ERROR("Render: invalid command ptr=%p length=%u expected=%Iu",
+                      pRender->pCommand, pRender->CommandLength,
+                      sizeof(WINMALI_CS_SUBMIT_DESC));
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    /* pCommand is an untrusted UMD buffer. Copy it exactly once into kernel
+       storage under SEH, then validate only the owned copy. */
+    __try {
+        ProbeForRead((PVOID)pRender->pCommand, sizeof(cs), 1);
+        RtlCopyMemory(&cs, pRender->pCommand, sizeof(cs));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS status = GetExceptionCode();
+        WINMALI_ERROR("Render: command-buffer probe/copy failed status=0x%08x",
+                      status);
+        return status;
+    }
+
+    if (cs.Magic != WINMALI_CS_SUBMIT_DESC_MAGIC ||
+        cs.StreamGpuVa == 0 || cs.StreamSize == 0 || cs.Reserved != 0 ||
+        (cs.Flags & ~WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) != 0 ||
+        cs.SyncCount > WINMALI_CS_SUBMIT_MAX_SYNCS) {
+        WINMALI_ERROR("Render: invalid desc magic=0x%08x vm=%u va=0x%llx size=%u "
+                      "flags=0x%x syncs=%u reserved=0x%x",
+                      cs.Magic, cs.VmId, (unsigned long long)cs.StreamGpuVa,
+                      cs.StreamSize, cs.Flags, cs.SyncCount, cs.Reserved);
+        return STATUS_INVALID_PARAMETER;
+    }
+    for (i = 0; i < cs.SyncCount; ++i) {
+        if (cs.SyncOps[i].Handle == 0 ||
+            (cs.SyncOps[i].Flags & ~WINMALI_SYNC_OP_SIGNAL) != 0) {
+            WINMALI_ERROR("Render: invalid sync[%u] handle=%u flags=0x%x point=%llu",
+                          i, cs.SyncOps[i].Handle, cs.SyncOps[i].Flags,
+                          (unsigned long long)cs.SyncOps[i].TimelineValue);
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    if (pRender->pDmaBufferPrivateData == NULL ||
+        pRender->DmaBufferPrivateDataSize < sizeof(cs)) {
+        WINMALI_ERROR("Render: private DMA buffer too small ptr=%p size=%u expected=%Iu",
+                      pRender->pDmaBufferPrivateData,
+                      pRender->DmaBufferPrivateDataSize, sizeof(cs));
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pRender->pDmaBuffer == NULL || pRender->DmaSize < sizeof(token)) {
+        WINMALI_WARN("Render: DMA buffer depleted ptr=%p remaining=%u needed=%Iu",
+                     pRender->pDmaBuffer, pRender->DmaSize, sizeof(token));
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    }
+
+    token.Magic      = WINMALI_CS_SUBMIT_DESC_MAGIC;
+    token.StreamSize = cs.StreamSize;
+    RtlCopyMemory(pRender->pDmaBuffer, &token, sizeof(token));
+    RtlCopyMemory(pRender->pDmaBufferPrivateData, &cs, sizeof(cs));
+
+    /* DXGKARG_RENDER requires pDmaBuffer to point at the first unused byte.
+       Private data stays at its allocation base for SubmitCommandVirtual. */
+    pRender->pDmaBuffer = (PVOID)((PUCHAR)pRender->pDmaBuffer + sizeof(token));
+    pRender->MultipassOffset = pRender->CommandLength;
+
+    WINMALI_TRACE("Render: accepted ctx=%p vm=%u va=0x%llx size=%u flags=0x%x "
+                  "syncs=%u dmaBytes=%Iu privateBytes=%Iu",
+                  ctx, cs.VmId, (unsigned long long)cs.StreamGpuVa,
+                  cs.StreamSize, cs.Flags, cs.SyncCount,
+                  sizeof(token), sizeof(cs));
     return STATUS_SUCCESS;
 }
 
@@ -485,11 +620,20 @@ WinMaliKmdSetRootPageTable(
     NTSTATUS         bindSt;
     UINT64           rootPtPa = 0;
 
+    WINMALI_TRACE("SetRootPageTableDiag: ENTER hAdapter=%p args=%p ctx=%p seg=%u off=0x%llx entries=%u",
+                  hAdapter, pArgs,
+                  pArgs != NULL ? pArgs->hContext : NULL,
+                  pArgs != NULL ? pArgs->Address.SegmentId : 0,
+                  pArgs != NULL ? (ULONGLONG)pArgs->Address.SegmentOffset : 0,
+                  pArgs != NULL ? pArgs->NumEntries : 0);
+
     if (pArgs == NULL) {
+        WINMALI_WARN("SetRootPageTableDiag: EXIT args=NULL");
         return;
     }
     adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
     if (adapter == NULL) {
+        WINMALI_WARN("SetRootPageTableDiag: EXIT invalid adapter=%p", hAdapter);
         return;
     }
 
@@ -512,8 +656,10 @@ WinMaliKmdSetRootPageTable(
                   pArgs->Address.SegmentId,
                   (ULONGLONG)pArgs->Address.SegmentOffset,
                   (ULONGLONG)rootPtPa,
-                  pArgs->NumEntries,
-                  asSlot, bindSt);
+                   pArgs->NumEntries,
+                   asSlot, bindSt);
+    WINMALI_TRACE("SetRootPageTableDiag: EXIT ctx=%p status=0x%08x AS=%u",
+                  pArgs->hContext, bindSt, asSlot);
 }
 
 /* Returns the root PT size in bytes and fills NumberOfPte with the root
@@ -527,15 +673,24 @@ WinMaliKmdGetRootPageTableSize(
     INOUT_PDXGKARG_GETROOTPAGETABLESIZE   pArgs)
 {
     UNREFERENCED_PARAMETER(hAdapter);
+    WINMALI_TRACE("GetRootPageTableSizeDiag: ENTER hAdapter=%p args=%p requestedPtes=%u physicalAdapter=%u",
+                  hAdapter, pArgs,
+                  pArgs != NULL ? pArgs->NumberOfPte : 0,
+                  pArgs != NULL ? pArgs->PhysicalAdapterIndex : 0);
     if (pArgs != NULL) {
         pArgs->NumberOfPte = 512;   /* 9-bit top-level index */
     }
+    WINMALI_TRACE("GetRootPageTableSizeDiag: EXIT bytes=%Iu ptes=%u",
+                  (SIZE_T)PAGE_SIZE,
+                  pArgs != NULL ? pArgs->NumberOfPte : 0);
     return PAGE_SIZE;
 }
 
 /* ------------------------------------------------------------------------ */
 /* DxgkDdiQueryCurrentFence                                                  */
 /* ------------------------------------------------------------------------ */
+
+static BOOLEAN WinMaliSchedNodeValid_(_In_ UINT node, _In_ UINT engine);
 
 _Function_class_(DXGKDDI_QUERYCURRENTFENCE)
 NTSTATUS
@@ -552,7 +707,11 @@ WinMaliKmdQueryCurrentFence(
     if (adapter == NULL) {
         return STATUS_INVALID_HANDLE;
     }
-    pArgs->CurrentFence = (UINT)adapter->GpuCompletedFence;
+    if (!WinMaliSchedNodeValid_(pArgs->NodeOrdinal, pArgs->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    pArgs->CurrentFence = (UINT)InterlockedCompareExchange64(
+        &adapter->NodeSched[pArgs->NodeOrdinal].CompletedFence, 0, 0);
     return STATUS_SUCCESS;
 }
 
@@ -669,49 +828,135 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
 /* (PreemptionAware/CancelCommandAware - dxgk won't even start the adapter   */
 /* without them, and stubbing the DDIs while advertising them bugchecks the  */
 /* scheduler). So: SubmitCommand enqueues here and returns immediately; a    */
-/* dedicated KMD worker thread runs the (proven, synchronous) CSF NOP off    */
-/* the scheduler thread and completes the fence via the DPC. PreemptCommand  */
-/* enqueues an in-order marker so preemption reports the exact completed-    */
-/* fence boundary (DMA-buffer-boundary granularity) with no race.           */
+/* dedicated KMD worker thread runs the real CSF stream off the scheduler   */
+/* thread and reports its terminal fence via the DPC. PreemptCommand is an   */
+/* urgent request honored at the next DMA-buffer boundary.                   */
 /* ------------------------------------------------------------------------ */
 
-/* Push a completed/preempted fence onto the DPC-drained notify queue. */
+static BOOLEAN
+WinMaliSchedNodeValid_(_In_ UINT node, _In_ UINT engine)
+{
+    return (node < WINMALI_NODE_COUNT && engine == 0u) ? TRUE : FALSE;
+}
+
+/* Queue exactly one DPC while work is pending. NotifyDpcPending remains set
+   while the DPC is queued/running; the DPC clears it only after an empty
+   observation and closes the producer/consumer lost-wakeup race. */
 static VOID
+WinMaliSchedRequestDpc_(_Inout_ PWINMALI_ADAPTER a)
+{
+    if (a->DxgkHandle != NULL && a->DxgkInterface.DxgkCbQueueDpc != NULL &&
+        InterlockedCompareExchange(&a->NotifyDpcPending, 1, 0) == 0) {
+        if (!a->DxgkInterface.DxgkCbQueueDpc(a->DxgkHandle)) {
+            WINMALI_TRACE("Sched: DPC already queued/running");
+        }
+    }
+}
+
+/* Push a completed/preempted/timeout event without ever overwriting an event
+   dxgkrnl has not consumed. The queue is deliberately much deeper than the
+   advertised HwQueuePacketCap. */
+static BOOLEAN
 WinMaliSchedPushFence_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
                        _In_ UINT node, _In_ UINT engine,
-                       _In_ BOOLEAN isPreempt, _In_ UINT lastCompleted)
+                       _In_ BOOLEAN isPreempt, _In_ UINT lastCompleted,
+                       _In_ NTSTATUS faultStatus)
 {
     KIRQL irql;
     ULONG next;
     KeAcquireSpinLock(&a->FenceQueueLock, &irql);
     next = (a->FenceQueueTail + 1) % WINMALI_FENCE_QUEUE_DEPTH;
     if (next == a->FenceQueueHead) {
-        a->FenceQueueHead = (a->FenceQueueHead + 1) % WINMALI_FENCE_QUEUE_DEPTH;
+        KeReleaseSpinLock(&a->FenceQueueLock, irql);
+        WINMALI_ERROR("Sched: notify queue full; refusing to overwrite fence=%u node=%u",
+                      fence, node);
+        return FALSE;
     }
     a->FenceQueue[a->FenceQueueTail].SubmissionFenceId    = fence;
     a->FenceQueue[a->FenceQueueTail].NodeOrdinal          = node;
     a->FenceQueue[a->FenceQueueTail].EngineOrdinal        = engine;
     a->FenceQueue[a->FenceQueueTail].IsPreempt            = isPreempt;
+    a->FenceQueue[a->FenceQueueTail].IsFault              =
+        (!isPreempt && !NT_SUCCESS(faultStatus)) ? TRUE : FALSE;
     a->FenceQueue[a->FenceQueueTail].LastCompletedFenceId = lastCompleted;
+    a->FenceQueue[a->FenceQueueTail].FaultStatus          = faultStatus;
     a->FenceQueueTail = next;
     KeReleaseSpinLock(&a->FenceQueueLock, irql);
+    return TRUE;
 }
 
-/* Enqueue a submit/preempt request for the worker. Returns FALSE if the ring
-   is momentarily full (caller then completes inline so no fence is dropped). */
+static VOID
+WinMaliSchedQueueTimeout_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
+                          _In_ UINT node, _In_ UINT engine,
+                          _In_ NTSTATUS status)
+{
+    if (!WinMaliSchedNodeValid_(node, engine)) {
+        WINMALI_ERROR("Sched: cannot report timeout for invalid node=%u engine=%u",
+                      node, engine);
+        return;
+    }
+    InterlockedExchange64(&a->NodeSched[node].LastAbortedFence, (LONG64)fence);
+    if (InterlockedCompareExchange(&a->NodeSched[node].TdrPending, 1, 0) != 0) {
+        WINMALI_WARN("Sched: suppressing duplicate timeout fence=%u node=%u status=0x%08x",
+                     fence, node, status);
+        return;
+    }
+    if (!WinMaliSchedPushFence_(a, fence, node, engine, FALSE, 0, status)) {
+        WINMALI_ERROR("Sched: timeout event could not be queued fence=%u node=%u",
+                      fence, node);
+        return;
+    }
+    WinMaliSchedRequestDpc_(a);
+}
+
+/* Retire Mesa's private timelines for a terminal submission. A failed CS is
+   terminal too: the WDDM engine-timeout notification starts recovery while
+   the sync signal lets Mesa release resources instead of hanging forever. */
+static VOID
+WinMaliSchedFinishSubmit_(_Inout_ PWINMALI_ADAPTER a,
+                          _In_ const WINMALI_CS_SUBMIT_DESC* cs,
+                          _In_ UINT fence,
+                          _In_ NTSTATUS status)
+{
+    ULONG i;
+    if (cs == NULL) {
+        return;
+    }
+    for (i = 0; i < cs->SyncCount; ++i) {
+        if (cs->SyncOps[i].Flags & WINMALI_SYNC_OP_SIGNAL) {
+            int err = NT_SUCCESS(status)
+                ? WinMaliSyncObjSignal(a, cs->SyncOps[i].Handle,
+                                       cs->SyncOps[i].TimelineValue)
+                : WinMaliSyncObjFail(a, cs->SyncOps[i].Handle,
+                                     cs->SyncOps[i].TimelineValue);
+            if (err != 0) {
+                WINMALI_ERROR("Sched: finish sync failed err=%d status=0x%08x handle=%u point=%llu fence=%u",
+                              err, status, cs->SyncOps[i].Handle,
+                              (unsigned long long)cs->SyncOps[i].TimelineValue,
+                              fence);
+            }
+        }
+    }
+}
+
+/* Enqueue a submit request for the worker. A FALSE result is a scheduler
+   invariant failure and must enter recovery; it is never a fake completion. */
 static BOOLEAN
 WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
-                     _In_ UINT node, _In_ UINT engine, _In_ BOOLEAN isPreempt)
+                      _In_ UINT node, _In_ UINT engine,
+                      _In_opt_ const WINMALI_CS_SUBMIT_DESC* cs,
+                     _In_ ULONG asSlot)
 {
     KIRQL   irql;
     ULONG   next;
     BOOLEAN queued = FALSE;
 
-    /* No worker (SchedInit failed, or we're tearing down) => tell the caller
-       to complete inline. Never enqueue into a queue nothing will drain - that
-       would leave the fence forever incomplete and TDR the adapter. */
-    if (a->SubmitWorkerThread == NULL ||
-        InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0) {
+    /* Never enqueue into a queue that has no live consumer. */
+    if (!WinMaliSchedNodeValid_(node, engine) ||
+        a->SubmitWorkerThread == NULL ||
+        InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0 ||
+        InterlockedCompareExchange(&a->SchedulerAccepting, 0, 0) == 0 ||
+        InterlockedCompareExchange(&a->NodeSched[node].TdrPending, 0, 0) != 0) {
         return FALSE;
     }
 
@@ -721,8 +966,19 @@ WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
         a->SubmitQueue[a->SubmitQueueTail].FenceId       = fence;
         a->SubmitQueue[a->SubmitQueueTail].NodeOrdinal   = node;
         a->SubmitQueue[a->SubmitQueueTail].EngineOrdinal = engine;
-        a->SubmitQueue[a->SubmitQueueTail].IsPreempt     = isPreempt;
+        a->SubmitQueue[a->SubmitQueueTail].HasCs         = (cs != NULL) ? TRUE : FALSE;
+        a->SubmitQueue[a->SubmitQueueTail].AsSlot        = asSlot;
+        a->SubmitQueue[a->SubmitQueueTail].ResetGeneration =
+            InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0);
+        if (cs != NULL) {
+            RtlCopyMemory(&a->SubmitQueue[a->SubmitQueueTail].Cs, cs, sizeof(*cs));
+        } else {
+            RtlZeroMemory(&a->SubmitQueue[a->SubmitQueueTail].Cs,
+                          sizeof(a->SubmitQueue[a->SubmitQueueTail].Cs));
+        }
         a->SubmitQueueTail = next;
+        KeClearEvent(&a->SubmitWorkerIdle);
+        KeClearEvent(&a->NodeSched[node].IdleEvent);
         queued = TRUE;
     }
     KeReleaseSpinLock(&a->SubmitQueueLock, irql);
@@ -732,8 +988,85 @@ WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
     return queued;
 }
 
-/* Dedicated worker: drains the submit queue in order, runs the CSF NOP for
-   real submits and completes their fences, and turns preempt markers into a
+/* Caller holds SubmitQueueLock. Remove every queued packet for one node while
+   preserving the order of all other nodes. */
+static UINT
+WinMaliSchedDrainNodeLocked_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT node)
+{
+    ULONG read = a->SubmitQueueHead;
+    ULONG write = a->SubmitQueueHead;
+    UINT drained = 0;
+    while (read != a->SubmitQueueTail) {
+        ULONG next = (read + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
+        if (a->SubmitQueue[read].NodeOrdinal == node) {
+            ++drained;
+        } else {
+            if (write != read) {
+                a->SubmitQueue[write] = a->SubmitQueue[read];
+            }
+            write = (write + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
+        }
+        read = next;
+    }
+    a->SubmitQueueTail = write;
+    return drained;
+}
+
+/* Caller holds SubmitQueueLock. Publish node/global idle state from the same
+   lock domain used by enqueue and dequeue. */
+static VOID
+WinMaliSchedUpdateIdleLocked_(_Inout_ PWINMALI_ADAPTER a)
+{
+    ULONG i;
+    ULONG read;
+    BOOLEAN queued[WINMALI_NODE_COUNT] = { FALSE, FALSE };
+    for (read = a->SubmitQueueHead; read != a->SubmitQueueTail;
+         read = (read + 1) % WINMALI_SUBMIT_QUEUE_DEPTH) {
+        UINT node = a->SubmitQueue[read].NodeOrdinal;
+        if (node < WINMALI_NODE_COUNT) queued[node] = TRUE;
+    }
+    for (i = 0; i < WINMALI_NODE_COUNT; ++i) {
+        if (!queued[i] && InterlockedCompareExchange(
+                &a->SubmitWorkerActiveNode, -1, -1) != (LONG)i) {
+            KeSetEvent(&a->NodeSched[i].IdleEvent, IO_NO_INCREMENT, FALSE);
+        }
+    }
+    if (a->SubmitQueueHead == a->SubmitQueueTail &&
+        InterlockedCompareExchange(&a->SubmitWorkerActive, 0, 0) == 0) {
+        KeSetEvent(&a->SubmitWorkerIdle, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+static BOOLEAN
+WinMaliSchedHandlePreempt_(_Inout_ PWINMALI_ADAPTER a)
+{
+    UINT node;
+    for (node = 0; node < WINMALI_NODE_COUNT; ++node) {
+        if (InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 1) == 1) {
+            KIRQL irql;
+            UINT drained;
+            UINT preemptFence = (UINT)InterlockedCompareExchange(
+                &a->NodeSched[node].PreemptionFenceId, 0, 0);
+            UINT last = (UINT)InterlockedCompareExchange64(
+                &a->NodeSched[node].WorkerCompletedFence, 0, 0);
+            KeAcquireSpinLock(&a->SubmitQueueLock, &irql);
+            drained = WinMaliSchedDrainNodeLocked_(a, node);
+            WinMaliSchedUpdateIdleLocked_(a);
+            KeReleaseSpinLock(&a->SubmitQueueLock, irql);
+            if (WinMaliSchedPushFence_(a, preemptFence, node, 0, TRUE, last,
+                                      STATUS_SUCCESS)) {
+                WinMaliSchedRequestDpc_(a);
+            }
+            WINMALI_TRACE("Sched: preempted node=%u fence=%u last=%u dropped=%u",
+                          node, preemptFence, last, drained);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Dedicated worker: drains the submit queue in order, runs the real CS for
+   tagged render submits, and turns preempt markers into a
    DMA_PREEMPTED at the current completed-fence boundary. */
 static VOID
 WinMaliSchedWorker_(_In_ PVOID Context)
@@ -749,41 +1082,136 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             KIRQL   irql;
             BOOLEAN have = FALSE;
             UINT    fence = 0, node = 0, engine = 0;
-            BOOLEAN isPreempt = FALSE;
+            BOOLEAN hasCs = FALSE;
+            ULONG   asSlot = WINMALI_AS_SLOT_MAX;
+            LONG    resetGeneration = 0;
+            WINMALI_CS_SUBMIT_DESC cs;
+
+            RtlZeroMemory(&cs, sizeof(cs));
+
+            if (WinMaliSchedHandlePreempt_(a)) {
+                continue;
+            }
 
             KeAcquireSpinLock(&a->SubmitQueueLock, &irql);
             if (a->SubmitQueueHead != a->SubmitQueueTail) {
-                fence     = a->SubmitQueue[a->SubmitQueueHead].FenceId;
                 node      = a->SubmitQueue[a->SubmitQueueHead].NodeOrdinal;
+                if (node < WINMALI_NODE_COUNT &&
+                    InterlockedCompareExchange(
+                        &a->NodeSched[node].TdrPending, 0, 0) != 0) {
+                    WinMaliSchedUpdateIdleLocked_(a);
+                    KeReleaseSpinLock(&a->SubmitQueueLock, irql);
+                    break;
+                }
+                fence     = a->SubmitQueue[a->SubmitQueueHead].FenceId;
                 engine    = a->SubmitQueue[a->SubmitQueueHead].EngineOrdinal;
-                isPreempt = a->SubmitQueue[a->SubmitQueueHead].IsPreempt;
+                hasCs     = a->SubmitQueue[a->SubmitQueueHead].HasCs;
+                asSlot    = a->SubmitQueue[a->SubmitQueueHead].AsSlot;
+                resetGeneration = a->SubmitQueue[a->SubmitQueueHead].ResetGeneration;
+                if (hasCs) {
+                    RtlCopyMemory(&cs, &a->SubmitQueue[a->SubmitQueueHead].Cs,
+                                  sizeof(cs));
+                }
                 a->SubmitQueueHead = (a->SubmitQueueHead + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
+                InterlockedExchange(&a->SubmitWorkerActive, 1);
+                InterlockedExchange(&a->SubmitWorkerActiveNode, (LONG)node);
+                InterlockedExchange64(&a->NodeSched[node].ActiveFence, (LONG64)fence);
                 have = TRUE;
+            } else {
+                /* Publish idle while holding the same lock used by enqueue.
+                   This prevents enqueue from clearing the event just before
+                   the worker incorrectly sets it again. */
+                KeSetEvent(&a->SubmitWorkerIdle, IO_NO_INCREMENT, FALSE);
             }
             KeReleaseSpinLock(&a->SubmitQueueLock, irql);
             if (!have) {
                 break;
             }
 
-            if (isPreempt) {
-                /* All prior real submits drained above (in order) and their
-                   fences completed, so the preemption boundary is simply the
-                   last completed fence. */
-                UINT last = (UINT)InterlockedCompareExchange64(&a->SchedLastCompletedFence, 0, 0);
-                WinMaliSchedPushFence_(a, fence, node, engine, TRUE, last);
-            } else {
-                NTSTATUS st = WinMaliCsfSubmitNopJob(a, 500u);
-                if (!NT_SUCCESS(st) && (a->CsfSubmitFailures++ & 0xFF) == 0) {
-                    WINMALI_WARN("Sched: CSF NOP unavailable 0x%08x fence=%u"
-                                 " (completing CPU-side, total=%u)",
-                                 st, fence, a->CsfSubmitFailures);
+            {
+                NTSTATUS st = STATUS_SUCCESS;
+                ULONG i;
+
+                if (hasCs) {
+                    for (i = 0; i < cs.SyncCount; ++i) {
+                        if ((cs.SyncOps[i].Flags & WINMALI_SYNC_OP_SIGNAL) == 0) {
+                            ULONG h = cs.SyncOps[i].Handle;
+                            UINT64 point = cs.SyncOps[i].TimelineValue;
+                            int err;
+                            do {
+                                /* Poll in bounded slices so ResetEngine can
+                                   cancel a packet waiting on a dependency. */
+                                err = WinMaliSyncObjWait(a, 1u, &h, &point,
+                                                        TRUE, 10000000LL);
+                            } while (err == -110 &&
+                                     InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) == 0 &&
+                                     InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 0) == 0 &&
+                                     resetGeneration ==
+                                     InterlockedCompareExchange(
+                                         &a->NodeSched[node].ResetGeneration, 0, 0));
+                            if (resetGeneration !=
+                                InterlockedCompareExchange(
+                                    &a->NodeSched[node].ResetGeneration, 0, 0) ||
+                                InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0 ||
+                                InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 0) != 0) {
+                                st = STATUS_CANCELLED;
+                                break;
+                            }
+                            if (err != 0) {
+                                st = STATUS_INVALID_HANDLE;
+                                WINMALI_ERROR("Sched: wait sync failed err=%d handle=%u point=%llu fence=%u",
+                                              err, h, (unsigned long long)point, fence);
+                                break;
+                            }
+                        }
+                    }
+                    if (NT_SUCCESS(st)) {
+                        WinMaliBoFlushVm(a, cs.VmId, TRUE);
+                        st = WinMaliCsfSubmitGroupStream(a, asSlot,
+                                                        cs.StreamGpuVa,
+                                                        cs.StreamSize,
+                                                        0u, 500u);
+                        WinMaliBoFlushVm(a, cs.VmId, FALSE);
+                    }
                 }
-                InterlockedExchange64(&a->SchedLastCompletedFence, (LONG64)fence);
-                WinMaliSchedPushFence_(a, fence, node, engine, FALSE, 0);
+                if (resetGeneration !=
+                    InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0) ||
+                    InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0 ||
+                    InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 0) != 0) {
+                    WINMALI_WARN("Sched: dropping stale fence=%u generation=%ld after reset generation=%ld",
+                                 fence, resetGeneration,
+                                 InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0));
+                } else if (!NT_SUCCESS(st)) {
+                    WinMaliSchedFinishSubmit_(a, &cs, fence, st);
+                    ++a->CsfSubmitFailures;
+                    WINMALI_ERROR("Sched: real CS failed 0x%08x fence=%u vm=%u as=%u total=%u",
+                                  st, fence, cs.VmId, asSlot,
+                                  a->CsfSubmitFailures);
+                    WinMaliSchedQueueTimeout_(a, fence, node, engine, st);
+                } else {
+                    WinMaliSchedFinishSubmit_(a, &cs, fence, STATUS_SUCCESS);
+                    InterlockedExchange64(&a->NodeSched[node].WorkerCompletedFence,
+                                          (LONG64)fence);
+                    if (!WinMaliSchedPushFence_(a, fence, node, engine, FALSE, 0,
+                                                STATUS_SUCCESS)) {
+                        WinMaliSchedQueueTimeout_(a, fence, node, engine,
+                                                  STATUS_INSUFFICIENT_RESOURCES);
+                    }
+                }
             }
 
-            if (a->DxgkInterface.DxgkCbQueueDpc != NULL && a->DxgkHandle != NULL) {
-                a->DxgkInterface.DxgkCbQueueDpc(a->DxgkHandle);
+            InterlockedExchange64(&a->NodeSched[node].ActiveFence, 0);
+            InterlockedExchange(&a->SubmitWorkerActive, 0);
+            InterlockedExchange(&a->SubmitWorkerActiveNode, -1);
+            KeAcquireSpinLock(&a->SubmitQueueLock, &irql);
+            WinMaliSchedUpdateIdleLocked_(a);
+            KeReleaseSpinLock(&a->SubmitQueueLock, irql);
+            WinMaliSchedRequestDpc_(a);
+
+            /* Do not execute later packets on a node while dxgkrnl is
+               recovering the failed packet. */
+            if (InterlockedCompareExchange(&a->NodeSched[node].TdrPending, 0, 0) != 0) {
+                break;
             }
         }
     }
@@ -803,9 +1231,23 @@ WinMaliSchedInit(_Inout_ PWINMALI_ADAPTER Adapter)
     KeInitializeSpinLock(&Adapter->SubmitQueueLock);
     Adapter->SubmitQueueHead = 0;
     Adapter->SubmitQueueTail = 0;
+    Adapter->FenceQueueHead = 0;
+    Adapter->FenceQueueTail = 0;
+    Adapter->NotifyDpcPending = 0;
     Adapter->SubmitWorkerStop = 0;
-    Adapter->SchedLastCompletedFence = 0;
+    Adapter->SubmitWorkerActive = 0;
+    Adapter->SubmitWorkerActiveNode = -1;
+    Adapter->SchedulerAccepting = 1;
     KeInitializeEvent(&Adapter->SubmitWorkerWake, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&Adapter->SubmitWorkerIdle, NotificationEvent, TRUE);
+    {
+        ULONG node;
+        for (node = 0; node < WINMALI_NODE_COUNT; ++node) {
+            RtlZeroMemory(&Adapter->NodeSched[node], sizeof(Adapter->NodeSched[node]));
+            KeInitializeEvent(&Adapter->NodeSched[node].IdleEvent,
+                              NotificationEvent, TRUE);
+        }
+    }
 
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
     st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, &oa, NULL, NULL,
@@ -836,7 +1278,10 @@ WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
     if (th == NULL) {
         return;
     }
+    InterlockedExchange(&Adapter->SchedulerAccepting, 0);
     InterlockedExchange(&Adapter->SubmitWorkerStop, 1);
+    InterlockedIncrement(&Adapter->NodeSched[0].ResetGeneration);
+    InterlockedIncrement(&Adapter->NodeSched[1].ResetGeneration);
     KeSetEvent(&Adapter->SubmitWorkerWake, IO_NO_INCREMENT, FALSE);
     KeWaitForSingleObject(th, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(th);
@@ -889,26 +1334,143 @@ WinMaliKmdSubmitCommand(
     }
 
     /* Hand off to the async worker and RETURN IMMEDIATELY - never block the
-       dxgk scheduler thread on the CSF round-trip. The worker runs the CSF
-       NOP fence off-thread and completes it via the DPC (DMA_COMPLETED). The
+       dxgk scheduler thread on the CSF round-trip. The worker runs the real
+       CS off-thread and reports its terminal result through the DPC. The
        worker's SubmitLock-serialized CSF path also serializes with escape
        GroupSubmits on the single CSG slot.
 
-       If the worker's queue is momentarily full, complete inline (the old
-       synchronous path) so a fence is never dropped - a lost fence would wedge
-       VidMm's paging wait and TDR the adapter. */
-    adapter->GpuSubmittedFence = pSubmit->SubmissionFenceId;
+       Queue exhaustion is reported through the TDR path; claiming completion
+       for an unexecuted packet would corrupt dxgmms2's fence accounting. */
+    if (!WinMaliSchedNodeValid_(pSubmit->NodeOrdinal, pSubmit->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    InterlockedExchange64(&adapter->NodeSched[pSubmit->NodeOrdinal].SubmittedFence,
+                          (LONG64)pSubmit->SubmissionFenceId);
     if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
-                              pSubmit->NodeOrdinal, pSubmit->EngineOrdinal, FALSE)) {
-        (VOID)WinMaliCsfSubmitNopJob(adapter, 500u);
-        InterlockedExchange64(&adapter->SchedLastCompletedFence,
-                              (LONG64)pSubmit->SubmissionFenceId);
-        WinMaliSchedPushFence_(adapter, pSubmit->SubmissionFenceId,
-                               pSubmit->NodeOrdinal, pSubmit->EngineOrdinal, FALSE, 0);
-        if (adapter->DxgkInterface.DxgkCbQueueDpc != NULL && adapter->DxgkHandle != NULL) {
-            adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
+                               pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
+                               NULL, WINMALI_AS_SLOT_MAX)) {
+        /* The packet was accepted by dxgkrnl but was not queued. Never claim
+           completion for work that did not execute; enter the normal TDR
+           recovery path instead. */
+        WinMaliSchedQueueTimeout_(adapter, pSubmit->SubmissionFenceId,
+                                  pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
+                                  STATUS_DEVICE_BUSY);
+    }
+    return STATUS_SUCCESS;
+}
+
+/* WDDM 2+ submits GPUVA command buffers directly from user mode. Validate the
+   complete UMD-owned portion of the private data before dxgkrnl places the
+   packet on a scheduler queue. No user pointers are accepted: every value in
+   WINMALI_CS_SUBMIT_DESC is an integer, GPUVA, or opaque KMD-owned handle. */
+_Function_class_(DXGKDDI_VALIDATESUBMITCOMMAND)
+NTSTATUS
+APIENTRY
+WinMaliKmdValidateSubmitCommand(
+    IN_CONST_HANDLE                     hAdapter,
+    INOUT_PDXGKARG_VALIDATESUBMITCOMMAND pArgs)
+{
+    PWINMALI_ADAPTER adapter;
+    PWINMALI_KMD_CONTEXT ctx;
+    WINMALI_CS_SUBMIT_DESC cs;
+    ULONG i;
+
+    if (pArgs == NULL) {
+        WINMALI_ERROR("ValidateSubmitCommand: NULL args");
+        return STATUS_INVALID_PARAMETER;
+    }
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL) {
+        WINMALI_ERROR("ValidateSubmitCommand: invalid adapter=%p", hAdapter);
+        return STATUS_INVALID_HANDLE;
+    }
+
+    WINMALI_TRACE("ValidateSubmitCommand: commands=0x%llx length=%u flags=0x%x "
+                  "contexts=%u private=%p/%u umd=%u",
+                  (unsigned long long)pArgs->Commands, pArgs->CommandLength,
+                  pArgs->Flags.Value, pArgs->ContextCount,
+                  pArgs->pPrivateDriverData, pArgs->PrivateDriverDataSize,
+                  pArgs->UmdPrivateDataSize);
+
+    if (pArgs->Flags.HardwareQueueSubmission ||
+        pArgs->ContextCount != 1 || pArgs->Context[0] == NULL) {
+        WINMALI_ERROR("ValidateSubmitCommand: unsupported flags=0x%x contexts=%u first=%p",
+                      pArgs->Flags.Value, pArgs->ContextCount,
+                      pArgs->ContextCount != 0 ? pArgs->Context[0] : NULL);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ctx = (PWINMALI_KMD_CONTEXT)pArgs->Context[0];
+    if (ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC ||
+        ctx->Adapter != adapter || ctx->OwnerDevice == NULL ||
+        ctx->NodeOrdinal != 0) {
+        WINMALI_ERROR("ValidateSubmitCommand: invalid context=%p magic=0x%x adapter=%p "
+                      "owner=%p node=%u",
+                      ctx, ctx->Magic, ctx->Adapter, ctx->OwnerDevice,
+                      ctx->NodeOrdinal);
+        return STATUS_INVALID_HANDLE;
+    }
+
+    if (pArgs->Commands == 0 || pArgs->CommandLength == 0 ||
+        pArgs->pPrivateDriverData == NULL ||
+        pArgs->UmdPrivateDataSize != sizeof(cs) ||
+        pArgs->PrivateDriverDataSize < pArgs->UmdPrivateDataSize) {
+        WINMALI_ERROR("ValidateSubmitCommand: invalid buffers commands=0x%llx length=%u "
+                      "private=%p/%u umd=%u expected=%Iu",
+                      (unsigned long long)pArgs->Commands,
+                      pArgs->CommandLength, pArgs->pPrivateDriverData,
+                      pArgs->PrivateDriverDataSize, pArgs->UmdPrivateDataSize,
+                      sizeof(cs));
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    RtlCopyMemory(&cs, pArgs->pPrivateDriverData, sizeof(cs));
+    if (cs.Magic != WINMALI_CS_SUBMIT_DESC_MAGIC ||
+        cs.StreamGpuVa != pArgs->Commands ||
+        cs.StreamSize != pArgs->CommandLength ||
+        cs.StreamGpuVa == 0 || cs.StreamSize == 0 ||
+        cs.Flags != WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR ||
+        cs.SyncCount > WINMALI_CS_SUBMIT_MAX_SYNCS ||
+        cs.Reserved != 0) {
+        WINMALI_ERROR("ValidateSubmitCommand: invalid desc magic=0x%x vm=%u "
+                      "va=0x%llx/%llx size=%u/%u flags=0x%x syncs=%u reserved=0x%x",
+                      cs.Magic, cs.VmId,
+                      (unsigned long long)cs.StreamGpuVa,
+                      (unsigned long long)pArgs->Commands,
+                      cs.StreamSize, pArgs->CommandLength, cs.Flags,
+                      cs.SyncCount, cs.Reserved);
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    for (i = 0; i < cs.SyncCount; ++i) {
+        ULONG handleType = cs.SyncOps[i].Flags & WINMALI_SYNC_OP_HANDLE_TYPE_MASK;
+        ULONG unknownFlags = cs.SyncOps[i].Flags &
+            ~(WINMALI_SYNC_OP_SIGNAL | WINMALI_SYNC_OP_HANDLE_TYPE_MASK);
+        BOOLEAN timeline;
+
+        if (unknownFlags != 0 ||
+            (handleType != WINMALI_SYNC_OP_HANDLE_TYPE_SYNCOBJ &&
+             handleType != WINMALI_SYNC_OP_HANDLE_TYPE_TIMELINE)) {
+            WINMALI_ERROR("ValidateSubmitCommand: invalid sync[%u] handle=%u "
+                          "flags=0x%x point=%llu",
+                          i, cs.SyncOps[i].Handle, cs.SyncOps[i].Flags,
+                          (unsigned long long)cs.SyncOps[i].TimelineValue);
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        timeline = (handleType == WINMALI_SYNC_OP_HANDLE_TYPE_TIMELINE);
+        if (!WinMaliSyncObjValidate(adapter, cs.SyncOps[i].Handle,
+                                    NULL, timeline)) {
+            WINMALI_ERROR("ValidateSubmitCommand: unknown/mismatched sync[%u] "
+                          "handle=%u type=%u",
+                          i, cs.SyncOps[i].Handle, handleType);
+            return STATUS_INVALID_HANDLE;
         }
     }
+
+    WINMALI_TRACE("ValidateSubmitCommand: accepted ctx=%p vm=%u va=0x%llx "
+                  "size=%u syncs=%u",
+                  ctx, cs.VmId, (unsigned long long)cs.StreamGpuVa,
+                  cs.StreamSize, cs.SyncCount);
     return STATUS_SUCCESS;
 }
 
@@ -918,7 +1480,7 @@ WinMaliKmdSubmitCommand(
    buffers for our copy node (node 1). A stubbed NOT_SUPPORTED here bugchecks
    0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR, arg2=0xC00000BB). Behaviour mirrors
    WinMaliKmdSubmitCommand: run a present blt if tagged, then hand the fence to
-   the async worker (inline fallback if the queue is full) and return. */
+   the async worker and return. */
 _Function_class_(DXGKDDI_SUBMITCOMMANDVIRTUAL)
 NTSTATUS
 APIENTRY
@@ -927,6 +1489,12 @@ WinMaliKmdSubmitCommandVirtual(
     IN_CONST_PDXGKARG_SUBMITCOMMANDVIRTUAL pSubmit)
 {
     PWINMALI_ADAPTER adapter;
+    WINMALI_CS_SUBMIT_DESC csCopy;
+    const WINMALI_CS_SUBMIT_DESC* queuedCs = NULL;
+    ULONG asSlot = WINMALI_AS_SLOT_MAX;
+    NTSTATUS csStatus = STATUS_SUCCESS;
+
+    RtlZeroMemory(&csCopy, sizeof(csCopy));
 
     if (pSubmit == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -936,12 +1504,17 @@ WinMaliKmdSubmitCommandVirtual(
         return STATUS_INVALID_HANDLE;
     }
 
-    WINMALI_TRACE("SubmitCommandVirtual: fenceId=%u node=%u engine=%u dmaVa=0x%llx dmaSize=%u",
+    WINMALI_TRACE("SubmitCommandVirtual: fenceId=%u node=%u engine=%u ctx=%p dmaVa=0x%llx dmaSize=%u flags=0x%x private=%p/%u umd=%u",
                   pSubmit->SubmissionFenceId,
                   pSubmit->NodeOrdinal,
                   pSubmit->EngineOrdinal,
+                  pSubmit->hContext,
                   (unsigned long long)pSubmit->DmaBufferVirtualAddress,
-                  pSubmit->DmaBufferSize);
+                  pSubmit->DmaBufferSize,
+                  pSubmit->Flags.Value,
+                  pSubmit->pDmaBufferPrivateData,
+                  pSubmit->DmaBufferPrivateDataSize,
+                  pSubmit->DmaBufferUmdPrivateDataSize);
 
     /* Present phase-2 blt (same tagging as the physical path). Paging submits
        carry no private data so they never enter here. */
@@ -974,51 +1547,59 @@ WinMaliKmdSubmitCommandVirtual(
                baseline) use the escape VM's AS. Both resolve to a Mali AS slot
                the CSG rebinds to before the CALL. The flag keeps the baseline
                correct even if dxgk pre-binds an (empty) context AS. */
-            ULONG asSlot = WINMALI_AS_SLOT_MAX;
             if (cs->Flags & WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) {
                 asSlot = WinMaliMmuGetContextAsSlot(adapter, pSubmit->hContext);
-            }
-            if (asSlot >= WINMALI_AS_SLOT_MAX) {
+            } else {
                 PWINMALI_VM vm = WinMaliVmGet(adapter, cs->VmId);
                 if (vm != NULL) {
                     asSlot = vm->Pt.AsSlot;
                     WinMaliVmPut(vm);
                 }
             }
-            if (asSlot < WINMALI_AS_SLOT_MAX) {
-                WinMaliBoFlushVm(adapter, cs->VmId, TRUE);   /* CPU->DRAM */
-                (VOID)WinMaliCsfSubmitGroupStream(adapter, asSlot,
-                                                  cs->StreamGpuVa, cs->StreamSize,
-                                                  0u, 500u);
-                WinMaliBoFlushVm(adapter, cs->VmId, FALSE);  /* DRAM->CPU */
+            if (cs->SyncCount > WINMALI_CS_SUBMIT_MAX_SYNCS) {
+                WINMALI_ERROR("SubmitCommandVirtual: invalid sync count=%u", cs->SyncCount);
+                csStatus = STATUS_INVALID_PARAMETER;
+            } else if (asSlot < WINMALI_AS_SLOT_MAX) {
+                RtlCopyMemory(&csCopy, cs, sizeof(csCopy));
+                queuedCs = &csCopy;
             } else {
                 WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no AS slot",
                              cs->VmId);
+                RtlCopyMemory(&csCopy, cs, sizeof(csCopy));
+                csStatus = STATUS_DEVICE_NOT_READY;
             }
-            cs->Magic = 0;   /* consume */
         }
     }
 
-    adapter->GpuSubmittedFence = pSubmit->SubmissionFenceId;
-    if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
-                              pSubmit->NodeOrdinal, pSubmit->EngineOrdinal, FALSE)) {
-        (VOID)WinMaliCsfSubmitNopJob(adapter, 500u);
-        InterlockedExchange64(&adapter->SchedLastCompletedFence,
-                              (LONG64)pSubmit->SubmissionFenceId);
-        WinMaliSchedPushFence_(adapter, pSubmit->SubmissionFenceId,
-                               pSubmit->NodeOrdinal, pSubmit->EngineOrdinal, FALSE, 0);
-        if (adapter->DxgkInterface.DxgkCbQueueDpc != NULL && adapter->DxgkHandle != NULL) {
-            adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
+    if (!WinMaliSchedNodeValid_(pSubmit->NodeOrdinal, pSubmit->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    InterlockedExchange64(&adapter->NodeSched[pSubmit->NodeOrdinal].SubmittedFence,
+                          (LONG64)pSubmit->SubmissionFenceId);
+    if (!NT_SUCCESS(csStatus)) {
+        if (csCopy.SyncCount <= WINMALI_CS_SUBMIT_MAX_SYNCS) {
+            WinMaliSchedFinishSubmit_(adapter, &csCopy,
+                                      pSubmit->SubmissionFenceId, csStatus);
         }
+        WinMaliSchedQueueTimeout_(adapter, pSubmit->SubmissionFenceId,
+                                  pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
+                                  csStatus);
+        return STATUS_SUCCESS;
+    }
+    if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
+                               pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
+                               queuedCs, asSlot)) {
+        NTSTATUS queueStatus = STATUS_DEVICE_BUSY;
+        WinMaliSchedFinishSubmit_(adapter, queuedCs,
+                                  pSubmit->SubmissionFenceId, queueStatus);
+        WinMaliSchedQueueTimeout_(adapter, pSubmit->SubmissionFenceId,
+                                  pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
+                                  queueStatus);
     }
     return STATUS_SUCCESS;
 }
 
-/* DxgkDdiPreemptCommand - honor a preempt request at DMA-buffer boundary.
-   We can't preempt mid-buffer; enqueue an in-order marker so the worker
-   drains every already-submitted buffer (completing their fences) and then
-   reports DMA_PREEMPTED with the exact completed-fence boundary. If the queue
-   is full, report immediately against the last completed fence. */
+/* DxgkDdiPreemptCommand - request urgent DMA-buffer-boundary preemption. */
 _Function_class_(DXGKDDI_PREEMPTCOMMAND)
 NTSTATUS
 APIENTRY
@@ -1040,15 +1621,13 @@ WinMaliKmdPreemptCommand(
                   pPreempt->NodeOrdinal, pPreempt->EngineOrdinal,
                   pPreempt->PreemptionFenceId);
 
-    if (!WinMaliSchedEnqueue_(adapter, pPreempt->PreemptionFenceId,
-                              pPreempt->NodeOrdinal, pPreempt->EngineOrdinal, TRUE)) {
-        UINT last = (UINT)InterlockedCompareExchange64(&adapter->SchedLastCompletedFence, 0, 0);
-        WinMaliSchedPushFence_(adapter, pPreempt->PreemptionFenceId,
-                               pPreempt->NodeOrdinal, pPreempt->EngineOrdinal, TRUE, last);
-        if (adapter->DxgkInterface.DxgkCbQueueDpc != NULL && adapter->DxgkHandle != NULL) {
-            adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
-        }
+    if (!WinMaliSchedNodeValid_(pPreempt->NodeOrdinal, pPreempt->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
     }
+    InterlockedExchange(&adapter->NodeSched[pPreempt->NodeOrdinal].PreemptionFenceId,
+                        (LONG)pPreempt->PreemptionFenceId);
+    InterlockedExchange(&adapter->NodeSched[pPreempt->NodeOrdinal].PreemptPending, 1);
+    KeSetEvent(&adapter->SubmitWorkerWake, IO_NO_INCREMENT, FALSE);
     return STATUS_SUCCESS;
 }
 
@@ -1070,12 +1649,9 @@ WinMaliKmdCancelCommand(
     return STATUS_SUCCESS;
 }
 
-/* DxgkDdiQueryEngineStatus - the scheduler's health probe (we advertise
-   SupportPerEngineTDR). Report the engine as responsive whenever completed
-   has caught up to submitted, OR the worker is alive and draining: our
-   submits are NOP fences that complete within the 500ms CSF bound, so the
-   engine is always making progress. Reporting Responsive=1 keeps the
-   scheduler from escalating a false hang to a TDR. */
+/* DxgkDdiQueryEngineStatus - the scheduler's health probe. A live worker is
+   not itself proof of GPU progress: report responsive only when the completed
+   fence has caught up to the submitted fence. */
 _Function_class_(DXGKDDI_QUERYENGINESTATUS)
 NTSTATUS
 APIENTRY
@@ -1094,19 +1670,24 @@ WinMaliKmdQueryEngineStatus(
     }
     /* Responsive if nothing is outstanding, or the worker thread is up (it
        drains in order and always completes each fence). */
+    if (!WinMaliSchedNodeValid_(pArgs->NodeOrdinal, pArgs->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
     pArgs->EngineStatus.Value = 0;
     pArgs->EngineStatus.Responsive =
-        (adapter->GpuCompletedFence >= adapter->GpuSubmittedFence ||
-         adapter->SubmitWorkerThread != NULL) ? 1u : 0u;
+        (InterlockedCompareExchange64(
+             &adapter->NodeSched[pArgs->NodeOrdinal].CompletedFence, 0, 0) ==
+         InterlockedCompareExchange64(
+             &adapter->NodeSched[pArgs->NodeOrdinal].SubmittedFence, 0, 0) &&
+         InterlockedCompareExchange(
+             &adapter->NodeSched[pArgs->NodeOrdinal].TdrPending, 0, 0) == 0) ? 1u : 0u;
     return STATUS_SUCCESS;
 }
 
-/* DxgkDdiResetEngine - per-engine TDR. We hold no persistent GPU state for a
-   dxgk submit (paging work is done CPU-side in BuildPagingBuffer, present is
-   a CPU blt, and the fence is a NOP), so "resetting" is just draining any
-   queued fences to completion so no waiter is stranded; the next submit's
-   unconditional CSG rebind re-establishes a clean slot. Nothing was aborted
-   mid-execution (LastAbortedFenceId = 0). */
+/* DxgkDdiResetEngine - per-engine TDR. Invalidate the scheduler generation,
+   wait until the bounded CSF operation has left the physical queue, and let
+   dxgkrnl resubmit the aborted range. No pre-reset packet may complete a
+   fence or private sync after this DDI returns. */
 _Function_class_(DXGKDDI_RESETENGINE)
 NTSTATUS
 APIENTRY
@@ -1116,7 +1697,12 @@ WinMaliKmdResetEngine(
 {
     PWINMALI_ADAPTER adapter;
     KIRQL            irql;
-    UINT             drained = 0;
+    UINT             drained;
+    UINT             node;
+    NTSTATUS         resetStatus = STATUS_SUCCESS;
+    LONG64           lastAborted;
+    LONG64           lastCompleted;
+    LONG64           lastSubmitted;
 
     if (pReset == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -1125,42 +1711,71 @@ WinMaliKmdResetEngine(
     if (adapter == NULL) {
         return STATUS_INVALID_HANDLE;
     }
+    node = pReset->NodeOrdinal;
+    if (!WinMaliSchedNodeValid_(node, pReset->EngineOrdinal)) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    /* Drain any pending submit requests to COMPLETED so nothing is stranded.
+    /* Invalidate the active generation first. The worker checks this after
+       returning from its bounded CSF wait and must never complete a packet
+       from the pre-reset hardware queue. Then discard queued packets; dxgkrnl
+       resubmits the affected range according to LastAbortedFenceId. */
+    InterlockedIncrement(&adapter->NodeSched[node].ResetGeneration);
+    InterlockedExchange(&adapter->NodeSched[node].PreemptPending, 0);
+
+    /* Drain pending submit requests without completing or signalling them.
        Dequeue under the lock (the worker uses the same lock, so we never
        double-consume an entry). Preempt markers are dropped - a reset
        supersedes an in-flight preempt. */
-    for (;;) {
-        UINT    fence = 0, node = 0, engine = 0;
-        BOOLEAN isPreempt = FALSE, have = FALSE;
-        KeAcquireSpinLock(&adapter->SubmitQueueLock, &irql);
-        if (adapter->SubmitQueueHead != adapter->SubmitQueueTail) {
-            fence     = adapter->SubmitQueue[adapter->SubmitQueueHead].FenceId;
-            node      = adapter->SubmitQueue[adapter->SubmitQueueHead].NodeOrdinal;
-            engine    = adapter->SubmitQueue[adapter->SubmitQueueHead].EngineOrdinal;
-            isPreempt = adapter->SubmitQueue[adapter->SubmitQueueHead].IsPreempt;
-            adapter->SubmitQueueHead =
-                (adapter->SubmitQueueHead + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
-            have = TRUE;
-        }
-        KeReleaseSpinLock(&adapter->SubmitQueueLock, irql);
-        if (!have) {
-            break;
-        }
-        if (!isPreempt) {
-            InterlockedExchange64(&adapter->SchedLastCompletedFence, (LONG64)fence);
-            WinMaliSchedPushFence_(adapter, fence, node, engine, FALSE, 0);
-            ++drained;
-        }
-    }
-    if (drained != 0 &&
-        adapter->DxgkInterface.DxgkCbQueueDpc != NULL && adapter->DxgkHandle != NULL) {
-        adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
+    KeAcquireSpinLock(&adapter->SubmitQueueLock, &irql);
+    drained = WinMaliSchedDrainNodeLocked_(adapter, node);
+    WinMaliSchedUpdateIdleLocked_(adapter);
+    KeReleaseSpinLock(&adapter->SubmitQueueLock, irql);
+
+    /* ResetEngine may return only after the hardware queue is empty. The CSF
+       submit wait is bounded, and the worker sets Idle after it observes the
+       invalidated generation and drops the stale terminal result. */
+    if (InterlockedCompareExchange(&adapter->SubmitWorkerActiveNode, -1, -1) ==
+        (LONG)node) {
+        KeWaitForSingleObject(&adapter->NodeSched[node].IdleEvent, Executive,
+                              KernelMode, FALSE, NULL);
     }
 
-    pReset->LastAbortedFenceId = 0;   /* nothing was executing on the GPU */
-    WINMALI_TRACE("ResetEngine: node=%u engine=%u drained=%u pending fences",
-                  pReset->NodeOrdinal, pReset->EngineOrdinal, drained);
+    if (node == 0u) {
+        resetStatus = WinMaliCsfResetRenderEngine(adapter);
+        if (!NT_SUCCESS(resetStatus)) {
+            WINMALI_ERROR("ResetEngine: CSF reset failed 0x%08x", resetStatus);
+            return resetStatus;
+        }
+    }
+
+    /* The timeout DPC records the accepted packet that failed to retire.
+       WDDM validates this value against its completed/submitted fence window;
+       returning the old hard-coded zero could make dxgkrnl resubmit the
+       already-failed packet or bugcheck once the completed fence was nonzero. */
+    lastAborted = InterlockedExchange64(
+        &adapter->NodeSched[node].LastAbortedFence, 0);
+    lastCompleted = InterlockedCompareExchange64(
+        &adapter->NodeSched[node].CompletedFence, 0, 0);
+    lastSubmitted = InterlockedCompareExchange64(
+        &adapter->NodeSched[node].SubmittedFence, 0, 0);
+    /* Fence IDs are 32-bit and legally wrap. Validate the aborted fence in
+       the modular [completed, submitted] window rather than comparing the
+       zero-extended values as monotonically increasing 64-bit integers. */
+    if ((UINT)((UINT)lastAborted - (UINT)lastCompleted) >
+        (UINT)((UINT)lastSubmitted - (UINT)lastCompleted)) {
+        WINMALI_WARN("ResetEngine: recorded aborted fence %llu outside valid [%llu,%llu]; using completed fence",
+                     (unsigned long long)lastAborted,
+                     (unsigned long long)lastCompleted,
+                     (unsigned long long)lastSubmitted);
+        lastAborted = lastCompleted;
+    }
+    pReset->LastAbortedFenceId = (UINT)lastAborted;
+    InterlockedExchange(&adapter->NodeSched[node].TdrPending, 0);
+    KeSetEvent(&adapter->SubmitWorkerWake, IO_NO_INCREMENT, FALSE);
+    WINMALI_TRACE("ResetEngine: node=%u engine=%u aborted=%u drained=%u pending fences",
+                  pReset->NodeOrdinal, pReset->EngineOrdinal,
+                  pReset->LastAbortedFenceId, drained);
     return STATUS_SUCCESS;
 }
 
@@ -1317,7 +1932,7 @@ WinMaliKmdControlInterrupt(
 }
 
 /* ------------------------------------------------------------------------ */
-/* DxgkDdiResetFromTimeout / RestartFromTimeout - TDR. No-op success.        */
+/* DxgkDdiResetFromTimeout / RestartFromTimeout - adapter-wide TDR.          */
 /* ------------------------------------------------------------------------ */
 
 _Function_class_(DXGKDDI_RESETFROMTIMEOUT)
@@ -1326,9 +1941,29 @@ APIENTRY
 WinMaliKmdResetFromTimeout(
     IN_CONST_HANDLE hAdapter)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    WINMALI_TRACE("ResetFromTimeout");
-    return STATUS_SUCCESS;
+    PWINMALI_ADAPTER adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    KIRQL irql;
+    NTSTATUS status;
+    ULONG node;
+    if (adapter == NULL) return STATUS_INVALID_HANDLE;
+
+    WINMALI_TRACE("ResetFromTimeout: quiescing scheduler and CSF");
+    InterlockedExchange(&adapter->SchedulerAccepting, 0);
+    for (node = 0; node < WINMALI_NODE_COUNT; ++node) {
+        InterlockedIncrement(&adapter->NodeSched[node].ResetGeneration);
+        InterlockedExchange(&adapter->NodeSched[node].PreemptPending, 0);
+    }
+    KeAcquireSpinLock(&adapter->SubmitQueueLock, &irql);
+    adapter->SubmitQueueHead = adapter->SubmitQueueTail;
+    WinMaliSchedUpdateIdleLocked_(adapter);
+    KeReleaseSpinLock(&adapter->SubmitQueueLock, irql);
+    if (InterlockedCompareExchange(&adapter->SubmitWorkerActive, 0, 0) != 0) {
+        KeWaitForSingleObject(&adapter->SubmitWorkerIdle, Executive,
+                              KernelMode, FALSE, NULL);
+    }
+    status = WinMaliCsfResetRenderEngine(adapter);
+    WINMALI_TRACE("ResetFromTimeout: CSF reset status=0x%08x", status);
+    return status;
 }
 
 _Function_class_(DXGKDDI_RESTARTFROMTIMEOUT)
@@ -1337,8 +1972,15 @@ APIENTRY
 WinMaliKmdRestartFromTimeout(
     IN_CONST_HANDLE hAdapter)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    WINMALI_TRACE("RestartFromTimeout");
+    PWINMALI_ADAPTER adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    ULONG node;
+    if (adapter == NULL) return STATUS_INVALID_HANDLE;
+    for (node = 0; node < WINMALI_NODE_COUNT; ++node) {
+        InterlockedExchange(&adapter->NodeSched[node].TdrPending, 0);
+    }
+    InterlockedExchange(&adapter->SchedulerAccepting, 1);
+    KeSetEvent(&adapter->SubmitWorkerWake, IO_NO_INCREMENT, FALSE);
+    WINMALI_TRACE("RestartFromTimeout: scheduler accepting work");
     return STATUS_SUCCESS;
 }
 
@@ -1361,12 +2003,32 @@ WinMaliKmdCollectDbgInfo(
     if (adapter == NULL) {
         return STATUS_INVALID_HANDLE;
     }
-    /* One-line summary; truncate to caller's buffer. */
+    /* Keep the crash-dump payload self-contained so a future scheduler fault
+       can be diagnosed from a minidump without another live-KD session. */
     (VOID)RtlStringCbPrintfA((PCHAR)pArgs->pBuffer, pArgs->BufferSize,
-        "WinMali flags=0x%08x regs=%u mcu=%u csf=%u",
+        "WinMali flags=%08x regs=%u mcu=%u csf=%u "
+        "n0[s=%u c=%u a=%u abort=%u tdr=%ld gen=%ld] "
+        "n1[s=%u c=%u a=%u abort=%u tdr=%ld gen=%ld] "
+        "sq=%u/%u fq=%u/%u activeNode=%ld accepting=%ld",
         adapter->AdapterFlags,
         adapter->GpuRegsMapped,
         (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_MCU_ALIVE) ? 1 : 0,
-        (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) ? 1 : 0);
+        (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) ? 1 : 0,
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[0].SubmittedFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[0].CompletedFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[0].ActiveFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[0].LastAbortedFence, 0, 0),
+        InterlockedCompareExchange(&adapter->NodeSched[0].TdrPending, 0, 0),
+        InterlockedCompareExchange(&adapter->NodeSched[0].ResetGeneration, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[1].SubmittedFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[1].CompletedFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[1].ActiveFence, 0, 0),
+        (UINT)InterlockedCompareExchange64(&adapter->NodeSched[1].LastAbortedFence, 0, 0),
+        InterlockedCompareExchange(&adapter->NodeSched[1].TdrPending, 0, 0),
+        InterlockedCompareExchange(&adapter->NodeSched[1].ResetGeneration, 0, 0),
+        adapter->SubmitQueueHead, adapter->SubmitQueueTail,
+        adapter->FenceQueueHead, adapter->FenceQueueTail,
+        InterlockedCompareExchange(&adapter->SubmitWorkerActiveNode, -1, -1),
+        InterlockedCompareExchange(&adapter->SchedulerAccepting, 0, 0));
     return STATUS_SUCCESS;
 }

@@ -267,15 +267,17 @@ WinMaliKmdCreateAllocation(
         info->Flags.Value              = 0;
         info->Flags.CpuVisible         = 1;
         info->Flags.Cached             = 0;
-#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_0)
-        info->Flags.AccessedPhysically = 1; /* GpuMmu maps host PA directly */
-#endif
+        /* This is a GpuMmu allocation: the UMD maps it with
+           pfnMapGpuVirtualAddressCb and submits its GPU virtual address via
+           SubmitCommandVirtual.  AccessedPhysically is reserved for
+           allocations which the rendering engine addresses by physical
+           allocation-list entries, so it must remain clear here. */
         info->AllocationPriority       = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
         info->hAllocation              = (HANDLE)ka;
 
-        WINMALI_TRACE("CreateAllocation[%u]: ka=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x",
+        WINMALI_TRACE("CreateAllocation[%u]: ka=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x flags=0x%x",
                       i, ka, ka->Size, ka->Width, ka->Height, ka->Alignment,
-                      ka->Pitch, ka->Format, ka->Usage);
+                      ka->Pitch, ka->Format, ka->Usage, info->Flags.Value);
     }
 
     return STATUS_SUCCESS;

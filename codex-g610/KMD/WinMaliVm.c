@@ -86,6 +86,8 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     *OutId = 0;
     *OutGrantedRange = 0;
 
+    WINMALI_TRACE("VmCreateDiag: ENTER flags=0x%x requested=0x%llx owner=%p",
+                  Flags, (ULONGLONG)UserVaRange, OwnerDevice);
     granted = (UserVaRange != 0) ? UserVaRange : WINMALI_VM_DEFAULT_USER_VA_RANGE;
     /* Cap to the span we advertise. */
     if (granted > WINMALI_VM_DEFAULT_USER_VA_RANGE) {
@@ -95,8 +97,11 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     vm = (PWINMALI_VM)ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*vm),
                                             WINMALI_POOL_TAG);
     if (vm == NULL) {
+        WINMALI_WARN("VmCreateDiag: VM allocation failed");
         return WMERR_ENOMEM;
     }
+    WINMALI_TRACE("VmCreateDiag: VM allocated vm=%p granted=0x%llx",
+                  vm, (ULONGLONG)granted);
     RtlZeroMemory(vm, sizeof(*vm));
     vm->Magic       = WINMALI_VM_MAGIC;
     vm->Flags       = Flags;
@@ -111,7 +116,10 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
                       & ~0xFFFFull;
 
     {
+        WINMALI_TRACE("VmCreateDiag: calling MmuVmInit vm=%p", vm);
         NTSTATUS st = WinMaliMmuVmInit(Adapter, &vm->Pt);
+        WINMALI_TRACE("VmCreateDiag: MmuVmInit returned 0x%08x AS=%u root=0x%llx",
+                      st, vm->Pt.AsSlot, (ULONGLONG)vm->Pt.RootPa.QuadPart);
         if (!NT_SUCCESS(st)) {
             ExFreePoolWithTag(vm, WINMALI_POOL_TAG);
             WINMALI_WARN("VmCreate: WinMaliMmuVmInit failed 0x%08x", st);
@@ -125,7 +133,9 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
        the MCU can execute this group's command streams in its own AS. Best-
        effort: if CSF isn't booted yet the submit path falls back to the NOP. */
     {
+        WINMALI_TRACE("VmCreateDiag: calling CsfMapIntoVm AS=%u", vm->Pt.AsSlot);
         NTSTATUS csfSt = WinMaliCsfMapIntoVm(Adapter, &vm->Pt);
+        WINMALI_TRACE("VmCreateDiag: CsfMapIntoVm returned 0x%08x", csfSt);
         if (!NT_SUCCESS(csfSt) && csfSt != STATUS_DEVICE_NOT_READY) {
             WINMALI_WARN("VmCreate: CsfMapIntoVm failed 0x%08x (submits will "
                          "fall back to NOP for this VM)", csfSt);

@@ -179,60 +179,57 @@ WinMaliKmdStartDevice(
     status = WinMaliParseResources(adapter);
     if (!NT_SUCCESS(status)) {
         WINMALI_ERROR("ParseResources failed 0x%08x", status);
-        /* Return success anyway so dxgk doesn't immediately tear us down
-           via a hot-error path. We continue with no MMIO; subsequent
-           registers reads return 0 and the warning is in the log. */
-        WM_TRACE_EXIT_S("StartDevice", STATUS_SUCCESS);
-        return STATUS_SUCCESS;
+        goto StartFailed;
     }
 
     status = WinMaliBringupHardware(adapter);
     if (!NT_SUCCESS(status)) {
         WINMALI_ERROR("BringupHardware failed 0x%08x", status);
-        WM_TRACE_EXIT_S("StartDevice", STATUS_SUCCESS);
-        return STATUS_SUCCESS;
+        goto StartFailed;
     }
 
     /* Re-seed the AS-slot allocator now that GPU_AS_PRESENT has been read. */
     WinMaliMmuInitAsAllocator(adapter);
 
     /* MMU scratch heap + AS1 bind. Lifted from panthor_mmu_init. */
-    if (adapter->GpuRegsMapped) {
-        NTSTATUS mmuStatus = WinMaliMmuInit(adapter);
-        if (!NT_SUCCESS(mmuStatus)) {
-            WINMALI_WARN("WinMaliMmuInit failed 0x%08x (AS1 not bound)",
-                         mmuStatus);
-        }
+    status = WinMaliMmuInit(adapter);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("WinMaliMmuInit failed 0x%08x", status);
+        goto StartFailed;
     }
 
     /* Record IRQ availability for the FW init path. The ISR itself is
        bound by dxgk via init->DxgkDdiInterruptRoutine. */
-    {
-        NTSTATUS irqStatus = WinMaliConnectInterrupt(adapter);
-        if (!NT_SUCCESS(irqStatus)) {
-            WINMALI_WARN("WinMaliConnectInterrupt failed 0x%08x", irqStatus);
-        }
+    status = WinMaliConnectInterrupt(adapter);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("WinMaliConnectInterrupt failed 0x%08x", status);
+        goto StartFailed;
     }
 
     /* 256 MiB sysmem segment for dxgk. Allocated even if FW init later
        fails, so VIDMM still sees a memory pool and the cap walk has
        real numbers to point at. */
-    {
-        NTSTATUS segStatus = WinMaliVidmmAllocateSegment(adapter);
-        if (!NT_SUCCESS(segStatus)) {
-            WINMALI_WARN("WinMaliVidmmAllocateSegment failed 0x%08x", segStatus);
-        }
+    status = WinMaliVidmmAllocateSegment(adapter);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("WinMaliVidmmAllocateSegment failed 0x%08x", status);
+        goto StartFailed;
     }
 
     /* CSF firmware boot. Reads \SystemRoot\System32\drivers\mali_csffw.bin,
        parses the panthor binary, loads sections to MCU AS0, sets
        MCU_CONTROL=AUTO and polls MCU_STATUS for ENABLED. */
-    if (adapter->GpuRegsMapped) {
-        NTSTATUS fwStatus = WinMaliFwInit(adapter);
-        if (!NT_SUCCESS(fwStatus)) {
-            WINMALI_WARN("WinMaliFwInit failed 0x%08x (CSF firmware not active)",
-                         fwStatus);
-        }
+    status = WinMaliFwInit(adapter);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("WinMaliFwInit failed 0x%08x", status);
+        goto StartFailed;
+    }
+    if ((adapter->AdapterFlags & (WINMALI_ADAPTER_FLAG_MCU_ALIVE |
+                                  WINMALI_ADAPTER_FLAG_CSF_JOBS)) !=
+        (WINMALI_ADAPTER_FLAG_MCU_ALIVE | WINMALI_ADAPTER_FLAG_CSF_JOBS)) {
+        status = STATUS_DEVICE_NOT_READY;
+        WINMALI_ERROR("WinMaliFwInit returned success without MCU/CSF readiness flags=0x%08x",
+                      adapter->AdapterFlags);
+        goto StartFailed;
     }
 
     /* No-op self-test removed - it was useful while we were still proving
@@ -240,10 +237,11 @@ WinMaliKmdStartDevice(
        CSF_JOBS, and we want every subsequent boot to land in a clean idle
        state with proper IRQ delivery, not a synchronous test submission. */
 
-    /* Bring up the async submit worker (drains DxgkDdiSubmitCommand /
-       PreemptCommand off the dxgk scheduler thread). Non-fatal if it fails -
-       SubmitCommand falls back to inline completion. */
-    (VOID)WinMaliSchedInit(adapter);
+    status = WinMaliSchedInit(adapter);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("WinMaliSchedInit failed 0x%08x", status);
+        goto StartFailed;
+    }
 
     adapter->StartDeviceEverSucceeded = TRUE;
     WINMALI_TRACE("StartDevice OK: regs=%u mmu=%u mcu_alive=%u csf_jobs=%u",
@@ -253,6 +251,21 @@ WinMaliKmdStartDevice(
                   (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) ? 1 : 0);
     WM_TRACE_EXIT_S("StartDevice", STATUS_SUCCESS);
     return STATUS_SUCCESS;
+
+StartFailed:
+    /* A partially-live WDDM adapter is more dangerous than a failed start:
+       dxgkrnl will schedule against every capability we advertised. Unwind
+       all idempotent stages and return the real failing status. */
+    WinMaliSchedTeardown(adapter);
+    WinMaliFwTeardown(adapter);
+    WinMaliDisconnectInterrupt(adapter);
+    WinMaliMmuTeardown(adapter);
+    WinMaliVidmmFreeSegment(adapter);
+    WinMaliTeardownHardware(adapter);
+    adapter->Started = FALSE;
+    WINMALI_ERROR("StartDevice failed 0x%08x; hardware fully unwound", status);
+    WM_TRACE_EXIT_S("StartDevice", status);
+    return status;
 }
 
 NTSTATUS APIENTRY
@@ -441,53 +454,104 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
         return;
     }
 
-    InterlockedExchange(&adapter->NotifyDpcPending, 0);
-
     if (adapter->DxgkInterface.DxgkCbNotifyInterrupt == NULL ||
         adapter->DxgkHandle == NULL) {
+        InterlockedExchange(&adapter->NotifyDpcPending, 0);
         return;
     }
 
-    KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
-    while (adapter->FenceQueueHead != adapter->FenceQueueTail) {
-        DXGKARGCB_NOTIFY_INTERRUPT_DATA notify;
-        UINT    fenceId   = adapter->FenceQueue[adapter->FenceQueueHead].SubmissionFenceId;
-        UINT    nodeOrd   = adapter->FenceQueue[adapter->FenceQueueHead].NodeOrdinal;
-        UINT    engineOrd = adapter->FenceQueue[adapter->FenceQueueHead].EngineOrdinal;
-        BOOLEAN isPreempt = adapter->FenceQueue[adapter->FenceQueueHead].IsPreempt;
-        UINT    lastDone  = adapter->FenceQueue[adapter->FenceQueueHead].LastCompletedFenceId;
-        adapter->FenceQueueHead = (adapter->FenceQueueHead + 1) % WINMALI_FENCE_QUEUE_DEPTH;
+    for (;;) {
+        BOOLEAN notified = FALSE;
+        KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
+        while (adapter->FenceQueueHead != adapter->FenceQueueTail) {
+            DXGKARGCB_NOTIFY_INTERRUPT_DATA notify;
+            UINT fenceId = adapter->FenceQueue[adapter->FenceQueueHead].SubmissionFenceId;
+            UINT nodeOrd = adapter->FenceQueue[adapter->FenceQueueHead].NodeOrdinal;
+            UINT engineOrd = adapter->FenceQueue[adapter->FenceQueueHead].EngineOrdinal;
+            BOOLEAN isPreempt = adapter->FenceQueue[adapter->FenceQueueHead].IsPreempt;
+            BOOLEAN isFault = adapter->FenceQueue[adapter->FenceQueueHead].IsFault;
+            UINT lastDone = adapter->FenceQueue[adapter->FenceQueueHead].LastCompletedFenceId;
+            NTSTATUS faultStatus = adapter->FenceQueue[adapter->FenceQueueHead].FaultStatus;
+            adapter->FenceQueueHead =
+                (adapter->FenceQueueHead + 1) % WINMALI_FENCE_QUEUE_DEPTH;
+            KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
+
+            if (nodeOrd >= WINMALI_NODE_COUNT || engineOrd != 0u) {
+                WINMALI_ERROR("DPC: dropped internally-invalid event fence=%u node=%u engine=%u",
+                              fenceId, nodeOrd, engineOrd);
+                KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
+                continue;
+            }
+
+            RtlZeroMemory(&notify, sizeof(notify));
+            if (isPreempt) {
+                UINT queuedLastDone = lastDone;
+
+                /* CompletedFence is the fence boundary already published to
+                   dxgkrnl by earlier DMA_COMPLETED notifications in this FIFO.
+                   A worker-side snapshot can be stale while those events are
+                   waiting for this DPC, which makes dxgmms2 reject the
+                   DMA_PREEMPTED notification as an invalid fence ID. */
+                lastDone = (UINT)InterlockedCompareExchange64(
+                    &adapter->NodeSched[nodeOrd].CompletedFence, 0, 0);
+                if (queuedLastDone != lastDone) {
+                    WINMALI_TRACE("DPC: preempt completion boundary advanced queued=%u published=%u node=%u",
+                                  queuedLastDone, lastDone, nodeOrd);
+                }
+                notify.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+                notify.DmaPreempted.PreemptionFenceId = fenceId;
+                notify.DmaPreempted.LastCompletedFenceId = lastDone;
+                notify.DmaPreempted.NodeOrdinal = nodeOrd;
+                notify.DmaPreempted.EngineOrdinal = engineOrd;
+                adapter->DxgkInterface.DxgkCbNotifyInterrupt(
+                    adapter->DxgkHandle, &notify);
+                WINMALI_TRACE("DPC: notified DMA_PREEMPTED preemptFence=%u lastCompleted=%u node=%u",
+                              fenceId, lastDone, nodeOrd);
+            } else if (isFault) {
+                notify.InterruptType = DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT;
+                notify.GpuEngineTimeout.NodeOrdinal = nodeOrd;
+                notify.GpuEngineTimeout.EngineOrdinal = engineOrd;
+                adapter->DxgkInterface.DxgkCbNotifyInterrupt(
+                    adapter->DxgkHandle, &notify);
+                WINMALI_ERROR("DPC: notified GPU_ENGINE_TIMEOUT fence=%u status=0x%08x node=%u engine=%u",
+                              fenceId, faultStatus, nodeOrd, engineOrd);
+            } else {
+                /* QueryCurrentFence can run as soon as NotifyInterrupt enters
+                   dxgkrnl, so publish the node-local fence first. */
+                InterlockedExchange64(
+                    &adapter->NodeSched[nodeOrd].CompletedFence,
+                    (LONG64)fenceId);
+                notify.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+                notify.DmaCompleted.SubmissionFenceId = fenceId;
+                notify.DmaCompleted.NodeOrdinal = nodeOrd;
+                notify.DmaCompleted.EngineOrdinal = engineOrd;
+                adapter->DxgkInterface.DxgkCbNotifyInterrupt(
+                    adapter->DxgkHandle, &notify);
+                WINMALI_TRACE("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
+                              fenceId, nodeOrd, engineOrd);
+            }
+            notified = TRUE;
+            KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
+        }
         KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
 
-        RtlZeroMemory(&notify, sizeof(notify));
-        if (isPreempt) {
-            notify.InterruptType                        = DXGK_INTERRUPT_DMA_PREEMPTED;
-            notify.DmaPreempted.PreemptionFenceId       = fenceId;
-            notify.DmaPreempted.LastCompletedFenceId    = lastDone;
-            notify.DmaPreempted.NodeOrdinal             = nodeOrd;
-            notify.DmaPreempted.EngineOrdinal           = engineOrd;
-            adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
-            WINMALI_TRACE("DPC: notified DMA_PREEMPTED preemptFence=%u lastCompleted=%u node=%u",
-                          fenceId, lastDone, nodeOrd);
-        } else {
-            notify.InterruptType                       = DXGK_INTERRUPT_DMA_COMPLETED;
-            notify.DmaCompleted.SubmissionFenceId      = fenceId;
-            notify.DmaCompleted.NodeOrdinal            = nodeOrd;
-            notify.DmaCompleted.EngineOrdinal          = engineOrd;
-            adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
-            adapter->GpuCompletedFence = fenceId;
-            WINMALI_TRACE("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
-                          fenceId, nodeOrd, engineOrd);
+        if (notified && adapter->DxgkInterface.DxgkCbNotifyDpc != NULL) {
+            adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
         }
 
+        /* Close the empty->sleep race. If a producer won the 0->1 CAS it has
+           queued a successor DPC; otherwise keep draining in this DPC. */
+        InterlockedExchange(&adapter->NotifyDpcPending, 0);
+        KeMemoryBarrier();
         KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
-    }
-    KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
-
-    /* Tell dxgk it can poll our QueryCurrentFence and process the
-       completions we just announced. */
-    if (adapter->DxgkInterface.DxgkCbNotifyDpc != NULL) {
-        adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
+        notified = (adapter->FenceQueueHead != adapter->FenceQueueTail);
+        KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
+        if (!notified) {
+            break;
+        }
+        if (InterlockedCompareExchange(&adapter->NotifyDpcPending, 1, 0) != 0) {
+            break;
+        }
     }
 }
 

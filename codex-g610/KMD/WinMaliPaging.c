@@ -263,6 +263,15 @@ WinMaliKmdBuildPagingBuffer(
     PWINMALI_ADAPTER adapter;
     NTSTATUS         status = STATUS_SUCCESS;
 
+    WINMALI_TRACE("BuildPagingBufferDiag: ENTER hAdapter=%p args=%p op=%d dma=%p/%u private=%p/%u multipass=%u",
+                  hAdapter, pBpb,
+                  pBpb != NULL ? pBpb->Operation : -1,
+                  pBpb != NULL ? pBpb->pDmaBuffer : NULL,
+                  pBpb != NULL ? pBpb->DmaSize : 0,
+                  pBpb != NULL ? pBpb->pDmaBufferPrivateData : NULL,
+                  pBpb != NULL ? pBpb->DmaBufferPrivateDataSize : 0,
+                  pBpb != NULL ? pBpb->MultipassOffset : 0);
+
     /* Status contract (dxgmms2): only STATUS_SUCCESS or
        STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER may leave this DDI. Anything
        else is bugcheck 0x10E subcode 0xb ("driver returned an invalid
@@ -270,11 +279,13 @@ WinMaliKmdBuildPagingBuffer(
        below therefore complete as no-op SUCCESS with a loud log. */
     if (pBpb == NULL) {
         WINMALI_ERROR("BuildPagingBuffer: pBpb NULL - no-op SUCCESS (0x10E_b contract)");
+        WINMALI_TRACE("BuildPagingBufferDiag: EXIT status=0x%08x", STATUS_SUCCESS);
         return STATUS_SUCCESS;
     }
     adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
     if (adapter == NULL) {
         WINMALI_ERROR("BuildPagingBuffer: bad hAdapter - no-op SUCCESS (0x10E_b contract)");
+        WINMALI_TRACE("BuildPagingBufferDiag: EXIT status=0x%08x", STATUS_SUCCESS);
         return STATUS_SUCCESS;
     }
 
@@ -345,9 +356,14 @@ WinMaliKmdBuildPagingBuffer(
     if (pBpb->pDmaBuffer != NULL && pBpb->DmaSize != 0) {
         if (!WinMaliPagingEmitNop_(pBpb)) {
             WINMALI_WARN("BuildPagingBuffer: DMA buffer too small for NOP (op=%d size=%u)",
-                         pBpb->Operation, pBpb->DmaSize);
+                          pBpb->Operation, pBpb->DmaSize);
+            WINMALI_TRACE("BuildPagingBufferDiag: EXIT status=0x%08x",
+                          STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
             return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
         }
     }
+    WINMALI_TRACE("BuildPagingBufferDiag: EXIT op=%d status=0x%08x dmaRemaining=%u multipass=%u",
+                  pBpb->Operation, status, pBpb->DmaSize,
+                  pBpb->MultipassOffset);
     return status;
 }

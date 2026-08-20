@@ -111,21 +111,30 @@ typedef struct _WINMALI_ADAPTER {
     PHYSICAL_ADDRESS    DmaSegmentPhys;
     SIZE_T              DmaSegmentBytes;
 
-    /* Monotonic fences for submit / completion. Reset on TDR. */
-    LONG64              GpuSubmittedFence;
-    LONG64              GpuCompletedFence;
+    /* The render and paging nodes own independent WDDM fence timelines. */
+#define WINMALI_NODE_COUNT 2u
+    struct {
+        LONG64  SubmittedFence;
+        LONG64  CompletedFence;
+        LONG64  WorkerCompletedFence;
+        LONG64  ActiveFence;
+        LONG64  LastAbortedFence;
+        LONG    ResetGeneration;
+        LONG    TdrPending;
+        LONG    PreemptPending;
+        LONG    PreemptionFenceId;
+        KEVENT  IdleEvent;
+    } NodeSched[WINMALI_NODE_COUNT];
     LONG                NotifyDpcPending;
 
-    /* Count of SubmitCommand calls whose CSF NOP round-trip failed and
-       were completed CPU-side instead (degraded mode; see WinMaliDdi.c).
-       Diagnostic only - nonzero means the MCU wasn't alive. */
+    /* Count of real CS submissions that reached a terminal failure. */
     ULONG               CsfSubmitFailures;
 
     /* Pending fence-completion queue: produced by WinMaliKmdSubmitCommand,
        drained by WinMaliKmdDpcRoutine which calls DxgkCbNotifyInterrupt.
        Synchronous "GPU work done immediately" path for paging submits we
        don't actually run on the GPU yet. */
-#define WINMALI_FENCE_QUEUE_DEPTH  64u
+#define WINMALI_FENCE_QUEUE_DEPTH  256u
     KSPIN_LOCK          FenceQueueLock;
     ULONG               FenceQueueHead;
     ULONG               FenceQueueTail;
@@ -134,31 +143,39 @@ typedef struct _WINMALI_ADAPTER {
         UINT    NodeOrdinal;
         UINT    EngineOrdinal;
         BOOLEAN IsPreempt;              /* TRUE => notify DMA_PREEMPTED, not COMPLETED */
+        BOOLEAN IsFault;                /* TRUE => notify GPU_ENGINE_TIMEOUT */
         UINT    LastCompletedFenceId;   /* preempt only: fence reached before preempt */
+        NTSTATUS FaultStatus;            /* fault only: terminal submit status */
     } FenceQueue[WINMALI_FENCE_QUEUE_DEPTH];
 
     /* Async submit scheduler. DxgkDdiSubmitCommand used to BLOCK the dxgk
        scheduler worker on the CSF round-trip (and we lied about preemption
        caps to dodge the scheduler's preempt path -> 0xD1 in dxgmms2). Now
        SubmitCommand enqueues here and returns immediately; a dedicated KMD
-       worker thread drains the queue, runs the (proven, synchronous) CSF
-       submit off the scheduler thread, and completes the fence via the DPC.
-       PreemptCommand enqueues an in-order marker so preemption reports the
-       exact completed-fence boundary with no race. */
+       worker thread drains the queue, runs the real CSF stream off the
+       scheduler thread, and completes or faults the fence via the DPC.
+       PreemptCommand is an urgent node-local request honored at the active
+       DMA-buffer boundary. */
 #define WINMALI_SUBMIT_QUEUE_DEPTH  64u
     KSPIN_LOCK          SubmitQueueLock;
     ULONG               SubmitQueueHead;
     ULONG               SubmitQueueTail;
     struct {
-        UINT    FenceId;               /* submission fence, or preemption fence */
+        UINT    FenceId;
         UINT    NodeOrdinal;
         UINT    EngineOrdinal;
-        BOOLEAN IsPreempt;
+        BOOLEAN HasCs;
+        ULONG   AsSlot;
+        LONG    ResetGeneration;
+        WINMALI_CS_SUBMIT_DESC Cs;      /* owned copy; dxgk private data is transient */
     } SubmitQueue[WINMALI_SUBMIT_QUEUE_DEPTH];
     PVOID               SubmitWorkerThread;   /* PKTHREAD (referenced) */
     KEVENT              SubmitWorkerWake;
+    KEVENT              SubmitWorkerIdle;
     LONG                SubmitWorkerStop;
-    LONG64              SchedLastCompletedFence;  /* worker-updated, in-order */
+    LONG                SubmitWorkerActive;
+    LONG                SubmitWorkerActiveNode; /* -1 while idle */
+    LONG                SchedulerAccepting;
 
     /* Set after a successful bring-up so RemoveDevice can tell a clean
        stop/remove cycle from a never-started one. */
@@ -249,6 +266,7 @@ NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
                                      _In_ ULONG   TimeoutMs);
+NTSTATUS WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter);
 
 /* Cross-map the CSF ring/sync/shader pages into a UMD group's VM at the
    fixed low GPU VAs so the CSG can execute the group's stream in its own AS.
@@ -274,8 +292,10 @@ NTSTATUS APIENTRY WinMaliKmdResetFromTimeout(IN_CONST_HANDLE hAdapter);
 NTSTATUS APIENTRY WinMaliKmdRestartFromTimeout(IN_CONST_HANDLE hAdapter);
 NTSTATUS APIENTRY WinMaliKmdCollectDbgInfo(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_COLLECTDBGINFO pArgs);
 NTSTATUS APIENTRY WinMaliKmdBuildPagingBuffer(IN_CONST_HANDLE hAdapter, IN_PDXGKARG_BUILDPAGINGBUFFER pBpb);
+NTSTATUS APIENTRY WinMaliKmdRender(IN_CONST_HANDLE hContext, INOUT_PDXGKARG_RENDER pRender);
 NTSTATUS APIENTRY WinMaliKmdSubmitCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_SUBMITCOMMAND pSubmit);
 NTSTATUS APIENTRY WinMaliKmdSubmitCommandVirtual(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_SUBMITCOMMANDVIRTUAL pSubmit);
+NTSTATUS APIENTRY WinMaliKmdValidateSubmitCommand(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_VALIDATESUBMITCOMMAND pArgs);
 NTSTATUS APIENTRY WinMaliKmdPreemptCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PREEMPTCOMMAND pPreempt);
 NTSTATUS APIENTRY WinMaliKmdCancelCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_CANCELCOMMAND pCancel);
 NTSTATUS APIENTRY WinMaliKmdQueryEngineStatus(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_QUERYENGINESTATUS pArgs);

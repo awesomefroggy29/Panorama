@@ -52,7 +52,7 @@
     init->DxgkDdiDestroyDevice                                    = WinMaliKmdDestroyDevice;
     init->DxgkDdiOpenAllocation                                   = WinMaliKmdOpenAllocation;
     init->DxgkDdiCloseAllocation                                  = WinMaliKmdCloseAllocation;
-    init->DxgkDdiRender                                           = WinMaliKmdStub_Render;
+    init->DxgkDdiRender                                           = WinMaliKmdRender;
     init->DxgkDdiPresent                                          = WinMaliKmdPresent;
     init->DxgkDdiUpdateOverlay                                    = NULL;
     init->DxgkDdiFlipOverlay                                      = NULL;
@@ -136,7 +136,7 @@
     init->DxgkDdiResumeHwEngine                                   = WinMaliKmdStub_ResumeHwEngine;
     init->DxgkDdiSignalMonitoredFence                             = WinMaliKmdStub_SignalMonitoredFence;
     init->DxgkDdiPresentToHwQueue                                 = WinMaliKmdStub_PresentToHwQueue;
-    init->DxgkDdiValidateSubmitCommand                            = WinMaliKmdStub_ValidateSubmitCommand;
+    init->DxgkDdiValidateSubmitCommand                            = WinMaliKmdValidateSubmitCommand;
     init->DxgkDdiSetTargetAdjustedColorimetry2                    = NULL;
     init->DxgkDdiSetTrackedWorkloadPowerLevel                     = WinMaliKmdStub_SetTrackedWorkloadPowerLevel;
     init->DxgkDdiSaveMemoryForHotUpdate                           = WinMaliKmdStub_SaveMemoryForHotUpdate;
