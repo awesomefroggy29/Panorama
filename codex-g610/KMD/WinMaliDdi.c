@@ -885,6 +885,36 @@ WinMaliSchedPushFence_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
     return TRUE;
 }
 
+/* Discard notifications for a node after dxgkrnl has quiesced/flushed that
+   engine for reset. Preserve the FIFO order of events belonging to the other
+   node; reporting a pre-reset completion or preemption after reset would mix
+   two scheduler generations and can make dxgmms2 reject its fence ID. */
+static UINT
+WinMaliSchedDiscardNotifyNode_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT node)
+{
+    KIRQL irql;
+    ULONG read;
+    ULONG write;
+    UINT discarded = 0;
+
+    KeAcquireSpinLock(&a->FenceQueueLock, &irql);
+    write = a->FenceQueueHead;
+    for (read = a->FenceQueueHead; read != a->FenceQueueTail;
+         read = (read + 1) % WINMALI_FENCE_QUEUE_DEPTH) {
+        if (a->FenceQueue[read].NodeOrdinal == node) {
+            ++discarded;
+            continue;
+        }
+        if (write != read) {
+            a->FenceQueue[write] = a->FenceQueue[read];
+        }
+        write = (write + 1) % WINMALI_FENCE_QUEUE_DEPTH;
+    }
+    a->FenceQueueTail = write;
+    KeReleaseSpinLock(&a->FenceQueueLock, irql);
+    return discarded;
+}
+
 static VOID
 WinMaliSchedQueueTimeout_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
                           _In_ UINT node, _In_ UINT engine,
@@ -1698,6 +1728,7 @@ WinMaliKmdResetEngine(
     PWINMALI_ADAPTER adapter;
     KIRQL            irql;
     UINT             drained;
+    UINT             discarded;
     UINT             node;
     NTSTATUS         resetStatus = STATUS_SUCCESS;
     LONG64           lastAborted;
@@ -1741,6 +1772,11 @@ WinMaliKmdResetEngine(
                               KernelMode, FALSE, NULL);
     }
 
+    /* dxgkrnl flushes queued DPCs before ResetEngine. Remove any node-local
+       event produced while the worker was observing the reset generation so
+       it cannot be delivered after the reset boundary is established. */
+    discarded = WinMaliSchedDiscardNotifyNode_(adapter, node);
+
     if (node == 0u) {
         resetStatus = WinMaliCsfResetRenderEngine(adapter);
         if (!NT_SUCCESS(resetStatus)) {
@@ -1771,11 +1807,24 @@ WinMaliKmdResetEngine(
         lastAborted = lastCompleted;
     }
     pReset->LastAbortedFenceId = (UINT)lastAborted;
+
+    /* A successful engine reset establishes a new scheduler recovery floor.
+       dxgmms2 advances past LastAbortedFenceId and later requires
+       DMA_PREEMPTED.LastCompletedFenceId and QueryCurrentFence to report the
+       same boundary. Keep both the worker-side and published copies aligned;
+       leaving them at their pre-reset value caused 0x119/1 (reported 0 while
+       dxgmms2's required boundary was 4). */
+    InterlockedExchange64(&adapter->NodeSched[node].WorkerCompletedFence,
+                          (LONG64)pReset->LastAbortedFenceId);
+    InterlockedExchange64(&adapter->NodeSched[node].CompletedFence,
+                          (LONG64)pReset->LastAbortedFenceId);
+    InterlockedExchange64(&adapter->NodeSched[node].ActiveFence, 0);
+    InterlockedExchange(&adapter->NodeSched[node].PreemptionFenceId, 0);
     InterlockedExchange(&adapter->NodeSched[node].TdrPending, 0);
     KeSetEvent(&adapter->SubmitWorkerWake, IO_NO_INCREMENT, FALSE);
-    WINMALI_TRACE("ResetEngine: node=%u engine=%u aborted=%u drained=%u pending fences",
+    WINMALI_TRACE("ResetEngine: node=%u engine=%u recoveryBoundary=%u drained=%u discardedNotify=%u",
                   pReset->NodeOrdinal, pReset->EngineOrdinal,
-                  pReset->LastAbortedFenceId, drained);
+                  pReset->LastAbortedFenceId, drained, discarded);
     return STATUS_SUCCESS;
 }
 
@@ -1962,6 +2011,27 @@ WinMaliKmdResetFromTimeout(
                               KernelMode, FALSE, NULL);
     }
     status = WinMaliCsfResetRenderEngine(adapter);
+    if (NT_SUCCESS(status)) {
+        /* Adapter-wide reset retires every packet accepted before the reset.
+           WDDM requires each node's last-completed boundary to advance to
+           its last submitted fence. Synchronize every source used by
+           QueryCurrentFence and DMA_PREEMPTED, and discard old-generation
+           notifications before RestartFromTimeout reopens submission. */
+        for (node = 0; node < WINMALI_NODE_COUNT; ++node) {
+            LONG64 submitted = InterlockedCompareExchange64(
+                &adapter->NodeSched[node].SubmittedFence, 0, 0);
+            UINT discarded = WinMaliSchedDiscardNotifyNode_(adapter, node);
+            InterlockedExchange64(
+                &adapter->NodeSched[node].WorkerCompletedFence, submitted);
+            InterlockedExchange64(
+                &adapter->NodeSched[node].CompletedFence, submitted);
+            InterlockedExchange64(&adapter->NodeSched[node].ActiveFence, 0);
+            InterlockedExchange64(&adapter->NodeSched[node].LastAbortedFence, 0);
+            InterlockedExchange(&adapter->NodeSched[node].PreemptionFenceId, 0);
+            WINMALI_TRACE("ResetFromTimeout: node=%u recoveryBoundary=%u discardedNotify=%u",
+                          node, (UINT)submitted, discarded);
+        }
+    }
     WINMALI_TRACE("ResetFromTimeout: CSF reset status=0x%08x", status);
     return status;
 }
