@@ -87,6 +87,18 @@ typedef struct _WINMALI_ADAPTER {
     PHYSICAL_ADDRESS    ApertureL3Phys;
     SIZE_T              ApertureL3Bytes;
 
+    /* Complete KMD-owned subtree attached to root/L3 entry 1 for the GPUVA
+       range reserved by DxgkCbReserveGpuVirtualAddressRange. VidMm owns the
+       process root; these L2/L1/L0 pages map the adapter-global CSF ring,
+       sync page and shader trampoline without modifying VidMm's tables. */
+    PVOID               CsfReservedL2PtVa;
+    PHYSICAL_ADDRESS    CsfReservedL2PtPhys;
+    PVOID               CsfReservedL1PtVa;
+    PHYSICAL_ADDRESS    CsfReservedL1PtPhys;
+    PVOID               CsfReservedL0PtVa;
+    PHYSICAL_ADDRESS    CsfReservedL0PtPhys;
+    BOOLEAN             CsfReservedPtValid;
+
     /* AS-slot allocator. AS0 is the CSF MCU; AS1 is the kernel bring-up
        address space. AS2..AS(N-1) are leased per dxgk context. */
     KSPIN_LOCK          AsSlotLock;
@@ -194,6 +206,13 @@ typedef struct _WINMALI_ADAPTER {
     /* UMD escape ABI: CSF queue Group handle table (GroupSubmit runs the
        UMD command streams on the CSG). */
     WINMALI_GROUP_TABLE     GroupTable;
+
+    /* KMD-owned tiler heaps retain their BO handles and both GPUVA mappings
+       until explicit heap destruction or device rundown. The record type is
+       private to WinMaliEscape.c. */
+    KSPIN_LOCK              TilerHeapLock;
+    LIST_ENTRY              TilerHeapHead;
+    LONG                    NextTilerHeapHandle;
 } WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 
 /* Bring-up state bits, used by the escape diagnostics channel + by
@@ -268,8 +287,8 @@ NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   TimeoutMs);
 NTSTATUS WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter);
 
-/* Cross-map the CSF ring/sync/shader pages into a UMD group's VM at the
-   fixed low GPU VAs so the CSG can execute the group's stream in its own AS.
+/* Cross-map the CSF ring/sync/shader pages into an escape-owned UMD group's
+   VM at fixed KMD-reserved GPU VAs so the CSG can execute in its own AS.
    Called from VmCreate; best-effort (DEVICE_NOT_READY before CSF boots). */
 NTSTATUS WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter,
                              _Inout_ PWINMALI_VM_PT VmPt);
@@ -280,6 +299,27 @@ VOID     WinMaliVidmmFreeSegment(_Inout_ PWINMALI_ADAPTER Adapter);
 NTSTATUS APIENTRY WinMaliKmdGetNodeMetadata(IN_CONST_HANDLE hAdapter, UINT NodeOrdinalAndAdapterIndex, OUT_PDXGKARG_GETNODEMETADATA pGetNodeMetadata);
 NTSTATUS APIENTRY WinMaliKmdCreateProcess(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_CREATEPROCESS pCreateProcess);
 NTSTATUS APIENTRY WinMaliKmdDestroyProcess(IN_CONST_HANDLE hAdapter, IN_CONST_HANDLE hKmdProcess);
+BOOLEAN WinMaliKmdGetProcessReservedPageTable(
+    _In_opt_ HANDLE hKmdProcess,
+    _Out_ UINT64* ReservedBase,
+    _Out_ UINT64* RootChildPhysicalAddress);
+NTSTATUS WinMaliKmdAllocateProcessReservedGpuVa(
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 size,
+    _In_ UINT64 alignment,
+    _Out_ UINT64* gpuVa);
+NTSTATUS WinMaliKmdMapProcessReservedGpuVa(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 gpuVa,
+    _In_reads_(pageCount) const PFN_NUMBER* pfns,
+    _In_ ULONG pageCount,
+    _In_ UINT64 attrs);
+NTSTATUS WinMaliKmdUnmapProcessReservedGpuVa(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 gpuVa,
+    _In_ ULONG pageCount);
 NTSTATUS APIENTRY WinMaliKmdCreateDevice(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_CREATEDEVICE pCreateDevice);
 NTSTATUS APIENTRY WinMaliKmdDestroyDevice(IN_CONST_HANDLE hDevice);
 NTSTATUS APIENTRY WinMaliKmdCreateContext(IN_CONST_HANDLE hDevice, INOUT_PDXGKARG_CREATECONTEXT pCreateContext);
@@ -301,6 +341,11 @@ NTSTATUS APIENTRY WinMaliKmdCancelCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDX
 NTSTATUS APIENTRY WinMaliKmdQueryEngineStatus(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_QUERYENGINESTATUS pArgs);
 NTSTATUS APIENTRY WinMaliKmdResetEngine(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_RESETENGINE pReset);
 NTSTATUS APIENTRY WinMaliKmdEscape(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pEscape);
+VOID WinMaliTilerHeapTableInit(_Inout_ PWINMALI_ADAPTER adapter);
+VOID WinMaliTilerHeapTableTeardown(_Inout_ PWINMALI_ADAPTER adapter);
+ULONG WinMaliTilerHeapRundownOwner(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_ PVOID ownerDevice);
 
 /* WinMaliDdi.c: async submit scheduler lifecycle. Init creates the worker
    thread (call from StartDevice after CSF is up); Teardown stops+joins it

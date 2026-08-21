@@ -871,20 +871,153 @@ WinMaliEscapeProcessSyncOps_(_Inout_ PWINMALI_ADAPTER adapter,
     return err;
 }
 
+#define WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS  16u
+#define WINMALI_TILER_HEAP_MAX_MAPPINGS        \
+    (1u + WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS)
+
+typedef struct _WINMALI_TILER_HEAP_MAPPING {
+    ULONG  BoHandle;
+    ULONG  PageCount;
+    UINT64 GpuVa;
+} WINMALI_TILER_HEAP_MAPPING, *PWINMALI_TILER_HEAP_MAPPING;
+
+typedef struct _WINMALI_TILER_HEAP_RECORD {
+    LIST_ENTRY Link;
+    ULONG      Handle;
+    ULONG      VmId;
+    PVOID      OwnerDevice;
+    BOOLEAN    MapProcessReserved;
+    ULONG      MappingCount;
+    WINMALI_TILER_HEAP_MAPPING Mappings[WINMALI_TILER_HEAP_MAX_MAPPINGS];
+} WINMALI_TILER_HEAP_RECORD, *PWINMALI_TILER_HEAP_RECORD;
+
+VOID
+WinMaliTilerHeapTableInit(_Inout_ PWINMALI_ADAPTER adapter)
+{
+    KeInitializeSpinLock(&adapter->TilerHeapLock);
+    InitializeListHead(&adapter->TilerHeapHead);
+    adapter->NextTilerHeapHandle = 0;
+}
+
+static VOID
+WinMaliTilerHeapDestroyRecord_(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _Inout_ PWINMALI_TILER_HEAP_RECORD heap)
+{
+    PWINMALI_VM vm;
+    ULONG i;
+
+    if (heap == NULL) return;
+    vm = WinMaliVmGet(adapter, heap->VmId);
+    /* Unmap before releasing backing.  The record owns every BO handle, and
+       process teardown occurs only after all of its devices are destroyed. */
+    for (i = 0; i < heap->MappingCount; ++i) {
+        PWINMALI_TILER_HEAP_MAPPING m = &heap->Mappings[i];
+        if (vm != NULL && vm->PtInitialized) {
+            (void)WinMaliMmuVmUnmap(adapter, &vm->Pt, m->GpuVa, m->PageCount);
+        }
+        if (heap->MapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, heap->OwnerDevice, m->GpuVa, m->PageCount);
+        }
+        if (m->BoHandle != 0) {
+            (void)WinMaliBoDestroy(adapter, m->BoHandle);
+        }
+    }
+    if (vm != NULL) WinMaliVmPut(vm);
+    ExFreePoolWithTag(heap, WINMALI_POOL_TAG);
+}
+
+static PWINMALI_TILER_HEAP_RECORD
+WinMaliTilerHeapRemove_(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_ ULONG handle)
+{
+    KIRQL irql;
+    PLIST_ENTRY entry;
+    PWINMALI_TILER_HEAP_RECORD found = NULL;
+
+    KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+    for (entry = adapter->TilerHeapHead.Flink;
+         entry != &adapter->TilerHeapHead; entry = entry->Flink) {
+        PWINMALI_TILER_HEAP_RECORD heap =
+            CONTAINING_RECORD(entry, WINMALI_TILER_HEAP_RECORD, Link);
+        if (heap->Handle == handle) {
+            RemoveEntryList(&heap->Link);
+            found = heap;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
+    return found;
+}
+
+ULONG
+WinMaliTilerHeapRundownOwner(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_ PVOID ownerDevice)
+{
+    LIST_ENTRY local;
+    KIRQL irql;
+    PLIST_ENTRY entry;
+    ULONG count = 0;
+
+    InitializeListHead(&local);
+    KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+    entry = adapter->TilerHeapHead.Flink;
+    while (entry != &adapter->TilerHeapHead) {
+        PWINMALI_TILER_HEAP_RECORD heap =
+            CONTAINING_RECORD(entry, WINMALI_TILER_HEAP_RECORD, Link);
+        entry = entry->Flink;
+        if (heap->OwnerDevice == ownerDevice) {
+            RemoveEntryList(&heap->Link);
+            InsertTailList(&local, &heap->Link);
+            ++count;
+        }
+    }
+    KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
+
+    while (!IsListEmpty(&local)) {
+        PWINMALI_TILER_HEAP_RECORD heap = CONTAINING_RECORD(
+            RemoveHeadList(&local), WINMALI_TILER_HEAP_RECORD, Link);
+        WinMaliTilerHeapDestroyRecord_(adapter, heap);
+    }
+    return count;
+}
+
+VOID
+WinMaliTilerHeapTableTeardown(_Inout_ PWINMALI_ADAPTER adapter)
+{
+    LIST_ENTRY local;
+    KIRQL irql;
+
+    InitializeListHead(&local);
+    KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+    while (!IsListEmpty(&adapter->TilerHeapHead)) {
+        PLIST_ENTRY entry = RemoveHeadList(&adapter->TilerHeapHead);
+        InsertTailList(&local, entry);
+    }
+    KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
+    while (!IsListEmpty(&local)) {
+        PWINMALI_TILER_HEAP_RECORD heap = CONTAINING_RECORD(
+            RemoveHeadList(&local), WINMALI_TILER_HEAP_RECORD, Link);
+        WinMaliTilerHeapDestroyRecord_(adapter, heap);
+    }
+}
+
 /* Allocate `Size` bytes of device-owned physical memory, map its pages
    into `Vm` at `GpuVa` (data, non-executable), zero the first page, and -
    if HasNext - stamp the u64 chunk-link at offset 0. Used to build the
    tiler heap's context descriptor and chunk ring.
 
-   The backing store is a normal BO (OwnerDevice set), so device rundown /
-   VM teardown reclaim it exactly like any UMD allocation - no bespoke
-   free path, no leak. Returns the BO handle in *OutHandle for optional
-   explicit teardown. The GPU-side mapping lives in the VM's PT and is
-   released when the VM is torn down. */
+   The heap record owns the normal BO (OwnerDevice set) and both GPU mappings.
+   It explicitly unmaps and destroys them on heap/device teardown, before the
+   general VM/BO rundown runs. Returns the BO handle in *OutHandle. */
 static NTSTATUS
 WinMaliHeapAllocMapped_(_Inout_ PWINMALI_ADAPTER adapter,
                         _Inout_ PWINMALI_VM      vm,
                         _In_opt_ PVOID           ownerDevice,
+                        _In_    BOOLEAN          mapProcessReserved,
                         _In_    ULONG            size,
                         _In_    UINT64           gpuVa,
                         _In_    BOOLEAN          hasNext,
@@ -907,22 +1040,61 @@ WinMaliHeapAllocMapped_(_Inout_ PWINMALI_ADAPTER adapter,
 
     err = WinMaliBoCreate(adapter, (SIZE_T)size, 0u, 0u, ownerDevice, &handle);
     if (err != WMERR_OK) {
+        if (mapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, size / PAGE_SIZE);
+        }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     bo = WinMaliBoGet(adapter, handle);
     if (bo == NULL) {
         (void)WinMaliBoDestroy(adapter, handle);
+        if (mapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, size / PAGE_SIZE);
+        }
         return STATUS_UNSUCCESSFUL;
     }
 
     pages = (ULONG)(bo->Size / PAGE_SIZE);
     pfns  = MmGetMdlPfnArray(bo->Mdl);
+    if (pfns == NULL) {
+        WinMaliBoPut(bo);
+        (void)WinMaliBoDestroy(adapter, handle);
+        if (mapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, pages);
+        }
+        return STATUS_INVALID_ADDRESS;
+    }
     st = WinMaliMmuVmMap(adapter, &vm->Pt, gpuVa, pfns, pages,
                          WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
     if (!NT_SUCCESS(st)) {
         WinMaliBoPut(bo);
         (void)WinMaliBoDestroy(adapter, handle);
+        if (mapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, pages);
+        }
         return st;
+    }
+
+    /* A DXGK-addressed command executes against the process VidMm root, while
+       the legacy escape submit executes against vm->Pt.  Map the same PFNs at
+       the same KMD-reserved VA in both address spaces.  This keeps both submit
+       paths truthful and avoids copying or replacing any VidMm-owned table. */
+    if (mapProcessReserved) {
+        st = WinMaliKmdMapProcessReservedGpuVa(
+            adapter, ownerDevice, gpuVa, pfns, pages,
+            WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
+        if (!NT_SUCCESS(st)) {
+            (void)WinMaliMmuVmUnmap(adapter, &vm->Pt, gpuVa, pages);
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, pages);
+            WinMaliBoPut(bo);
+            (void)WinMaliBoDestroy(adapter, handle);
+            return st;
+        }
     }
 
     /* One-time init of the descriptor/header: map the backing pages into
@@ -933,6 +1105,10 @@ WinMaliHeapAllocMapped_(_Inout_ PWINMALI_ADAPTER adapter,
     kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
                                        NULL, FALSE, NormalPagePriority);
     if (kva == NULL) {
+        if (mapProcessReserved) {
+            (void)WinMaliKmdUnmapProcessReservedGpuVa(
+                adapter, ownerDevice, gpuVa, pages);
+        }
         (void)WinMaliMmuVmUnmap(adapter, &vm->Pt, gpuVa, pages);
         WinMaliBoPut(bo);
         (void)WinMaliBoDestroy(adapter, handle);
@@ -942,6 +1118,9 @@ WinMaliHeapAllocMapped_(_Inout_ PWINMALI_ADAPTER adapter,
     if (hasNext) {
         *(volatile UINT64 UNALIGNED*)kva = nextValue;
     }
+    /* These BOs are CPU-initialized and GPU-read. Clean the cached system
+       mapping before the GPU can consume the context/chunk header. */
+    KeFlushIoBuffers(bo->Mdl, FALSE, TRUE);
     MmUnmapLockedPages(kva, bo->Mdl);
 
     WinMaliBoPut(bo);
@@ -965,9 +1144,11 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
                             _In_    ULONG            chunkSize,
                             _In_    ULONG            initialChunkCount,
                             _Out_   UINT64*          outCtxVa,
-                            _Out_   UINT64*          outFirstChunkVa)
+                            _Out_   UINT64*          outFirstChunkVa,
+                            _Outptr_ PWINMALI_TILER_HEAP_RECORD* outRecord)
 {
     PWINMALI_VM vm;
+    PWINMALI_TILER_HEAP_RECORD record = NULL;
     NTSTATUS    st;
     ULONG       ctxHandle = 0;
     UINT64      ctxVa;
@@ -975,9 +1156,11 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
     UINT64      prevChunkVa  = 0;
     ULONG       i;
     ULONG       count = initialChunkCount;
+    BOOLEAN     mapProcessReserved = FALSE;
 
     *outCtxVa = 0;
     *outFirstChunkVa = 0;
+    *outRecord = NULL;
 
     /* Sanity: chunk_size must be page-aligned and sane (panthor allows
        256K..2M power-of-two; we only require page alignment + a cap so a
@@ -989,8 +1172,8 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
     if (count == 0) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (count > 16u) {
-        count = 16u;  /* bound the up-front allocation; growth is on-demand */
+    if (count > WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS) {
+        count = WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS;
     }
 
     vm = WinMaliVmGet(adapter, vmId);
@@ -1001,44 +1184,96 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
         WinMaliVmPut(vm);
         return STATUS_DEVICE_NOT_READY;
     }
+    record = (PWINMALI_TILER_HEAP_RECORD)ExAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(*record), WINMALI_POOL_TAG);
+    if (record == NULL) {
+        WinMaliVmPut(vm);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(record, sizeof(*record));
+    record->VmId = vmId;
+    record->OwnerDevice = ownerDevice;
 
-    /* Heap context: one page (holds the cache-line-aligned 32-byte
-       descriptor; the GPU manages the rest). */
-    ctxVa = vm->KmdVaNext;
-    st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice, PAGE_SIZE,
-                                 ctxVa, FALSE, 0, &ctxHandle);
-    if (!NT_SUCCESS(st)) {
+    /* Prefer the owner process's dxgkrnl-reserved GPUVA.  The same VA is also
+       installed in the escape VM, so legacy GroupSubmit remains valid.  A
+       device without a WDDM process (diagnostic/legacy escape use) retains
+       the original escape-only bump allocator. */
+    st = WinMaliKmdAllocateProcessReservedGpuVa(
+        ownerDevice, PAGE_SIZE, PAGE_SIZE, &ctxVa);
+    if (NT_SUCCESS(st)) {
+        mapProcessReserved = TRUE;
+    } else if (st == STATUS_NOT_SUPPORTED) {
+        ctxVa = vm->KmdVaNext;
+        vm->KmdVaNext += PAGE_SIZE;
+    } else {
+        ExFreePoolWithTag(record, WINMALI_POOL_TAG);
         WinMaliVmPut(vm);
         return st;
     }
-    vm->KmdVaNext += PAGE_SIZE;
+    record->MapProcessReserved = mapProcessReserved;
+
+    /* Heap context: one page (holds the cache-line-aligned 32-byte
+       descriptor; the GPU manages the rest). */
+    st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice,
+                                 mapProcessReserved, PAGE_SIZE,
+                                 ctxVa, FALSE, 0, &ctxHandle);
+    if (!NT_SUCCESS(st)) {
+        ExFreePoolWithTag(record, WINMALI_POOL_TAG);
+        WinMaliVmPut(vm);
+        return st;
+    }
+    record->Mappings[record->MappingCount].BoHandle = ctxHandle;
+    record->Mappings[record->MappingCount].PageCount = 1;
+    record->Mappings[record->MappingCount].GpuVa = ctxVa;
+    ++record->MappingCount;
 
     /* Chunks: allocate `count`, each linked to the previous. panthor adds
        new chunks to the front of the list, so chunk[k].next = chunk[k-1],
        and first_chunk = the last one allocated. */
     for (i = 0; i < count; ++i) {
         ULONG  chunkHandle = 0;
-        UINT64 va       = vm->KmdVaNext;
+        UINT64 va;
         UINT64 nextVal  = (prevChunkVa != 0)
                           ? ((prevChunkVa & ~0xFFFull) | ((UINT64)chunkSize >> 12))
                           : 0ull;
-        st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice, chunkSize,
+        if (mapProcessReserved) {
+            st = WinMaliKmdAllocateProcessReservedGpuVa(
+                ownerDevice, chunkSize, PAGE_SIZE, &va);
+            if (!NT_SUCCESS(st)) {
+                WinMaliTilerHeapDestroyRecord_(adapter, record);
+                WinMaliVmPut(vm);
+                return st;
+            }
+        } else {
+            va = vm->KmdVaNext;
+            vm->KmdVaNext = va + chunkSize;
+        }
+        st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice,
+                                     mapProcessReserved, chunkSize,
                                      va, TRUE, nextVal, &chunkHandle);
         if (!NT_SUCCESS(st)) {
-            /* Partial failure: the context + already-mapped chunks are BOs
-               owned by the device and get reclaimed at rundown/VM teardown.
-               Report failure so the caller uses the metadata fallback. */
+            /* Roll back the context and every previously mapped chunk now;
+               never expose a partially constructed heap to UMD. */
+            WinMaliTilerHeapDestroyRecord_(adapter, record);
             WinMaliVmPut(vm);
             return st;
         }
+        record->Mappings[record->MappingCount].BoHandle = chunkHandle;
+        record->Mappings[record->MappingCount].PageCount = chunkSize / PAGE_SIZE;
+        record->Mappings[record->MappingCount].GpuVa = va;
+        ++record->MappingCount;
         prevChunkVa  = va;
         firstChunkVa = va;               /* newest = first_chunk_gpu_va */
-        vm->KmdVaNext = va + chunkSize;
     }
 
     WinMaliVmPut(vm);
     *outCtxVa = ctxVa;
     *outFirstChunkVa = firstChunkVa;
+    *outRecord = record;
+    WINMALI_TRACE(
+        "TilerHeapAddressing: vm=%u mode=%s ctx=0x%llx first=0x%llx",
+        vmId, mapProcessReserved ? "DXGK+escape" : "escape-only",
+        (ULONGLONG)ctxVa, (ULONGLONG)firstChunkVa);
     return STATUS_SUCCESS;
 }
 
@@ -1340,14 +1575,20 @@ WinMaliKmdEscape(
             hdr->Status = WMERR_EINVAL;
         } else {
             UINT64   realCtxVa = 0, realFirstVa = 0;
+            PWINMALI_TILER_HEAP_RECORD record = NULL;
             NTSTATUS heapSt = WinMaliTilerHeapCreateReal_(
                                   adapter, WinMaliDeviceOwnerToken(pEscape->hDevice),
                                   args->VmId, args->ChunkSize,
                                   args->InitialChunkCount,
-                                  &realCtxVa, &realFirstVa);
+                                  &realCtxVa, &realFirstVa, &record);
             if (NT_SUCCESS(heapSt)) {
+                KIRQL irql;
                 args->HeapHandle = (ULONG)InterlockedIncrement(
-                                       &adapter->GroupTable.NextHandle) | 0x80000000u;
+                                       &adapter->NextTilerHeapHandle) | 0x80000000u;
+                record->Handle = args->HeapHandle;
+                KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+                InsertTailList(&adapter->TilerHeapHead, &record->Link);
+                KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
                 args->FirstChunkGpuVa   = realFirstVa;
                 args->TilerHeapCtxGpuVa = realCtxVa;
                 WINMALI_TRACE("TilerHeapCreate: handle=0x%x vm=%u chunk=%u count=%u "
@@ -1371,8 +1612,18 @@ WinMaliKmdEscape(
         if (args == NULL) {
             hdr->Status = WMERR_EINVAL;
         } else {
-            WINMALI_TRACE("TilerHeapDestroy: handle=0x%x (metadata-only)", args->HeapHandle);
-            hdr->Status = WMERR_OK;
+            PWINMALI_TILER_HEAP_RECORD record =
+                WinMaliTilerHeapRemove_(adapter, args->HeapHandle);
+            if (record == NULL) {
+                WINMALI_WARN("TilerHeapDestroy: unknown handle=0x%x",
+                             args->HeapHandle);
+                hdr->Status = WMERR_ENOENT;
+            } else {
+                WinMaliTilerHeapDestroyRecord_(adapter, record);
+                WINMALI_TRACE("TilerHeapDestroy: handle=0x%x released",
+                              args->HeapHandle);
+                hdr->Status = WMERR_OK;
+            }
         }
         break;
     }

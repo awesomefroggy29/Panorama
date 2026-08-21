@@ -23,6 +23,133 @@
 
 #include "WinMaliKmd.h"
 
+/* The current failing render submission starts at this GPU VA.  Keep this
+   diagnostic deliberately narrow: the initial VidMm population touches four
+   512-entry tables, and dumping every PTE makes the useful ordering almost
+   impossible to recover from DbgView. */
+#define WINMALI_PAGING_DIAG_GPU_VA  (0x0000fffffffe6000ull)
+
+/* DXGK_PTE stores the high 52 bits of a physical address: in other words,
+   PageAddress/PageTableAddress are page frame numbers and the implicit low
+   PAGE_SHIFT bits are zero.  Mali LPAE descriptors instead store the byte
+   physical address in bits[47:12], so restore the omitted page offset before
+   applying the hardware PA mask.
+
+   The distinction is observable in the 24H2 runtime data.  For example,
+   VidMm supplied PageTableAddress=0x3a4b8c for a table whose CPU mapping has
+   physical address 0x3a4b8c000. */
+static UINT64
+WinMaliPagingPteAddressToPhysical_(_In_ UINT64 pageNumber)
+{
+    return (pageNumber << PAGE_SHIFT) & WINMALI_LPAE_PA_MASK;
+}
+
+static BOOLEAN
+WinMaliPagingIsDiagnosticPte_(
+    _In_ const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE* op,
+    _In_ UINT entryOffset,
+    _Out_opt_ UINT64* entryGpuVa)
+{
+    UINT shift;
+    UINT64 va;
+    UINT64 target;
+
+    if (op == NULL || op->PageTableLevel > 3u) {
+        return FALSE;
+    }
+
+    /* WDDM numbers the leaf as level zero.  With 4 KiB pages and nine index
+       bits at every level, one entry covers 4 KiB << (9 * level). */
+    shift = 12u + (9u * op->PageTableLevel);
+    va = op->FirstPteVirtualAddress + ((UINT64)entryOffset << shift);
+    target = WINMALI_PAGING_DIAG_GPU_VA & ~((1ull << shift) - 1ull);
+    if (entryGpuVa != NULL) {
+        *entryGpuVa = va;
+    }
+    return va == target;
+}
+
+static VOID
+WinMaliPagingTraceDiagnosticPte_(
+    _In_ const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE* op,
+    _In_ const DXGK_PTE* pte,
+    _In_ UINT entryOffset,
+    _In_ UINT64 encoded)
+{
+    PHYSICAL_ADDRESS tablePa;
+    UINT64 entryGpuVa = 0;
+    UINT absoluteIndex;
+
+    if (!WinMaliPagingIsDiagnosticPte_(op, entryOffset, &entryGpuVa)) {
+        return;
+    }
+
+    absoluteIndex = op->StartIndex + entryOffset;
+    tablePa = MmGetPhysicalAddress(op->PageTableAddress.CpuVirtual);
+
+    WINMALI_TRACE(
+        "PTW-DIAG: process=%p level=%u tableVa=%p tablePa=0x%llx "
+        "start=%u offset=%u index=%u entryGpuVa=0x%llx firstPteVa=0x%llx "
+        "initial=%u repeat=%u alloc=%p allocOff=0x%llx",
+        op->hProcess,
+        op->PageTableLevel,
+        op->PageTableAddress.CpuVirtual,
+        (ULONGLONG)tablePa.QuadPart,
+        op->StartIndex,
+        entryOffset,
+        absoluteIndex,
+        (ULONGLONG)entryGpuVa,
+        (ULONGLONG)op->FirstPteVirtualAddress,
+        op->Flags.InitialUpdate,
+        op->Flags.Repeat,
+        op->hAllocation,
+        (ULONGLONG)op->AllocationOffsetInBytes);
+    WINMALI_TRACE(
+        "PTW-DIAG: level=%u index=%u rawFlags=0x%llx valid=%u zero=%u "
+        "coherent=%u ro=%u nx=%u segment=%u large=%u adapter=%u "
+        "ptPageSize=%u pageNumber=0x%llx resolvedPa=0x%llx "
+        "encoded=0x%llx readback=0x%llx",
+        op->PageTableLevel,
+        absoluteIndex,
+        (ULONGLONG)pte->Flags,
+        (UINT)pte->Valid,
+        (UINT)pte->Zero,
+        (UINT)pte->CacheCoherent,
+        (UINT)pte->ReadOnly,
+        (UINT)pte->NoExecute,
+        (UINT)pte->Segment,
+        (UINT)pte->LargePage,
+        (UINT)pte->PhysicalAdapterIndex,
+        (UINT)pte->PageTablePageSize,
+        (ULONGLONG)pte->PageTableAddress,
+        (ULONGLONG)WinMaliPagingPteAddressToPhysical_(
+            (UINT64)pte->PageTableAddress),
+        (ULONGLONG)encoded,
+        (ULONGLONG)((PUINT64)op->PageTableAddress.CpuVirtual)[absoluteIndex]);
+
+    if (pte->Valid) {
+        UINT64 pageNumber = (UINT64)pte->PageTableAddress;
+        UINT64 physical = WinMaliPagingPteAddressToPhysical_(pageNumber);
+        if (pageNumber == 0 || physical == 0 ||
+            pageNumber > (WINMALI_LPAE_PA_MASK >> PAGE_SHIFT)) {
+            WINMALI_ERROR(
+                "PTW-DIAG: INVALID level=%u index=%u valid pageNumber=0x%llx resolvedPa=0x%llx",
+                op->PageTableLevel, absoluteIndex,
+                (ULONGLONG)pageNumber, (ULONGLONG)physical);
+        }
+        if (op->PageTableLevel != 0u && (encoded & 0x3ull) != 0x3ull) {
+            WINMALI_ERROR(
+                "PTW-DIAG: INVALID level=%u index=%u table descriptor=0x%llx type=0x%llx",
+                op->PageTableLevel, absoluteIndex,
+                (ULONGLONG)encoded, (ULONGLONG)(encoded & 0x3ull));
+        }
+    } else if (encoded != 0) {
+        WINMALI_ERROR(
+            "PTW-DIAG: INVALID level=%u index=%u invalid input encoded nonzero=0x%llx",
+            op->PageTableLevel, absoluteIndex, (ULONGLONG)encoded);
+    }
+}
+
 /* ARM-LPAE leaf encoding. See WINMALI_LPAE_L3_* in WinMaliMmu.h - we
    pick the variant per PTE based on the DXGK_PTE flags. */
 static UINT64
@@ -42,17 +169,16 @@ WinMaliEncodeLpaePte_(_In_ const DXGK_PTE* pte)
                                : WINMALI_LPAE_L3_PAGE_ATTR_RW_EX;
     }
 
-    /* DXGK_PTE::PageAddress holds the page-aligned host physical address
-       (low 12 bits zero). LPAE PA field occupies bits[47:12]; the mask
-       enforces the alignment + width. */
-    return ((UINT64)pte->PageAddress & WINMALI_LPAE_PA_MASK) | attrs;
+    /* DXGK_PTE::PageAddress is the page number (the high 52 PA bits).
+       Restore its implicit zero low bits for Mali's byte-addressed PA field. */
+    return WinMaliPagingPteAddressToPhysical_((UINT64)pte->PageAddress) | attrs;
 }
 
 /* Walk pPageTableEntries and write Mali LPAE entries. The GPU VA space is
    4-level 48-bit LPAE (see GPUMMUCAPS): dxgk populates level 0 with leaf page
    descriptors (real allocation pages) and levels 1..3 with TABLE descriptors
-   pointing at the next-level page table (DXGK_PTE::PageTableAddress). Both the
-   leaf and table PA fields are byte-PAs with the low 12 bits zero. */
+   pointing at the next-level page table (DXGK_PTE::PageTableAddress). Both
+   DXGK_PTE address fields are page numbers; Mali descriptors need byte PAs. */
 static NTSTATUS
 WinMaliPagingUpdatePageTable_(
     _Inout_ PWINMALI_ADAPTER adapter,
@@ -61,6 +187,9 @@ WinMaliPagingUpdatePageTable_(
     PUINT64 pt;
     UINT    i;
     BOOLEAN leaf;
+    UINT64  reservedBase = 0;
+    UINT64  reservedRootChildPa = 0;
+    BOOLEAN hasReservation;
 
     UNREFERENCED_PARAMETER(adapter);
 
@@ -81,25 +210,70 @@ WinMaliPagingUpdatePageTable_(
 
     pt = (PUINT64)op->PageTableAddress.CpuVirtual + op->StartIndex;
     leaf = (op->PageTableLevel == 0);
+    hasReservation = WinMaliKmdGetProcessReservedPageTable(
+        op->hProcess, &reservedBase, &reservedRootChildPa);
 
     for (i = 0; i < op->NumPageTableEntries; ++i) {
         const DXGK_PTE* pte = &op->pPageTableEntries[op->Flags.Repeat ? 0 : i];
+        UINT64 encoded;
         if (leaf) {
-            pt[i] = WinMaliEncodeLpaePte_(pte);
+            encoded = WinMaliEncodeLpaePte_(pte);
         } else if (pte->Valid) {
             /* Non-leaf: valid LPAE table descriptor -> next-level PT phys addr.
                Bits[1:0]=0b11 = valid table descriptor (see WinMaliMmu.c). */
-            pt[i] = (pte->PageTableAddress & WINMALI_LPAE_PA_MASK) | 0x3ull;
+            encoded = WinMaliPagingPteAddressToPhysical_(
+                          (UINT64)pte->PageTableAddress) | 0x3ull;
         } else {
-            pt[i] = 0ULL;
+            encoded = 0ULL;
         }
+        pt[i] = encoded;
+
+        /* Dxgk's KMD reservation owns a process-root entry, not a VidMm
+           level-1 entry. For our 48-bit layout root/L3 entry 1 represents
+           0x8000000000. VidMm initializes that reserved entry invalid each
+           time the root becomes resident; point it at our complete private
+           L2->L1->L0 subtree on every such update. */
+        if (op->PageTableLevel == 3 && hasReservation &&
+            op->FirstPteVirtualAddress + ((UINT64)i << 39) == reservedBase) {
+            if (reservedRootChildPa == 0) {
+                WINMALI_ERROR(
+                    "UpdatePageTable: reserved process root without private subtree process=%p va=0x%llx",
+                    op->hProcess, (ULONGLONG)reservedBase);
+                return STATUS_DEVICE_NOT_READY;
+            }
+            if (pte->Valid) {
+                WINMALI_WARN(
+                    "UpdatePageTable: reserved CSF root arrived VidMm-valid process=%p va=0x%llx pageTablePa=0x%llx; replacing owned entry",
+                    op->hProcess,
+                    (ULONGLONG)reservedBase,
+                    (ULONGLONG)pte->PageTableAddress);
+            }
+            pt[i] = (reservedRootChildPa & WINMALI_LPAE_PA_MASK) | 0x3ull;
+            encoded = pt[i];
+            WINMALI_TRACE(
+                "UpdatePageTable: installed process-reserved root process=%p va=0x%llx pt=%p index=%u L2Pa=0x%llx vidmmValid=%u init=%u",
+                op->hProcess,
+                (ULONGLONG)reservedBase,
+                op->PageTableAddress.CpuVirtual,
+                op->StartIndex + i,
+                (ULONGLONG)reservedRootChildPa,
+                pte->Valid,
+                op->Flags.InitialUpdate);
+        }
+
+        /* Read back the exact descriptor after all normal/reserved overrides
+           have run.  This is logging-only and intentionally does not repair
+           an invalid VidMm input or reinterpret DXGK_PTE.Segment. */
+        WinMaliPagingTraceDiagnosticPte_(op, pte, i, encoded);
     }
     KeMemoryBarrier();
 
-    WINMALI_TRACE("UpdatePageTable: lvl=%u pt=%p start=%u count=%u repeat=%u alloc=%p",
+    WINMALI_TRACE("UpdatePageTable: lvl=%u pt=%p start=%u count=%u repeat=%u alloc=%p process=%p firstPteVa=0x%llx reserved=%u",
                   op->PageTableLevel, op->PageTableAddress.CpuVirtual,
                   op->StartIndex, op->NumPageTableEntries, op->Flags.Repeat,
-                  op->hAllocation);
+                  op->hAllocation, op->hProcess,
+                  (ULONGLONG)op->FirstPteVirtualAddress,
+                  hasReservation);
     return STATUS_SUCCESS;
 }
 

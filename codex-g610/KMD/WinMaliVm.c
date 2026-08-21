@@ -129,8 +129,8 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
         vm->PtInitialized = TRUE;
     }
 
-    /* Cross-map the CSF ring/sync/shader into this VM at the fixed low VAs so
-       the MCU can execute this group's command streams in its own AS. Best-
+    /* Cross-map the CSF ring/sync/shader into this escape-owned VM at the
+       fixed KMD-reserved VAs so the MCU can execute in its own AS. Best-
        effort: if CSF isn't booted yet the submit path falls back to the NOP. */
     {
         WINMALI_TRACE("VmCreateDiag: calling CsfMapIntoVm AS=%u", vm->Pt.AsSlot);

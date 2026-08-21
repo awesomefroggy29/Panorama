@@ -48,11 +48,28 @@ typedef struct _WINMALI_KMD_PROCESS {
     UINT                Flags;           /* mirror of DXGK_CREATEPROCESSFLAGS */
     ULONG               Pasid;           /* primary process address-space id (if any) */
     LONG                DeviceCount;     /* outstanding Devices on this process */
+    UINT64              CsfReservedGpuVa;
+    BOOLEAN             CsfGpuVaReserved;
+    /* Process-private subtree installed beneath the one root entry reserved
+       at WINMALI_CSF_RESERVED_GPU_VA_BASE.  Hardware layout for this 1 GiB
+       range is root -> ReservedL2[0] -> ReservedL1[0..511] -> leaf PTEs.
+       Leaf zero contains a copy of the adapter-global CSF mappings; remaining
+       leaves are allocated lazily for process-private tiler heaps. */
+    FAST_MUTEX          ReservedPtLock;
+    PVOID               ReservedL2PtVa;
+    PHYSICAL_ADDRESS    ReservedL2PtPa;
+    PVOID               ReservedL1PtVa;
+    PHYSICAL_ADDRESS    ReservedL1PtPa;
+    PVOID               ReservedLeafPtVa[512];
+    PHYSICAL_ADDRESS    ReservedLeafPtPa[512];
+    RTL_BITMAP          ReservedGpuVaBitmap;
+    PULONG              ReservedGpuVaBitmapBuffer;
+    ULONG               ReservedGpuVaPageCount;
+    BOOLEAN             ReservedPtValid;
 } WINMALI_KMD_PROCESS, *PWINMALI_KMD_PROCESS;
 
-/* Per-device state. Each D3D11 process opens one+ devices; each device
-   can own many contexts. We chain back to the owning process via
-   OwnerProcess so cleanup ordering errors are visible. */
+/* Per-device state. Declared before the process-reserved mapping helpers
+   because their opaque owner token is this object. */
 typedef struct _WINMALI_KMD_DEVICE {
     ULONG                 Magic;
     PWINMALI_ADAPTER      Adapter;
@@ -62,6 +79,352 @@ typedef struct _WINMALI_KMD_DEVICE {
     ULONG                 Pasid;
     LONG                  ContextCount;
 } WINMALI_KMD_DEVICE, *PWINMALI_KMD_DEVICE;
+
+BOOLEAN
+WinMaliKmdGetProcessReservedPageTable(
+    _In_opt_ HANDLE hKmdProcess,
+    _Out_ UINT64* ReservedBase,
+    _Out_ UINT64* RootChildPhysicalAddress)
+{
+    PWINMALI_KMD_PROCESS proc = (PWINMALI_KMD_PROCESS)hKmdProcess;
+
+    if (ReservedBase == NULL || RootChildPhysicalAddress == NULL) {
+        return FALSE;
+    }
+    *ReservedBase = 0;
+    *RootChildPhysicalAddress = 0;
+    if (proc == NULL || proc->Magic != WINMALI_KMD_PROCESS_MAGIC ||
+        !proc->CsfGpuVaReserved || !proc->ReservedPtValid ||
+        proc->ReservedL2PtVa == NULL ||
+        proc->ReservedL2PtPa.QuadPart == 0) {
+        return FALSE;
+    }
+    *ReservedBase = proc->CsfReservedGpuVa;
+    *RootChildPhysicalAddress = (UINT64)proc->ReservedL2PtPa.QuadPart;
+    return TRUE;
+}
+
+static VOID
+WinMaliKmdFreeProcessReservedPt_(_Inout_ PWINMALI_KMD_PROCESS proc)
+{
+    ULONG i;
+
+    if (proc == NULL) {
+        return;
+    }
+    proc->ReservedPtValid = FALSE;
+    if (proc->ReservedGpuVaBitmapBuffer != NULL) {
+        ExFreePoolWithTag(proc->ReservedGpuVaBitmapBuffer, WINMALI_POOL_TAG);
+        proc->ReservedGpuVaBitmapBuffer = NULL;
+        proc->ReservedGpuVaPageCount = 0;
+    }
+    for (i = 0; i < RTL_NUMBER_OF(proc->ReservedLeafPtVa); ++i) {
+        if (proc->ReservedLeafPtVa[i] != NULL) {
+            MmFreeContiguousMemory(proc->ReservedLeafPtVa[i]);
+            proc->ReservedLeafPtVa[i] = NULL;
+            proc->ReservedLeafPtPa[i].QuadPart = 0;
+        }
+    }
+    if (proc->ReservedL1PtVa != NULL) {
+        MmFreeContiguousMemory(proc->ReservedL1PtVa);
+        proc->ReservedL1PtVa = NULL;
+        proc->ReservedL1PtPa.QuadPart = 0;
+    }
+    if (proc->ReservedL2PtVa != NULL) {
+        MmFreeContiguousMemory(proc->ReservedL2PtVa);
+        proc->ReservedL2PtVa = NULL;
+        proc->ReservedL2PtPa.QuadPart = 0;
+    }
+}
+
+static NTSTATUS
+WinMaliKmdInitProcessReservedPt_(
+    _In_ PWINMALI_ADAPTER adapter,
+    _Inout_ PWINMALI_KMD_PROCESS proc)
+{
+    PHYSICAL_ADDRESS low;
+    PHYSICAL_ADDRESS high;
+    PUINT64 l2 = NULL;
+    PUINT64 l1 = NULL;
+    PUINT64 leaf0 = NULL;
+    PULONG bitmapBuffer = NULL;
+    ULONG pageCount = (ULONG)(WINMALI_CSF_RESERVED_GPU_VA_BYTES >> PAGE_SHIFT);
+    ULONG bitmapBytes = ((pageCount + 31u) / 32u) * sizeof(ULONG);
+
+    if (adapter == NULL || proc == NULL ||
+        !adapter->CsfReservedPtValid ||
+        adapter->CsfReservedL0PtVa == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    low.QuadPart = 0;
+    high.QuadPart = (ULONG64)-1LL;
+    l2 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    l1 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    leaf0 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    bitmapBuffer = (PULONG)ExAllocatePoolWithTag(
+        NonPagedPoolNx, bitmapBytes, WINMALI_POOL_TAG);
+    if (l2 == NULL || l1 == NULL || leaf0 == NULL || bitmapBuffer == NULL) {
+        if (bitmapBuffer != NULL) {
+            ExFreePoolWithTag(bitmapBuffer, WINMALI_POOL_TAG);
+        }
+        if (leaf0 != NULL) MmFreeContiguousMemory(leaf0);
+        if (l1 != NULL) MmFreeContiguousMemory(l1);
+        if (l2 != NULL) MmFreeContiguousMemory(l2);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(l2, PAGE_SIZE);
+    RtlZeroMemory(l1, PAGE_SIZE);
+    /* The shared adapter leaf contains only the ring, shader trampoline and
+       sync mappings in the first 2 MiB.  Copy descriptors, not ownership. */
+    RtlCopyMemory(leaf0, adapter->CsfReservedL0PtVa, PAGE_SIZE);
+
+    proc->ReservedL2PtVa = l2;
+    proc->ReservedL2PtPa = MmGetPhysicalAddress(l2);
+    proc->ReservedL1PtVa = l1;
+    proc->ReservedL1PtPa = MmGetPhysicalAddress(l1);
+    proc->ReservedLeafPtVa[0] = leaf0;
+    proc->ReservedLeafPtPa[0] = MmGetPhysicalAddress(leaf0);
+    proc->ReservedGpuVaBitmapBuffer = bitmapBuffer;
+    proc->ReservedGpuVaPageCount = pageCount;
+    RtlInitializeBitMap(&proc->ReservedGpuVaBitmap, bitmapBuffer, pageCount);
+    RtlClearAllBits(&proc->ReservedGpuVaBitmap);
+    /* Leaf zero is the immutable shared CSF portion, not allocatable heap VA. */
+    RtlSetBits(&proc->ReservedGpuVaBitmap, 0,
+               (ULONG)(WINMALI_CSF_SHARED_GPU_VA_BYTES >> PAGE_SHIFT));
+
+    l2[0] = ((UINT64)proc->ReservedL1PtPa.QuadPart &
+             WINMALI_LPAE_PA_MASK) | 0x3ull;
+    l1[0] = ((UINT64)proc->ReservedLeafPtPa[0].QuadPart &
+             WINMALI_LPAE_PA_MASK) | 0x3ull;
+    KeMemoryBarrier();
+    proc->ReservedPtValid = TRUE;
+
+    WINMALI_TRACE(
+        "ProcessReservedPT: proc=%p L2=%p/0x%llx L1=%p/0x%llx leaf0=%p/0x%llx range=0x%llx-0x%llx",
+        proc, l2, (ULONGLONG)proc->ReservedL2PtPa.QuadPart,
+        l1, (ULONGLONG)proc->ReservedL1PtPa.QuadPart,
+        leaf0, (ULONGLONG)proc->ReservedLeafPtPa[0].QuadPart,
+        (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BASE,
+        (ULONGLONG)(WINMALI_CSF_RESERVED_GPU_VA_BASE +
+                    WINMALI_CSF_RESERVED_GPU_VA_BYTES - 1ull));
+    return STATUS_SUCCESS;
+}
+
+static PWINMALI_KMD_PROCESS
+WinMaliKmdProcessFromOwnerDevice_(_In_opt_ PVOID ownerDevice)
+{
+    PWINMALI_KMD_DEVICE dev = (PWINMALI_KMD_DEVICE)ownerDevice;
+    PWINMALI_KMD_PROCESS proc;
+
+    if (dev == NULL || dev->Magic != WINMALI_KMD_DEVICE_MAGIC) {
+        return NULL;
+    }
+    proc = dev->OwnerProcess;
+    if (proc == NULL || proc->Magic != WINMALI_KMD_PROCESS_MAGIC ||
+        !proc->ReservedPtValid || !proc->CsfGpuVaReserved) {
+        return NULL;
+    }
+    return proc;
+}
+
+NTSTATUS
+WinMaliKmdAllocateProcessReservedGpuVa(
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 size,
+    _In_ UINT64 alignment,
+    _Out_ UINT64* gpuVa)
+{
+    PWINMALI_KMD_PROCESS proc;
+    ULONG pages;
+    ULONG alignmentPages;
+    ULONG candidate;
+    ULONG privateStart;
+
+    if (gpuVa == NULL || size == 0 ||
+        (size & (PAGE_SIZE - 1ull)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *gpuVa = 0;
+    proc = WinMaliKmdProcessFromOwnerDevice_(ownerDevice);
+    if (proc == NULL) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;
+    if ((alignment & (alignment - 1ull)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (size > WINMALI_CSF_RESERVED_GPU_VA_BYTES ||
+        alignment > WINMALI_CSF_RESERVED_GPU_VA_BYTES) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    pages = (ULONG)(size >> PAGE_SHIFT);
+    alignmentPages = (ULONG)(alignment >> PAGE_SHIFT);
+    privateStart = (ULONG)(WINMALI_CSF_SHARED_GPU_VA_BYTES >> PAGE_SHIFT);
+
+    ExAcquireFastMutex(&proc->ReservedPtLock);
+    candidate = (privateStart + alignmentPages - 1u) & ~(alignmentPages - 1u);
+    while (candidate <= proc->ReservedGpuVaPageCount &&
+           pages <= proc->ReservedGpuVaPageCount - candidate) {
+        if (RtlAreBitsClear(&proc->ReservedGpuVaBitmap, candidate, pages)) {
+            RtlSetBits(&proc->ReservedGpuVaBitmap, candidate, pages);
+            ExReleaseFastMutex(&proc->ReservedPtLock);
+            *gpuVa = proc->CsfReservedGpuVa +
+                     ((UINT64)candidate << PAGE_SHIFT);
+            return STATUS_SUCCESS;
+        }
+        if (candidate > MAXULONG - alignmentPages) break;
+        candidate += alignmentPages;
+    }
+    ExReleaseFastMutex(&proc->ReservedPtLock);
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+NTSTATUS
+WinMaliKmdMapProcessReservedGpuVa(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 gpuVa,
+    _In_reads_(pageCount) const PFN_NUMBER* pfns,
+    _In_ ULONG pageCount,
+    _In_ UINT64 attrs)
+{
+    PWINMALI_KMD_PROCESS proc;
+    PHYSICAL_ADDRESS low;
+    PHYSICAL_ADDRESS high;
+    ULONG mapped = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (adapter == NULL || pfns == NULL || pageCount == 0 ||
+        (gpuVa & (PAGE_SIZE - 1ull)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    proc = WinMaliKmdProcessFromOwnerDevice_(ownerDevice);
+    if (proc == NULL) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (gpuVa < proc->CsfReservedGpuVa + WINMALI_CSF_SHARED_GPU_VA_BYTES ||
+        gpuVa + ((UINT64)pageCount << PAGE_SHIFT) < gpuVa ||
+        gpuVa + ((UINT64)pageCount << PAGE_SHIFT) >
+            proc->CsfReservedGpuVa + WINMALI_CSF_RESERVED_GPU_VA_BYTES) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    low.QuadPart = 0;
+    high.QuadPart = (ULONG64)-1LL;
+    ExAcquireFastMutex(&proc->ReservedPtLock);
+    if (!RtlAreBitsSet(
+            &proc->ReservedGpuVaBitmap,
+            (ULONG)((gpuVa - proc->CsfReservedGpuVa) >> PAGE_SHIFT),
+            pageCount)) {
+        ExReleaseFastMutex(&proc->ReservedPtLock);
+        return STATUS_INVALID_ADDRESS;
+    }
+    for (mapped = 0; mapped < pageCount; ++mapped) {
+        UINT64 va = gpuVa + ((UINT64)mapped << PAGE_SHIFT);
+        UINT leafIndex = (UINT)((va - proc->CsfReservedGpuVa) >> 21);
+        UINT pteIndex = (UINT)((va >> PAGE_SHIFT) & 0x1ffull);
+        PUINT64 leaf;
+
+        if (leafIndex >= RTL_NUMBER_OF(proc->ReservedLeafPtVa)) {
+            status = STATUS_INVALID_ADDRESS;
+            break;
+        }
+        if (proc->ReservedLeafPtVa[leafIndex] == NULL) {
+            PVOID page = MmAllocateContiguousMemorySpecifyCache(
+                PAGE_SIZE, low, high, low, MmNonCached);
+            if (page == NULL) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlZeroMemory(page, PAGE_SIZE);
+            proc->ReservedLeafPtVa[leafIndex] = page;
+            proc->ReservedLeafPtPa[leafIndex] = MmGetPhysicalAddress(page);
+            ((PUINT64)proc->ReservedL1PtVa)[leafIndex] =
+                ((UINT64)proc->ReservedLeafPtPa[leafIndex].QuadPart &
+                 WINMALI_LPAE_PA_MASK) | 0x3ull;
+        }
+        leaf = (PUINT64)proc->ReservedLeafPtVa[leafIndex];
+        if (leaf[pteIndex] != 0) {
+            status = STATUS_CONFLICTING_ADDRESSES;
+            break;
+        }
+        leaf[pteIndex] = (((UINT64)pfns[mapped] << PAGE_SHIFT) &
+                          WINMALI_LPAE_PA_MASK) | attrs;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        while (mapped != 0) {
+            UINT64 va;
+            UINT leafIndex;
+            UINT pteIndex;
+            --mapped;
+            va = gpuVa + ((UINT64)mapped << PAGE_SHIFT);
+            leafIndex = (UINT)((va - proc->CsfReservedGpuVa) >> 21);
+            pteIndex = (UINT)((va >> PAGE_SHIFT) & 0x1ffull);
+            ((PUINT64)proc->ReservedLeafPtVa[leafIndex])[pteIndex] = 0;
+        }
+    }
+    KeMemoryBarrier();
+    ExReleaseFastMutex(&proc->ReservedPtLock);
+
+    if (NT_SUCCESS(status)) {
+        (VOID)WinMaliMmuFlushUserAsSlots(adapter);
+        WINMALI_TRACE(
+            "ProcessReservedMap: proc=%p va=0x%llx pages=%u firstPa=0x%llx attrs=0x%llx",
+            proc, (ULONGLONG)gpuVa, pageCount,
+            (ULONGLONG)((UINT64)pfns[0] << PAGE_SHIFT),
+            (ULONGLONG)attrs);
+    }
+    return status;
+}
+
+NTSTATUS
+WinMaliKmdUnmapProcessReservedGpuVa(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_opt_ PVOID ownerDevice,
+    _In_ UINT64 gpuVa,
+    _In_ ULONG pageCount)
+{
+    PWINMALI_KMD_PROCESS proc;
+    ULONG i;
+
+    if (adapter == NULL || pageCount == 0 ||
+        (gpuVa & (PAGE_SIZE - 1ull)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    proc = WinMaliKmdProcessFromOwnerDevice_(ownerDevice);
+    if (proc == NULL) return STATUS_NOT_SUPPORTED;
+    if (gpuVa < proc->CsfReservedGpuVa + WINMALI_CSF_SHARED_GPU_VA_BYTES ||
+        gpuVa + ((UINT64)pageCount << PAGE_SHIFT) < gpuVa ||
+        gpuVa + ((UINT64)pageCount << PAGE_SHIFT) >
+            proc->CsfReservedGpuVa + WINMALI_CSF_RESERVED_GPU_VA_BYTES) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    ExAcquireFastMutex(&proc->ReservedPtLock);
+    for (i = 0; i < pageCount; ++i) {
+        UINT64 va = gpuVa + ((UINT64)i << PAGE_SHIFT);
+        UINT leafIndex = (UINT)((va - proc->CsfReservedGpuVa) >> 21);
+        UINT pteIndex = (UINT)((va >> PAGE_SHIFT) & 0x1ffull);
+        if (leafIndex < RTL_NUMBER_OF(proc->ReservedLeafPtVa) &&
+            proc->ReservedLeafPtVa[leafIndex] != NULL) {
+            ((PUINT64)proc->ReservedLeafPtVa[leafIndex])[pteIndex] = 0;
+        }
+    }
+    RtlClearBits(
+        &proc->ReservedGpuVaBitmap,
+        (ULONG)((gpuVa - proc->CsfReservedGpuVa) >> PAGE_SHIFT),
+        pageCount);
+    KeMemoryBarrier();
+    ExReleaseFastMutex(&proc->ReservedPtLock);
+    (VOID)WinMaliMmuFlushUserAsSlots(adapter);
+    return STATUS_SUCCESS;
+}
 
 /* Per-context state. Each context binds (lazily, via SetRootPageTable)
    to a Mali AS slot. dxgk hands hContext back to us for every submit, so
@@ -185,6 +548,8 @@ WinMaliKmdCreateProcess(
 {
     PWINMALI_ADAPTER     adapter;
     PWINMALI_KMD_PROCESS proc;
+    DXGKARGCB_RESERVEGPUVIRTUALADDRESSRANGE reserve;
+    NTSTATUS             status;
 
     if (pCreateProcess == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -193,6 +558,12 @@ WinMaliKmdCreateProcess(
     if (adapter == NULL) {
         return STATUS_INVALID_HANDLE;
     }
+    if (!adapter->CsfReservedPtValid ||
+        adapter->CsfReservedL2PtVa == NULL ||
+        adapter->CsfReservedL2PtPhys.QuadPart == 0) {
+        WINMALI_ERROR("CreateProcess: CSF reserved page-table subtree is not ready");
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     proc = (PWINMALI_KMD_PROCESS)ExAllocatePoolWithTag(
         NonPagedPoolNx, sizeof(*proc), WINMALI_POOL_TAG);
@@ -200,6 +571,7 @@ WinMaliKmdCreateProcess(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(proc, sizeof(*proc));
+    ExInitializeFastMutex(&proc->ReservedPtLock);
     proc->Magic         = WINMALI_KMD_PROCESS_MAGIC;
     proc->Adapter       = adapter;
     proc->hDxgkProcess  = pCreateProcess->hDxgkProcess;
@@ -208,9 +580,61 @@ WinMaliKmdCreateProcess(
         proc->Pasid = pCreateProcess->pPasid[0];
     }
 
+    status = WinMaliKmdInitProcessReservedPt_(adapter, proc);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR("CreateProcess: process reserved PT init failed 0x%08x",
+                      status);
+        ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+        return status;
+    }
+
+    /* Reserve one complete hardware L2-entry coverage (1 GiB). The shared
+       CSF mappings occupy its first 2 MiB and process-private KMD mappings
+       (currently tiler heap context/chunks) occupy the remainder.
+       Reservation is legal only while DxgkDdiCreateProcess is executing.
+       AllowUserModeMapping stays clear: UMD allocations must never replace
+       the ring/sync/trampoline mappings installed by the KMD. */
+    if (adapter->DxgkInterface.DxgkCbReserveGpuVirtualAddressRange == NULL) {
+        WINMALI_ERROR("CreateProcess: DxgkCbReserveGpuVirtualAddressRange unavailable");
+        WinMaliKmdFreeProcessReservedPt_(proc);
+        ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+        return STATUS_NOT_SUPPORTED;
+    }
+    RtlZeroMemory(&reserve, sizeof(reserve));
+    reserve.hDxgkProcess = pCreateProcess->hDxgkProcess;
+    reserve.SizeInBytes = WINMALI_CSF_RESERVED_GPU_VA_BYTES;
+    reserve.Alignment = (UINT)WINMALI_CSF_RESERVED_GPU_VA_BYTES;
+    reserve.BaseAddress = WINMALI_CSF_RESERVED_GPU_VA_BASE;
+    reserve.Flags = 0;
+    status = adapter->DxgkInterface.DxgkCbReserveGpuVirtualAddressRange(
+        adapter->DxgkHandle, &reserve);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_ERROR(
+            "CreateProcess: reserve CSF GPUVA base=0x%llx bytes=0x%llx failed 0x%08x",
+            (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BASE,
+            (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BYTES,
+            status);
+        WinMaliKmdFreeProcessReservedPt_(proc);
+        ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+        return status;
+    }
+    if (reserve.StartVirtualAddress != WINMALI_CSF_RESERVED_GPU_VA_BASE) {
+        WINMALI_ERROR(
+            "CreateProcess: CSF reservation returned unexpected base=0x%llx requested=0x%llx",
+            (ULONGLONG)reserve.StartVirtualAddress,
+            (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BASE);
+        WinMaliKmdFreeProcessReservedPt_(proc);
+        ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+        return STATUS_CONFLICTING_ADDRESSES;
+    }
+    proc->CsfReservedGpuVa = reserve.StartVirtualAddress;
+    proc->CsfGpuVaReserved = TRUE;
+
     pCreateProcess->hKmdProcess = (HANDLE)proc;
-    WINMALI_TRACE("CreateProcess: proc=%p hDxgk=%p flags=0x%x pasid=%u",
-                  proc, proc->hDxgkProcess, proc->Flags, proc->Pasid);
+    WINMALI_TRACE("CreateProcess: proc=%p hDxgk=%p flags=0x%x pasid=%u CSF-reserved=0x%llx/0x%llx",
+                  proc, proc->hDxgkProcess, proc->Flags, proc->Pasid,
+                  (ULONGLONG)proc->CsfReservedGpuVa,
+                  (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BYTES);
     return STATUS_SUCCESS;
 }
 
@@ -232,6 +656,7 @@ WinMaliKmdDestroyProcess(
                      proc, proc->DeviceCount);
     }
     WINMALI_TRACE("DestroyProcess: proc=%p", proc);
+    WinMaliKmdFreeProcessReservedPt_(proc);
     proc->Magic = 0;
     ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
     return STATUS_SUCCESS;
@@ -330,29 +755,32 @@ WinMaliKmdDestroyDevice(
         WINMALI_WARN("DestroyDevice: dev=%p leaks %ld contexts",
                      dev, dev->ContextCount);
     }
-    if (dev->OwnerProcess != NULL) {
-        InterlockedDecrement(&dev->OwnerProcess->DeviceCount);
-    }
-
     /* Run down every escape-created resource this device still owns. A UMD
        that dies (or just never sends the destroy ops) must not leak: each
        leaked VM pins a Mali AS slot and only 8 exist - six leaks and every
        VmCreate adapter-wide fails -ENOMEM until reboot (seen live
        2026-07-12: dwm/shell probes exhausted AS2..AS7, gl-smoke got 0
        pixel formats). Order: groups reference VMs, BOs may be VM-bound, so
-       groups -> BOs -> syncobjs -> VMs. */
+       heaps -> groups -> remaining BOs -> syncobjs -> VMs.  Keep the process
+       reference counted by this device until heap teardown has removed its
+       process-private reserved mappings. */
     {
         PWINMALI_ADAPTER adapter = dev->Adapter;
         if (adapter != NULL) {
+            ULONG heaps  = WinMaliTilerHeapRundownOwner(adapter, dev);
             ULONG groups = WinMaliGroupRundownOwner(adapter, dev);
             ULONG bos    = WinMaliBoRundownOwner(adapter, dev);
             ULONG syncs  = WinMaliSyncObjRundownOwner(adapter, dev);
             ULONG vms    = WinMaliVmRundownOwner(adapter, dev);
-            if ((groups | bos | syncs | vms) != 0) {
-                WINMALI_TRACE("DestroyDevice rundown: dev=%p groups=%u bos=%u "
-                              "syncs=%u vms=%u", dev, groups, bos, syncs, vms);
+            if ((heaps | groups | bos | syncs | vms) != 0) {
+                WINMALI_TRACE("DestroyDevice rundown: dev=%p heaps=%u groups=%u bos=%u "
+                              "syncs=%u vms=%u", dev, heaps, groups, bos, syncs, vms);
             }
         }
+    }
+
+    if (dev->OwnerProcess != NULL) {
+        InterlockedDecrement(&dev->OwnerProcess->DeviceCount);
     }
 
     WINMALI_TRACE("DestroyDevice: dev=%p", dev);
@@ -606,8 +1034,9 @@ WinMaliKmdRender(
 /* ------------------------------------------------------------------------ */
 
 /* DXGKDDI_SETROOTPAGETABLE returns VOID and takes a SINGLE context per
-   call. Address is {SegmentId, SegmentOffset} - we translate to a host
-   physical address using the DmaSegment base, then bind to a Mali AS slot. */
+   call. Address is {SegmentId, SegmentOffset}: implicit system-memory
+   addresses (segment 0) already carry a physical address, while explicit
+   segment addresses need translation through the DmaSegment base. */
 _Function_class_(DXGKDDI_SETROOTPAGETABLE)
 VOID
 APIENTRY
@@ -637,14 +1066,37 @@ WinMaliKmdSetRootPageTable(
         return;
     }
 
-    if (pArgs->Address.SegmentId == WINMALI_SEGMENT_ID_SYSMEM &&
-        adapter->DmaSegmentVa != NULL) {
-        rootPtPa = (UINT64)adapter->DmaSegmentPhys.QuadPart
-                 + (UINT64)pArgs->Address.SegmentOffset;
+    if (pArgs->Address.SegmentId == 0) {
+        /* WDDM's implicit system-memory segment is SegmentId 0.  In that
+           case SegmentOffset is already the GPU-visible physical address of
+           the root page table.  Only the all-zero address is an unbind. */
+        rootPtPa = (UINT64)pArgs->Address.SegmentOffset;
+    } else if (pArgs->Address.SegmentId == WINMALI_SEGMENT_ID_SYSMEM) {
+        UINT64 segmentOffset = (UINT64)pArgs->Address.SegmentOffset;
+
+        /* Explicit segment addresses are relative to the contiguous backing
+           store reported by QUERYSEGMENT.  Validate the complete root table,
+           not just its first byte, before translating it to a host PA. */
+        if (adapter->DmaSegmentVa == NULL ||
+            segmentOffset > adapter->DmaSegmentBytes ||
+            PAGE_SIZE > adapter->DmaSegmentBytes - segmentOffset) {
+            WINMALI_WARN(
+                "SetRootPageTableDiag: invalid segment-1 address off=0x%llx segmentBytes=0x%Ix",
+                (ULONGLONG)segmentOffset,
+                adapter->DmaSegmentBytes);
+            return;
+        }
+        rootPtPa = (UINT64)adapter->DmaSegmentPhys.QuadPart + segmentOffset;
     } else {
-        /* Unbind request (SegmentId=0) or unknown segment - pass 0 to
-           WinMaliMmuBindContextRootPt which treats 0 as unbind. */
-        rootPtPa = 0;
+        /* This DDI returns VOID, so an unknown segment cannot be reported to
+           dxgkrnl.  Leave any existing context binding intact rather than
+           silently converting a malformed address into an unbind request. */
+        WINMALI_WARN(
+            "SetRootPageTableDiag: unsupported segment=%u off=0x%llx ctx=%p",
+            pArgs->Address.SegmentId,
+            (ULONGLONG)pArgs->Address.SegmentOffset,
+            pArgs->hContext);
+        return;
     }
 
     bindSt = WinMaliMmuBindContextRootPt(adapter,

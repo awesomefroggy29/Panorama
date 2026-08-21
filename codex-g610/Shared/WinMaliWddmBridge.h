@@ -25,6 +25,13 @@ extern "C" {
 struct pan_kmod_dev;
 struct pipe_screen;
 
+/* GPU mapping protections carried across the pan_kmod C <-> WDDM C++
+ * boundary.  These are bridge semantics, not pan_kmod or VM-bind flag values;
+ * keeping a separate namespace prevents accidental bit-for-bit translation
+ * between APIs whose flag layouts differ. */
+#define WINMALI_WDDM_MAP_READONLY (1u << 0)
+#define WINMALI_WDDM_MAP_EXECUTE  (1u << 1)
+
 /* Arm/complete the private syncobjs carried by a WDDM render descriptor.
  * Arm runs before pfnRenderCb so a userspace wait cannot observe the old
  * signalled state while dxgkrnl is still queueing the DMA buffer. */
@@ -54,13 +61,14 @@ struct winmali_wddm_alloc_ops {
     * space via pfnMapGpuVirtualAddressCb / pfnFreeGpuVirtualAddressCb, retiring
     * the escape VmBind for BOs that are real dxgk allocations. map_va requests
     * *inout_va (panfrost's chosen VA) as the base and returns the dxgk-assigned
-    * VA in *inout_va (must match for panfrost's bookkeeping to hold). The map is
-    * synchronised on the device's paging queue before returning. Opt-in:
+    * VA in *inout_va (must match for panfrost's bookkeeping to hold). map_flags
+    * is WINMALI_WDDM_MAP_* and must reflect the BO's GPU access contract. The
+    * map is synchronised on the device's paging queue before returning. Opt-in:
     * panfrost only calls these when WINMALI_DXGK_ADDR is set AND the BO is
     * dxgk-backed (wddm_kmt_handle != 0); otherwise escape VmBind is used.
     * Returns 0 on success, non-zero (errno) on failure. */
    int (*map_va)(void *cookie, uint32_t kmt_handle, uint64_t offset_bytes,
-                 uint64_t size, uint64_t *inout_va);
+                 uint64_t size, uint32_t map_flags, uint64_t *inout_va);
    void (*unmap_va)(void *cookie, uint64_t va, uint64_t size);
 
    /* Create `size` bytes of opaque backing as a real dxgk allocation, made

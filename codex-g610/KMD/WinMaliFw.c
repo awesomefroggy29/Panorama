@@ -88,9 +88,9 @@
 #define WINMALI_CSF_QUEUE_IFACE_BYTES      (8u * 1024u)
 #define WINMALI_CSF_NUM_INSTRS_PER_SLOT    16u
 
-#define WINMALI_CSF_RING_GPU_VA            0x410000ull
-#define WINMALI_CSF_SHADER_GPU_VA          0x420000ull
-#define WINMALI_CSF_SYNC_GPU_VA            0x421000ull
+#define WINMALI_CSF_BRINGUP_RING_GPU_VA    0x410000ull
+#define WINMALI_CSF_BRINGUP_SHADER_GPU_VA  0x420000ull
+#define WINMALI_CSF_BRINGUP_SYNC_GPU_VA    0x421000ull
 
 //
 // Per-Mesa v10.xml the SPD lives at the start of the descriptor page;
@@ -1268,6 +1268,7 @@ WinMaliCsfProgramAndStartCsg_(_Inout_ PWINMALI_ADAPTER Adapter,
     ULONG    epVal;
     ULONG    csgAck;
     ULONG    acked = 0;
+    UINT64   ringGpuVa;
     NTSTATUS status;
 
     if (Fw->Cs00Input == NULL || Fw->Csg0Input == NULL || Fw->Csg0Output == NULL
@@ -1277,6 +1278,9 @@ WinMaliCsfProgramAndStartCsg_(_Inout_ PWINMALI_ADAPTER Adapter,
 
     csIn  = Fw->Cs00Input;
     csgIn = Fw->Csg0Input;
+    ringGpuVa = (AsSlot == Adapter->GpuMmuBringupAs)
+        ? WINMALI_CSF_BRINGUP_RING_GPU_VA
+        : WINMALI_CSF_PROCESS_RING_GPU_VA;
 
     /* Program the CS slot (queue ring). Present an EMPTY ring at the FW's
        current extract position - Insert == Extract == QRingOut->Extract.
@@ -1288,7 +1292,7 @@ WinMaliCsfProgramAndStartCsg_(_Inout_ PWINMALI_ADAPTER Adapter,
        with the ring looking empty and no fault). */
     Fw->QRingIn->Extract  = Fw->QRingOut->Extract;
     Fw->QRingIn->Insert   = Fw->QRingOut->Extract;
-    csIn->RingbufBase     = WINMALI_CSF_RING_GPU_VA;
+    csIn->RingbufBase     = ringGpuVa;
     csIn->RingbufSize     = WINMALI_CSF_RING_BYTES;
     csIn->RingbufInput    = Fw->McuQueueIfaceVa;
     csIn->RingbufOutput   = Fw->McuQueueIfaceVa + 4096ull;
@@ -1348,6 +1352,157 @@ WinMaliCsfProgramAndStartCsg_(_Inout_ PWINMALI_ADAPTER Adapter,
                      AsSlot, status, acked);
     }
     return status;
+}
+
+/* Build the complete private subtree attached below the process root entry
+   reserved for the KMD: L2[0] -> L1, L1[0] -> L0, then the 2-MiB L0 leaf
+   maps the ring/sync/shader pages. VidMm owns only the process root page. */
+static NTSTATUS
+WinMaliCsfBuildReservedPt_(_Inout_ PWINMALI_ADAPTER Adapter,
+                           _In_ WINMALI_FWCTX* Fw)
+{
+    PHYSICAL_ADDRESS low;
+    PHYSICAL_ADDRESS high;
+    PUINT64           l2 = NULL;
+    PUINT64           l1 = NULL;
+    PUINT64           l0 = NULL;
+    PHYSICAL_ADDRESS  l2Pa;
+    PHYSICAL_ADDRESS  l1Pa;
+    PHYSICAL_ADDRESS  l0Pa;
+    ULONG             i;
+    ULONG             ringFirst;
+    ULONG             ringPages;
+    ULONG             shaderIndex;
+    ULONG             syncIndex;
+
+    if (Adapter == NULL || Fw == NULL || Fw->HostRingVa == NULL ||
+        Fw->HostShaderVa == NULL || Fw->HostSyncVa == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Adapter->CsfReservedL2PtVa != NULL ||
+        Adapter->CsfReservedL1PtVa != NULL ||
+        Adapter->CsfReservedL0PtVa != NULL) {
+        return STATUS_ALREADY_INITIALIZED;
+    }
+
+    low.QuadPart = 0;
+    high.QuadPart = (ULONG64)-1LL;
+    l2 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    if (l2 == NULL) {
+        goto insufficient_resources;
+    }
+    l1 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    if (l1 == NULL) {
+        goto insufficient_resources;
+    }
+    l0 = (PUINT64)MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, low, high, low, MmNonCached);
+    if (l0 == NULL) {
+        goto insufficient_resources;
+    }
+    RtlZeroMemory(l2, PAGE_SIZE);
+    RtlZeroMemory(l1, PAGE_SIZE);
+    RtlZeroMemory(l0, PAGE_SIZE);
+    l2Pa = MmGetPhysicalAddress(l2);
+    l1Pa = MmGetPhysicalAddress(l1);
+    l0Pa = MmGetPhysicalAddress(l0);
+
+    /* Reservation base 0x8000000000 has indices L3=1/L2=0/L1=0. The
+       process root supplies L3; this private subtree supplies the rest. */
+    l2[0] = ((UINT64)l1Pa.QuadPart & WINMALI_LPAE_PA_MASK) | 0x3ull;
+    l1[0] = ((UINT64)l0Pa.QuadPart & WINMALI_LPAE_PA_MASK) | 0x3ull;
+
+    ringFirst = (ULONG)(WINMALI_CSF_RING_GPU_VA_OFFSET >> PAGE_SHIFT);
+    ringPages = WINMALI_CSF_RING_BYTES >> PAGE_SHIFT;
+    shaderIndex = (ULONG)(WINMALI_CSF_SHADER_GPU_VA_OFFSET >> PAGE_SHIFT);
+    syncIndex = (ULONG)(WINMALI_CSF_SYNC_GPU_VA_OFFSET >> PAGE_SHIFT);
+    if (ringFirst + ringPages > PAGE_SIZE / sizeof(UINT64) ||
+        shaderIndex >= PAGE_SIZE / sizeof(UINT64) ||
+        syncIndex >= PAGE_SIZE / sizeof(UINT64)) {
+        MmFreeContiguousMemory(l0);
+        MmFreeContiguousMemory(l1);
+        MmFreeContiguousMemory(l2);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    for (i = 0; i < ringPages; ++i) {
+        l0[ringFirst + i] =
+            (((UINT64)Fw->RingPa.QuadPart + ((UINT64)i << PAGE_SHIFT)) &
+             WINMALI_LPAE_PA_MASK) |
+            WINMALI_LPAE_L3_PAGE_ATTR_RW_NX;
+    }
+    l0[shaderIndex] = ((UINT64)Fw->ShaderPa.QuadPart & WINMALI_LPAE_PA_MASK) |
+                      WINMALI_LPAE_L3_PAGE_ATTR_RW_EX;
+    l0[syncIndex] = ((UINT64)Fw->SyncPa.QuadPart & WINMALI_LPAE_PA_MASK) |
+                    WINMALI_LPAE_L3_PAGE_ATTR_RW_NX;
+    KeMemoryBarrier();
+
+    Adapter->CsfReservedL2PtVa = l2;
+    Adapter->CsfReservedL2PtPhys = l2Pa;
+    Adapter->CsfReservedL1PtVa = l1;
+    Adapter->CsfReservedL1PtPhys = l1Pa;
+    Adapter->CsfReservedL0PtVa = l0;
+    Adapter->CsfReservedL0PtPhys = l0Pa;
+    KeMemoryBarrier();
+    Adapter->CsfReservedPtValid = TRUE;
+    WINMALI_TRACE(
+        "CSF reserved PT hierarchy: L2=%p/0x%llx L1=%p/0x%llx L0=%p/0x%llx range=0x%llx-0x%llx ring=0x%llx shader=0x%llx sync=0x%llx",
+        l2, (ULONGLONG)l2Pa.QuadPart,
+        l1, (ULONGLONG)l1Pa.QuadPart,
+        l0, (ULONGLONG)l0Pa.QuadPart,
+        (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BASE,
+        (ULONGLONG)(WINMALI_CSF_RESERVED_GPU_VA_BASE +
+                    WINMALI_CSF_SHARED_GPU_VA_BYTES - 1ull),
+        (ULONGLONG)WINMALI_CSF_PROCESS_RING_GPU_VA,
+        (ULONGLONG)WINMALI_CSF_PROCESS_SHADER_GPU_VA,
+        (ULONGLONG)WINMALI_CSF_PROCESS_SYNC_GPU_VA);
+    return STATUS_SUCCESS;
+
+insufficient_resources:
+    if (l0 != NULL) {
+        MmFreeContiguousMemory(l0);
+    }
+    if (l1 != NULL) {
+        MmFreeContiguousMemory(l1);
+    }
+    if (l2 != NULL) {
+        MmFreeContiguousMemory(l2);
+    }
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+static VOID
+WinMaliCsfFreeReservedPt_(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    PVOID l2;
+    PVOID l1;
+    PVOID l0;
+
+    if (Adapter == NULL) {
+        return;
+    }
+    Adapter->CsfReservedPtValid = FALSE;
+    KeMemoryBarrier();
+    l2 = Adapter->CsfReservedL2PtVa;
+    l1 = Adapter->CsfReservedL1PtVa;
+    l0 = Adapter->CsfReservedL0PtVa;
+    Adapter->CsfReservedL2PtVa = NULL;
+    Adapter->CsfReservedL1PtVa = NULL;
+    Adapter->CsfReservedL0PtVa = NULL;
+    Adapter->CsfReservedL2PtPhys.QuadPart = 0;
+    Adapter->CsfReservedL1PtPhys.QuadPart = 0;
+    Adapter->CsfReservedL0PtPhys.QuadPart = 0;
+    if (l0 != NULL) {
+        MmFreeContiguousMemory(l0);
+    }
+    if (l1 != NULL) {
+        MmFreeContiguousMemory(l1);
+    }
+    if (l2 != NULL) {
+        MmFreeContiguousMemory(l2);
+    }
 }
 
 /*
@@ -1424,7 +1579,7 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
     // mapping; we tag the *callee* stream below as RW + EX instead.
     status = WinMaliMmuMapGpuRange(
         Adapter,
-        WINMALI_CSF_RING_GPU_VA,
+        WINMALI_CSF_BRINGUP_RING_GPU_VA,
         Fw->RingPa,
         WINMALI_CSF_RING_BYTES / 4096u,
         WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
@@ -1471,7 +1626,7 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
     // SYNC_ADD64 here. Memory access only, never instruction fetch.
     status     = WinMaliMmuMapGpuRange(
         Adapter,
-        WINMALI_CSF_SYNC_GPU_VA,
+        WINMALI_CSF_BRINGUP_SYNC_GPU_VA,
         Fw->SyncPa,
         1u,
         WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
@@ -1541,12 +1696,18 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
     // Escape NOP path: callee CSF stream the trampoline CALLs; must be EX.
     status       = WinMaliMmuMapGpuRange(
         Adapter,
-        WINMALI_CSF_SHADER_GPU_VA,
+        WINMALI_CSF_BRINGUP_SHADER_GPU_VA,
         Fw->ShaderPa,
         1u,
         WINMALI_LPAE_L3_PAGE_ATTR_RW_EX);
     if (!NT_SUCCESS(status)) {
         goto err_shader;
+    }
+
+    status = WinMaliCsfBuildReservedPt_(Adapter, Fw);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_WARN("CSF bootstrap: reserved PT subtree failed 0x%08x", status);
+        goto err_shader_unmap;
     }
 
 
@@ -1581,11 +1742,11 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
         "CSF bootstrap OK: ring gpu_va=0x%llx (%lu KiB) qiface mcu_va=0x%llx "
         "sync gpu_va=0x%llx shader gpu_va=0x%llx susp=%lu B protm=%lu B "
         "shader_mask=0x%016llx max_cores=%lu csg_as=%u csg_ack=0x%08x",
-        (ULONGLONG)WINMALI_CSF_RING_GPU_VA,
+        (ULONGLONG)WINMALI_CSF_BRINGUP_RING_GPU_VA,
         (ULONG)(WINMALI_CSF_RING_BYTES / 1024u),
         (ULONGLONG)Fw->McuQueueIfaceVa,
-        (ULONGLONG)WINMALI_CSF_SYNC_GPU_VA,
-        (ULONGLONG)WINMALI_CSF_SHADER_GPU_VA,
+        (ULONGLONG)WINMALI_CSF_BRINGUP_SYNC_GPU_VA,
+        (ULONGLONG)WINMALI_CSF_BRINGUP_SHADER_GPU_VA,
         (ULONG)Fw->SuspendBytes,
         (ULONG)Fw->ProtmBytes,
         (ULONGLONG)shaderMask,
@@ -1596,7 +1757,8 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
     return STATUS_SUCCESS;
 
 err_shader_unmap:
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_SHADER_GPU_VA, 1u);
+    WinMaliCsfFreeReservedPt_(Adapter);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_SHADER_GPU_VA, 1u);
 err_shader:
     if (Fw->HostShaderVa != NULL) {
         MmFreeContiguousMemory(Fw->HostShaderVa);
@@ -1613,7 +1775,7 @@ err_free_susp:
         Fw->HostSuspendVa = NULL;
     }
 err_sync_unmap:
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_SYNC_GPU_VA, 1u);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_SYNC_GPU_VA, 1u);
 err_sync:
     if (Fw->HostSyncVa != NULL) {
         MmFreeContiguousMemory(Fw->HostSyncVa);
@@ -1627,7 +1789,7 @@ err_qif_unmap:
         Fw->QRingOut         = NULL;
     }
 err_ring_unmap:
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_RING_GPU_VA, WINMALI_CSF_RING_BYTES / 4096u);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_RING_GPU_VA, WINMALI_CSF_RING_BYTES / 4096u);
 err_ring:
     if (Fw->HostRingVa != NULL) {
         MmFreeContiguousMemory(Fw->HostRingVa);
@@ -1642,9 +1804,10 @@ WinMaliCsfTeardown_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw)
     if (Fw == NULL || Adapter == NULL) {
         return;
     }
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_RING_GPU_VA, WINMALI_CSF_RING_BYTES / 4096u);
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_SYNC_GPU_VA, 1u);
-    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_SHADER_GPU_VA, 1u);
+    WinMaliCsfFreeReservedPt_(Adapter);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_RING_GPU_VA, WINMALI_CSF_RING_BYTES / 4096u);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_SYNC_GPU_VA, 1u);
+    (VOID)WinMaliMmuUnmapGpuRange(Adapter, WINMALI_CSF_BRINGUP_SHADER_GPU_VA, 1u);
     Fw->CsfBootValid = FALSE;
     if (Fw->HostRingVa != NULL) {
         MmFreeContiguousMemory(Fw->HostRingVa);
@@ -1871,8 +2034,8 @@ WinMaliCsfSubmitStreamCall_(
 {
     UINT64             addrReg;
     UINT64             valReg;
-    UINT64             syncGpuVa  = WINMALI_CSF_SYNC_GPU_VA;
-    UINT64             tagGpuVa   = WINMALI_CSF_SYNC_GPU_VA + WINMALI_CSF_TAG_OFFSET;
+    UINT64             syncGpuVa;
+    UINT64             tagGpuVa;
     UINT64             jobSeq;
     ULONG              ringMask;
     UINT64             ringInsert;
@@ -1899,6 +2062,10 @@ WinMaliCsfSubmitStreamCall_(
         WINMALI_WARN("CSF submit: CSG AS rebind to %u failed 0x%08x", CsgAsSlot, status);
         return status;
     }
+    syncGpuVa = (CsgAsSlot == Adapter->GpuMmuBringupAs)
+        ? WINMALI_CSF_BRINGUP_SYNC_GPU_VA
+        : WINMALI_CSF_PROCESS_SYNC_GPU_VA;
+    tagGpuVa = syncGpuVa + WINMALI_CSF_TAG_OFFSET;
 
     addrReg = (UINT64)Fw->CsRegCount - (UINT64)Fw->CsUnpreservedRegCount;
     valReg  = addrReg + 2ull;
@@ -2192,7 +2359,7 @@ WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG TimeoutMs)
         st = WinMaliCsfSubmitStreamCall_(
             Adapter,
             fw,
-            WINMALI_CSF_SHADER_GPU_VA,
+            WINMALI_CSF_BRINGUP_SHADER_GPU_VA,
             (ULONG)sizeof(WinMaliShaderNop),
             0u,
             Adapter->GpuMmuBringupAs,   /* NOP self-test runs in the bring-up AS */
@@ -2287,11 +2454,9 @@ WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter)
 }
 
 /*
- * Cross-map the bring-up CSF ring, sync page and NOP-shader page into a UMD
- * group's VM at the same fixed low GPU VAs the CSG expects (RING/SYNC/SHADER
- * _GPU_VA). Those VAs (0x41x000) are far below the UMD user VA window
- * (0x10000000+) and the very-high UMD scratch (0xfffff...), so they never
- * collide. Called from WinMaliVmCreate after the VM's page tables exist.
+ * Cross-map the CSF ring, sync page and NOP-shader page into an escape-owned
+ * UMD VM at the fixed high KMD-reserved VAs used by dxgk process VMs. Called
+ * from WinMaliVmCreate after the VM's page tables exist.
  * Best-effort: returns DEVICE_NOT_READY if CSF isn't booted yet; the submit
  * path then falls back to the NOP self-test.
  */
@@ -2321,7 +2486,7 @@ WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ struct _WINMALI_VM
     for (i = 0; i < ringPages; ++i) {
         ringPfns[i] = (PFN_NUMBER)(ringPfn0 + i);
     }
-    status = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_RING_GPU_VA,
+    status = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_PROCESS_RING_GPU_VA,
                              ringPfns, ringPages,
                              WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
     if (!NT_SUCCESS(status)) {
@@ -2330,7 +2495,7 @@ WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ struct _WINMALI_VM
     }
 
     syncPfn = (PFN_NUMBER)(fw->SyncPa.QuadPart >> PAGE_SHIFT);
-    status  = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_SYNC_GPU_VA,
+    status  = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_PROCESS_SYNC_GPU_VA,
                               &syncPfn, 1u, WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
     if (!NT_SUCCESS(status)) {
         WINMALI_WARN("CsfMapIntoVm: sync map failed 0x%08x", status);
@@ -2338,7 +2503,7 @@ WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ struct _WINMALI_VM
     }
 
     shaderPfn = (PFN_NUMBER)(fw->ShaderPa.QuadPart >> PAGE_SHIFT);
-    status    = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_SHADER_GPU_VA,
+    status    = WinMaliMmuVmMap(Adapter, VmPt, WINMALI_CSF_PROCESS_SHADER_GPU_VA,
                                 &shaderPfn, 1u, WINMALI_LPAE_L3_PAGE_ATTR_RW_EX);
     if (!NT_SUCCESS(status)) {
         WINMALI_WARN("CsfMapIntoVm: shader map failed 0x%08x", status);
@@ -2346,9 +2511,9 @@ WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ struct _WINMALI_VM
     }
 
     WINMALI_TRACE("CsfMapIntoVm: AS%u ring/sync/shader mapped at 0x%llx/0x%llx/0x%llx",
-                  VmPt->AsSlot, (ULONGLONG)WINMALI_CSF_RING_GPU_VA,
-                  (ULONGLONG)WINMALI_CSF_SYNC_GPU_VA,
-                  (ULONGLONG)WINMALI_CSF_SHADER_GPU_VA);
+                  VmPt->AsSlot, (ULONGLONG)WINMALI_CSF_PROCESS_RING_GPU_VA,
+                  (ULONGLONG)WINMALI_CSF_PROCESS_SYNC_GPU_VA,
+                  (ULONGLONG)WINMALI_CSF_PROCESS_SHADER_GPU_VA);
     return STATUS_SUCCESS;
 }
 

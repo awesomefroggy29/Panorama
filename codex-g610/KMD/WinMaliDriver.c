@@ -135,6 +135,7 @@ WinMaliKmdAddDevice(
     WinMaliSyncObjTableInit(&adapter->SyncObjTable);
     WinMaliVmTableInit(&adapter->VmTable);
     WinMaliGroupTableInit(&adapter->GroupTable);
+    WinMaliTilerHeapTableInit(adapter);
 
     g_WinMaliAdapter       = adapter;
     *MiniportDeviceContext = adapter;
@@ -308,6 +309,7 @@ WinMaliKmdRemoveDevice(_In_ CONST PVOID MiniportDeviceContext)
        matters: Groups reference VMs (CSG slots may still be claimed); VMs
        own LPAE PT pages whose teardown also releases AS slots. BOs and
        SyncObjs are independent. */
+    WinMaliTilerHeapTableTeardown(adapter);
     WinMaliGroupTableTeardown(adapter, &adapter->GroupTable);
     WinMaliVmTableTeardown(adapter, &adapter->VmTable);
     WinMaliBoTableTeardown(adapter, &adapter->BoTable);

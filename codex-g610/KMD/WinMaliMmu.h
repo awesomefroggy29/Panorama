@@ -52,6 +52,39 @@ typedef struct _WINMALI_ADAPTER WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 #define WINMALI_MMU_BRINGUP_AS      1u
 #define WINMALI_MMU_MCU_AS          0u
 
+/*
+ * KMD-private CSF GPU virtual-address reservation.
+ *
+ * DxgkCbReserveGpuVirtualAddressRange reserves address space in units of
+ * one leaf-page-table coverage.  With 512 4-KiB PTEs that unit is 2 MiB.
+ * Driver reservations cannot live below root-table entry 1; in our 48-bit,
+ * four-level layout each root entry covers 512 GiB, so use the beginning of
+ * root entry 1.  The same fixed base is requested for every process.
+ *
+ * The low 0x41xxxx/0x42xxxx addresses remain private to the bring-up AS1.
+ * Render/escape VMs use the reserved addresses below.
+ */
+#define WINMALI_CSF_RESERVED_GPU_VA_BASE   (0x0000008000000000ull)
+/* Reserve one complete hardware L2-entry coverage (1 GiB) per WDDM process.
+   The first 2 MiB holds the shared CSF ring/shader/sync mappings; the rest is
+   process-private KMD GPUVA used for tiler-heap context/chunk pages.  Keeping
+   the whole range below base+1GiB means one process-owned L2->L1 subtree can
+   represent it without touching any VidMm-owned root entry other than the one
+   explicitly reserved through DxgkCbReserveGpuVirtualAddressRange. */
+#define WINMALI_CSF_RESERVED_GPU_VA_BYTES  (0x0000000040000000ull)
+#define WINMALI_CSF_SHARED_GPU_VA_BYTES    (0x0000000000200000ull)
+#define WINMALI_PROCESS_GPU_VA_BASE        \
+    (WINMALI_CSF_RESERVED_GPU_VA_BASE + WINMALI_CSF_SHARED_GPU_VA_BYTES)
+#define WINMALI_CSF_RING_GPU_VA_OFFSET     (0x0000000000010000ull)
+#define WINMALI_CSF_SHADER_GPU_VA_OFFSET   (0x0000000000020000ull)
+#define WINMALI_CSF_SYNC_GPU_VA_OFFSET     (0x0000000000021000ull)
+#define WINMALI_CSF_PROCESS_RING_GPU_VA    \
+    (WINMALI_CSF_RESERVED_GPU_VA_BASE + WINMALI_CSF_RING_GPU_VA_OFFSET)
+#define WINMALI_CSF_PROCESS_SHADER_GPU_VA  \
+    (WINMALI_CSF_RESERVED_GPU_VA_BASE + WINMALI_CSF_SHADER_GPU_VA_OFFSET)
+#define WINMALI_CSF_PROCESS_SYNC_GPU_VA    \
+    (WINMALI_CSF_RESERVED_GPU_VA_BASE + WINMALI_CSF_SYNC_GPU_VA_OFFSET)
+
 //
 // ARM-LPAE stage-1 L3 page descriptor (Mali MMU AArch64 mode).
 //
