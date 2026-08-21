@@ -441,6 +441,7 @@ extern LONG  g_WinMaliStatUvSrcPages;
 extern LONG  g_WinMaliStatUvSrcNCand;
 extern LONG  g_WinMaliUvCandBo[4];
 extern LONG  g_WinMaliUvCandPid[4];
+extern LONG  g_WinMaliUvCandBox[4];
 /* Hits = TRANSITIONS between adjacent samples (structure), NOT non-black count.
    The old non-black metric saturates - a blank white buffer scores maximum - and
    that is what put a solid white screen on the panel. NonBlack is kept only so
@@ -455,6 +456,20 @@ extern LONG  g_WinMaliUvCandChg[4];
 extern LONG  g_WinMaliUvCandScans[4];
 extern LONG  g_WinMaliStatUvSrcChg;
 extern LONG  g_WinMaliStatUvSrcEvict;
+extern LONG  g_WinMaliStatUvRevokeBig;
+extern LONG  g_WinMaliTrapRevokeBig;
+extern LONG  g_WinMaliStatBoDedup;
+extern LONG  g_WinMaliStatUvPubBig;
+extern LONG  g_WinMaliStatBoDeref;
+extern ULONG g_WinMaliUvBoDedup;
+extern ULONG g_WinMaliQaiDirectFlip;
+extern ULONG g_WinMaliQaiMaxQueuedFlip;
+extern PUCHAR g_WinMaliRevokeSnap;
+extern ULONG  g_WinMaliRevokeSnapLen;
+extern LONG  g_WinMaliStatUvRevokeAny;
+extern LONG  g_WinMaliStatUvSrcEvictBig;
+extern LONG  g_WinMaliStatUvSrcEvictBusy;
+extern LONG  g_WinMaliStatUvSrcDropSmall;
 extern LONG  g_WinMaliStatSubmitNoGroup;
 extern LONG  g_WinMaliStatSubmitFatalGroup;
 extern LONG  g_WinMaliStatCsfLastStatus;
@@ -474,6 +489,12 @@ extern LONG  g_WinMaliStatSyncWaitTimeout;
 /* SIGNAL-phase sync failures: the CS ran to completion, then signalling failed.
    Distinct from StatSubmitSyncFail (a rejected WAIT) - different bug, own counter. */
 extern LONG  g_WinMaliStatSubmitSignalFail;
+extern LONG  g_WinMaliTrapSignalFail;
+extern LONG  g_WinMaliTrapFirstTmo;
+extern LONG  g_WinMaliStatTilerOomCount;
+extern LONG  g_WinMaliStatTilerOomFail;
+extern LONG  g_WinMaliStatSyncTableInits;
+extern LONG  g_WinMaliStatSyncTableTeardowns;
 extern LONG  g_WinMaliStatSignalErr;
 extern LONG  g_WinMaliStatSignalBadHandle;
 extern LONG  g_WinMaliStatCsTimeoutCount;
@@ -507,6 +528,7 @@ extern LONG  g_WinMaliStatUvRevokeTimeout; /* Revoke gave up waiting - must be 0
 extern LONG  g_WinMaliStatPowerStop;  /* SetPowerState stopped the present worker */
 extern LONG  g_WinMaliStatUvSrcQual;
 extern LONG  g_WinMaliStatUvSrcMaxCov;
+extern LONG  g_WinMaliStatUvSrcMaxChg;   /* best change-count of ANY candidate: pairs with StatUvSrcChg to split "chose wrong" from "nothing is being written" */
 extern LONG  g_WinMaliStatUvSrcCoverage; /* adopted source painted extent, %% */
 
 /* DRIVERCAPS VISIBILITY - see the long comment in WinMaliQai.c. These answer
@@ -607,6 +629,9 @@ extern ULONG g_WinMaliPresentMarker;
 extern ULONG g_WinMaliTraceSubmit;
 extern ULONG g_WinMaliPresentTimerHz;
 extern ULONG g_WinMaliFailOnGpuFault;
+extern ULONG g_WinMaliTilerOomCtxSplice;
+extern ULONG g_WinMaliPresentSettleMs;
+extern ULONG g_WinMaliQaiFlipCaps;
 /* UvSrcInvalidate (default 1): invalidate the scanout source before reading it.
    Correct while the GPU is the last writer (it writes non-coherently). ⚠ WRONG
    once delivery into that surface is a CPU copy - an invalidate can DISCARD the
@@ -680,6 +705,14 @@ NTSTATUS WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Tim
 /* Real UMD command-stream submission: bind the CSG to the group's VM AS
    (GroupAsSlot) and execute the UMD's CS stream at StreamGpuVa. On failure
    the caller should fall back to WinMaliCsfSubmitNopJob. */
+/* Grow the tiler heap of the VM bound to AsSlot by one chunk, to service a
+   firmware TILER_OOM request. Defined in WinMaliEscape.c beside the heap
+   creator (it reuses that file's static chunk allocator). */
+NTSTATUS WinMaliTilerHeapGrow(_Inout_ PWINMALI_ADAPTER Adapter,
+                              _In_    ULONG            AsSlot,
+                              _Out_   UINT64*          OutChunkVa,
+                              _Out_   ULONG*           OutChunkSize);
+
 NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
                                      _In_ UINT64  StreamGpuVa,

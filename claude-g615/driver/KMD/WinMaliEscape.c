@@ -1262,9 +1262,190 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
         vm->KmdVaNext = va + chunkSize;
     }
 
+    /* ★ RECORD THE HEAP SO IT CAN BE GROWN LATER.
+       Without this the heap was write-once: created with `count` chunks and no
+       way to extend it, so the first TILER_OOM parked the CS forever. See
+       WinMaliTilerHeapGrow below and WinMaliCsfServiceTilerOom_ in WinMaliFw.c. */
+    vm->HeapCtxVa         = ctxVa;
+    vm->HeapCtxHandle     = ctxHandle;
+    vm->HeapFirstChunkVa  = firstChunkVa;
+    vm->HeapChunkSize     = chunkSize;
+    vm->HeapChunkCount    = count;
+    vm->HeapOwnerDevice   = ownerDevice;
+    /* Bound total growth. panthor caps heaps too; an unbounded grow on a
+       runaway tiler would eat all of system memory instead of wedging one
+       context. 128 chunks at the usual 2 MB is 256 MB, far past anything the
+       desktop needs, and the cap failing is still strictly better than today's
+       permanent wedge (we ack with a NULL chunk and the CS faults cleanly). */
+    vm->HeapMaxChunks     = 128u;
+
     WinMaliVmPut(vm);
     *outCtxVa = ctxVa;
     *outFirstChunkVa = firstChunkVa;
+    return STATUS_SUCCESS;
+}
+
+/* Point the tiler heap CONTEXT at a new head chunk.
+ *
+ * ⛔★★★★★ THIS IS THE PIECE THAT MAKES A GROWN CHUNK REACHABLE.
+ *
+ * The command stream does `cs_heap_set(ctx_va)` (pan_csf.c:487-490) so the
+ * FIRMWARE walks the 32-byte heap context descriptor - NOT any driver-side
+ * bookkeeping - to find chunks. Growing the heap by allocating a chunk and
+ * linking it new->old updates only the new chunk's own header; nothing points
+ * AT the new chunk, so it is orphaned and the FW is no better off.
+ *
+ * MEASURED 1.1.9.15: 38 TILER_OOM requests, 38 chunks allocated and mapped
+ * successfully (OOMfail=0), our ack landing every time (the FW toggles its ACK
+ * bit and we match it) - and CsOk still frozen, with the FW re-asking once per
+ * retry forever. That is precisely what handing over an unreachable chunk looks
+ * like.
+ *
+ * Chunk pointers use panthor's packed encoding, the same one
+ * WinMaliTilerHeapCreateReal_ stamps into each chunk header:
+ *     (va & ~0xFFF) | (chunk_size >> 12)
+ * and the context's first field is that pointer. */
+static NTSTATUS
+WinMaliHeapCtxSetFirstChunk_(_Inout_ PWINMALI_ADAPTER adapter,
+                             _In_    ULONG            ctxHandle,
+                             _In_    UINT64           encodedChunk,
+                             _Out_opt_ UINT64*        outPrevEncoded)
+{
+    PWINMALI_BO bo;
+    PVOID       kva;
+
+    if (ctxHandle == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    bo = WinMaliBoGet(adapter, ctxHandle);
+    if (bo == NULL || bo->Mdl == NULL) {
+        if (bo != NULL) { WinMaliBoPut(bo); }
+        return STATUS_NOT_FOUND;
+    }
+    kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                       NULL, FALSE, NormalPagePriority);
+    if (kva == NULL) {
+        WinMaliBoPut(bo);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    /* ⛔★★★★★ READ THE FW'S CURRENT HEAD, DO NOT TRUST OUR BOOKKEEPING.
+       The FIRMWARE pops chunks off this free list and rewrites the head itself
+       (pan_csf.c:1256 "Gather freed heap chunks and add them to the heap context
+       free list"). vm->HeapFirstChunkVa is therefore STALE the moment the FW
+       consumes one, and linking new->stale CORRUPTS the list - which is what
+       1.1.9.17 did: 38 chunks handed over, every one acked, stream never resumed.
+       Read-modify-write the real head instead. */
+    if (outPrevEncoded != NULL) {
+        *outPrevEncoded = *(volatile UINT64 UNALIGNED*)kva;
+    }
+    *(volatile UINT64 UNALIGNED*)kva = encodedChunk;
+    KeMemoryBarrier();
+    MmUnmapLockedPages(kva, bo->Mdl);
+    WinMaliBoPut(bo);
+    return STATUS_SUCCESS;
+}
+
+/* Service a firmware TILER_OOM: allocate ONE more chunk for the tiler heap of
+   the VM bound to `asSlot`, link it at the HEAD of the newest->oldest chunk
+   list exactly as WinMaliTilerHeapCreateReal_ builds it, and hand the caller
+   its GPU VA and size.
+
+   ★ WHY THIS EXISTS (measured 2026-08-20). The FW parks the command stream and
+   raises CS_ACK bit 26 when the tiler heap runs out of chunks, and resumes only
+   once the host links in a chunk and toggles CS_REQ bit 26 to match. The driver
+   had TilerHeapCreate and TilerHeapDestroy but NO grow path, and
+   WINMALI_CS_REQ_MASK masked bit 26 out of every REQ write, so the request could
+   be neither satisfied nor acknowledged. First exhaustion = permanent wedge:
+   CsAck=0x04000011 vs CsReq=0x00000511, CsOk frozen, CsTimeouts climbing, and
+   every fault bank reading zero because TILER_OOM is a REQUEST, not a fault.
+   panthor's equivalent is panthor_heap_grow().
+
+   Returns STATUS_INSUFFICIENT_RESOURCES at the cap or on allocation failure.
+   ⚠ The caller must ACKNOWLEDGE the request either way (with a zero chunk on
+   failure) - an unacknowledged TILER_OOM parks the CS forever, which is strictly
+   worse than letting it fault. */
+NTSTATUS
+WinMaliTilerHeapGrow(_Inout_ PWINMALI_ADAPTER adapter,
+                     _In_    ULONG            asSlot,
+                     _Out_   UINT64*          outChunkVa,
+                     _Out_   ULONG*           outChunkSize)
+{
+    PWINMALI_VM vm;
+    NTSTATUS    st;
+    ULONG       chunkHandle = 0;
+    UINT64      va;
+    UINT64      nextVal;
+
+    *outChunkVa   = 0;
+    *outChunkSize = 0;
+
+    vm = WinMaliVmGetByAsSlot(adapter, asSlot);
+    if (vm == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+    if (!vm->PtInitialized || vm->HeapChunkSize == 0) {
+        WinMaliVmPut(vm);
+        return STATUS_NOT_FOUND;            /* no tiler heap on this VM */
+    }
+    if (vm->HeapChunkCount >= vm->HeapMaxChunks) {
+        WINMALI_WARN("TilerHeapGrow: vm=%u at chunk cap %u - refusing to grow",
+                     vm->Id, vm->HeapMaxChunks);
+        WinMaliVmPut(vm);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    va = vm->KmdVaNext;
+    /* Header left ZERO here on purpose - the real 'next' is the head we are about
+       to read out of the context, which only the swap below can tell us. */
+    UNREFERENCED_PARAMETER(nextVal);
+    st = WinMaliHeapAllocMapped_(adapter, vm, vm->HeapOwnerDevice,
+                                 vm->HeapChunkSize, va, FALSE, 0ull,
+                                 &chunkHandle);
+    if (!NT_SUCCESS(st)) {
+        WINMALI_WARN("TilerHeapGrow: vm=%u chunk alloc failed 0x%08x", vm->Id, st);
+        WinMaliVmPut(vm);
+        return st;
+    }
+
+    vm->KmdVaNext        = va + vm->HeapChunkSize;
+    vm->HeapFirstChunkVa = va;
+    vm->HeapChunkCount  += 1;
+
+
+    /* ★ MAKE THE CHUNK REACHABLE. Linking new->old only fills in the NEW chunk's
+       own header; nothing points AT it until the heap context's head pointer is
+       updated, and the context is what `cs_heap_set` hands the firmware. Skipping
+       this is why 1.1.9.15 allocated 38 chunks that the FW could not use. */
+    if (g_WinMaliTilerOomCtxSplice != 0) {
+        /* ⚠ OFF BY DEFAULT. panthor and kbase hand the grown chunk to the FW ONLY via
+           CS_TILER_HEAP_START/END; they do NOT touch the heap context on grow.
+           Splicing here as well puts the same chunk in two places, which can corrupt
+           the free list the FW is walking. Knob so both behaviours are testable
+           without a rebuild (ParametersTilerOomCtxSplice=1 restores 1.1.9.18). */
+        UINT64   encoded = (va & ~0xFFFull) | ((UINT64)vm->HeapChunkSize >> 12);
+        UINT64   prevEncoded = 0;
+        NTSTATUS cst = WinMaliHeapCtxSetFirstChunk_(adapter, vm->HeapCtxHandle,
+                                                    encoded, &prevEncoded);
+        if (!NT_SUCCESS(cst)) {
+            WINMALI_WARN("TilerHeapGrow: vm=%u ctx head update FAILED 0x%08x - the "
+                         "new chunk is UNREACHABLE by the FW", vm->Id, cst);
+        } else {
+            /* Link the new chunk to whatever the FIRMWARE had as head. Same helper:
+               both the context and a chunk header hold the packed pointer at
+               offset 0. Doing it after the swap is safe because the FW is parked
+               waiting for the acknowledgement we have not sent yet. */
+            (VOID)WinMaliHeapCtxSetFirstChunk_(adapter, chunkHandle, prevEncoded, NULL);
+            WINMALI_TRACE("TilerHeapGrow: ctx head 0x%llx -> 0x%llx (new chunk 0x%llx, "
+                          "prev head kept as its next)",
+                          (ULONGLONG)prevEncoded, (ULONGLONG)encoded, (ULONGLONG)va);
+        }
+    }
+    *outChunkVa   = va;
+    *outChunkSize = vm->HeapChunkSize;
+    WINMALI_TRACE("TilerHeapGrow: vm=%u as=%u new chunk va=0x%llx size=%u count=%u/%u",
+                  vm->Id, asSlot, (ULONGLONG)va, vm->HeapChunkSize,
+                  vm->HeapChunkCount, vm->HeapMaxChunks);
+    WinMaliVmPut(vm);
     return STATUS_SUCCESS;
 }
 
@@ -1461,6 +1642,23 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                  * it. Count it, and name the handle. */
                 (VOID)InterlockedIncrement(&g_WinMaliStatSubmitSignalFail);
                 (VOID)InterlockedExchange(&g_WinMaliStatSignalErr, (LONG)e);
+                /* ⛔★★★★★ ARM THE RING SNAPSHOT ON THE **FIRST** FAILURE.
+                 *
+                 * Every attempt to capture this burst from a timer-published
+                 * tail came back empty - and NOT because the code never ran.
+                 * The 79 failures all land ~57 s after boot, WinRM only becomes
+                 * reachable ~70 s in, and the traffic in between scrolls even a
+                 * 192 KB slice. Enlarging the buffer is a dead end: the ring
+                 * itself is only 256 KB (WINMALI_RING_BYTES 0x40000).
+                 *
+                 * So TRIGGER instead of POLL: latch 0 -> 1 here, and let the
+                 * present worker snapshot the ring into its own registry value
+                 * on the next tick (~2 s) and latch to 2, so the first failure's
+                 * context is preserved and never overwritten by later traffic.
+                 * WMSIGENOENT1 (WinMaliSync.c) prints the missing handle, the
+                 * live table count and the calling pid - this is what finally
+                 * delivers it. */
+                (VOID)InterlockedCompareExchange(&g_WinMaliTrapSignalFail, 1, 0);
                 if (qs->SyncsCount > 0) {
                     ULONG k;
                     /* Report the first SIGNAL-direction handle, not syncs[0] -

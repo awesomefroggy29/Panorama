@@ -226,6 +226,53 @@ WinMaliKmdQueryAdapterInfo(
             if (g_WinMaliComputeOnly == 0) {
                 caps->FlipCaps.FlipOnVSyncMmIo = 1;
 
+                /* ⛔★★★★★ THE OS IS PRESENTING TO US IN THE **BLT** MODEL.
+                 *
+                 * MEASURED: StatPresentLastFlags = 1 -> DXGK_PRESENTFLAGS bit0 =
+                 * Blt (d3dkmddi.h:173); StatPresentFlips = 0. Not one flip in a
+                 * whole boot. That single fact explains the entire cluster: no
+                 * flip chain, exactly ONE panel-sized back buffer alive
+                 * (PubBig 5 - RevokeBig 4 = 1 = NCand), RotateResourceIdentities
+                 * called ZERO times, LiveFlipLatch stuck at 2 (the mode-set).
+                 *
+                 * Two ADAPTER-level caps that could steer dxgk toward the flip
+                 * model are never set anywhere in this tree (verified: zero grep
+                 * hits) and ship as 0 from the initial RtlZeroMemory:
+                 *     DXGK_DRIVERCAPS.SupportDirectFlip      (d3dkmddi.h:2441)
+                 *     DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync   (d3dkmddi.h:2426)
+                 *
+                 * ⚠ THE OLD "DirectFlip IS REFUTED" NOTE IS A MISATTRIBUTION: that
+                 * experiment set DXGK_SEGMENTFLAGS.DirectFlip (a per-segment
+                 * permission bit, already ON below). Different field, same name.
+                 * The adapter-level cap has never been tried.
+                 *
+                 * ⚠ THIS IS A REAL PROMISE AND WE MAY NOT BE ABLE TO KEEP IT. Our
+                 * "flip" is a worker-thread RtlCopyMemory into the firmware
+                 * framebuffer with NO vsync synchronisation. Claiming a capability
+                 * we cannot honour has already made things strictly worse once
+                 * (FL11_0: every client stopped creating devices). So BOTH default
+                 * to OFF - identical to today - and are knob-driven so a bad trial
+                 * costs one reboot, not a rebuild:
+                 *     Parameters\QaiDirectFlip   = 1  -> claim SupportDirectFlip
+                 *     Parameters\QaiMaxQueuedFlip= N  -> claim MaxQueuedFlipOnVSync
+                 * ORACLE: StatPresentFlips > 0, or StatPresentLastFlags bit2
+                 * (Flip, 0x4). If those stay 0/1 the cap is not what chooses the
+                 * model, and this must be reverted rather than left claimed. */
+                /* ⛔⛔ REVERTED - THESE TWO WRITES BROKE DRIVER ENTRY.
+                 * Setting SupportDirectFlip / MaxQueuedFlipOnVSync here produced
+                 * DEVICE PROBLEM 37 (CM_PROB_FAILED_DRIVER_ENTRY) and it did NOT
+                 * clear when the knobs were set back to 0 - the fault is the
+                 * WRITES, not the values.
+                 *
+                 * Cause is the hazard this file's own header comment already
+                 * records: FIELD_OFFSET computed from OUR DXGK_DRIVERCAPS does
+                 * not necessarily address the same field in the OS's struct, so
+                 * these landed somewhere else and StartAdapter failed. The
+                 * existing FlipCaps/PresentationCaps writes are safe only because
+                 * they were validated against a live dxgk.
+                 * ★ A FIELD_OFFSET GUARD PROVES THE WRITE IS IN BOUNDS, NOT THAT
+                 *   IT IS THE RIGHT FIELD. */
+
                 /* ★★★★★ THE FLIP LogonUI ASKS FOR IS **IMMEDIATE**, AND WE HAVE
                  * NEVER CLAIMED WE COULD DO ONE.
                  *
@@ -266,6 +313,14 @@ WinMaliKmdQueryAdapterInfo(
             /* Publish what we ACTUALLY sent, plus the offset we wrote it at.
                dxgk reported reading 0x8 from a field this code sets to 0, and
                that discrepancy is not something to resolve by reasoning. */
+            /* ★ KNOB OVERRIDE, applied LAST so it wins over every bit set above.
+               Parameters\QaiFlipCaps = 0 leaves the compiled behaviour untouched.
+               See the comment on g_WinMaliQaiFlipCaps in WinMaliDriver.c: the
+               measured refusal is a RedirectedFlip (Flags=0x8000) and bit 4
+               FlipIndependent is exactly "MMIO flip to redirected surfaces". */
+            if (g_WinMaliQaiFlipCaps != 0) {
+                caps->FlipCaps.Value = g_WinMaliQaiFlipCaps;
+            }
             g_WinMaliQaiFlipCapsValue = (ULONG)caps->FlipCaps.Value;
             g_WinMaliQaiFlipCapsOff   = (ULONG)FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps);
             g_WinMaliQaiOutSize       = (ULONG)pQueryAdapterInfo->OutputDataSize;

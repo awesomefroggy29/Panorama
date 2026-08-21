@@ -377,6 +377,15 @@ WinMaliBoCreateFromPfns(_Inout_ PWINMALI_ADAPTER Adapter,
    "DWM stopped composing". */
 #define WINMALI_UVSRC_SLOTS 64
 
+/* A candidate must reach at least this much vertical coverage to be considered
+   "the whole screen". MEASURED 2026-08-18: ranking on liveness alone followed a
+   5%-covered partial render from another process (icons on black, animating),
+   while ranking on coverage alone froze on a 94%-covered DEAD buffer. Neither
+   signal alone identifies the composed desktop; this gate supplies the missing
+   half. 50% is deliberately loose - the real desktop measures ~94% - so a frame
+   still mid-composition is not disqualified. */
+#define WINMALI_UVSRC_MIN_COVERAGE 50u
+
 typedef struct _WINMALI_UVSRC_ENT {
     ULONG  Handle;      /* 0 = empty slot */
     PMDL   Mdl;         /* the BO's ProbeMdl - valid while Handle is live */
@@ -457,6 +466,101 @@ WinMaliUvSrcInit_(VOID)
     }
 }
 
+/* âââââ PUBLISH THE PICTURE, NOT ANOTHER SCORE.
+ *
+ * Five builds were justified by winner-only counters that structurally could not
+ * separate "we chose wrong" from "nothing good is on offer". The field is now
+ * published as numbers (StatUvC*), and this adds the one thing numbers cannot
+ * carry: an actual decimated image of ONE candidate per capture, rotating, so the
+ * live-but-near-black surface dwm is writing can be LOOKED AT instead of
+ * theorised about. 184x115x3 = 63,480 B, once every 64 selection ticks. */
+#define WINMALI_REVOKE_SNAP_BYTES (192u * 1024u)
+PUCHAR g_WinMaliRevokeSnap    = NULL;
+ULONG  g_WinMaliRevokeSnapLen = 0;
+
+#define WINMALI_CT_W 184u
+#define WINMALI_CT_H 115u
+static PUCHAR g_WinMaliCandThumb        = NULL;
+static LONG   g_WinMaliCandThumbBo      = 0;
+static LONG   g_WinMaliCandThumbPid     = 0;
+static LONG   g_WinMaliCandThumbPending = 0;
+
+/* ⛔★ PUBLISH FROM **BOTH** UNLOCK SITES.
+ *
+ * The first version published only from WinMaliUvSrcRelease, which the present
+ * worker calls only when a winner exists. On a boot where nothing qualifies -
+ * exactly the boot you most want a picture of - AcquireBest unlocks itself and
+ * returns NULL, Release is never called, and the image is never written. The
+ * instrument sat behind the very condition it was built to explain.
+ * Callers must NOT hold the mutex: WinMaliUvSrcPublish takes it from the 0x93
+ * escape path, and a 62 KB registry write under it would block dwm's escape. */
+/* ⛔★★★★★ PUBLISH THE GATE'S DECISION FOR **EVERY** SLOT, NOT JUST THE WINNERS.
+ *
+ * MEASURED (UMD 1.1.5.3): dwm creates TWO 2944x1840 render targets - its
+ * composition flip chain - each a real locked kernel allocation. The KMD at the
+ * same moment reports StatUvSrcNCand = **1**. So one of dwm's two back buffers
+ * never becomes a candidate, and we therefore scan out a real dwm frame that is
+ * simply not the current one.
+ *
+ * Why the second is missing cannot be answered by the counters we have:
+ * StatUvSrcTooSmall is a GLOBAL total, so it cannot say WHICH slot was rejected
+ * or what it was measured against. Publish the raw inputs to the gate per slot -
+ * handle, pid, size, pitch, and the byte count actually required - so the
+ * decision is reconstructable instead of inferred.
+ * ★ A GLOBAL REJECT COUNTER CANNOT NAME THE THING IT REJECTED. */
+/* ⛔★ COVER THE WHOLE TABLE, NOT A WINDOW OVER IT.
+   WINMALI_UVSRC_SLOTS is 64. At 16 this blob showed the first 16 SLOT INDICES,
+   and I read "16 slots, exactly one panel-sized" as proof that dwm's second
+   flip buffer is never registered. It proves nothing of the sort if the second
+   one lives at index >= 16. Same shape as reading a throttle as a count. */
+#define WINMALI_SLOTREC_MAX 64u
+typedef struct _WINMALI_SLOTREC {
+    ULONG Handle;
+    ULONG Pid;
+    ULONG Pages;      /* Size >> PAGE_SHIFT */
+    ULONG Pitch;
+    ULONG NeedPages;  /* Height * pitch, in pages - what the gate demanded */
+    ULONG Rej;        /* 0=qualified 1=too small 2=map failed 3=uniform */
+} WINMALI_SLOTREC;
+static WINMALI_SLOTREC g_WinMaliSlotRec[WINMALI_SLOTREC_MAX];
+static ULONG           g_WinMaliSlotRecN = 0;
+static LONG            g_WinMaliSlotRecPending = 0;
+
+static VOID
+WinMaliSlotRecPublish_(VOID)
+{
+    if (InterlockedExchange(&g_WinMaliSlotRecPending, 0) == 0) { return; }
+    (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"UvSlots",
+            g_WinMaliSlotRec,
+            (ULONG)(g_WinMaliSlotRecN * sizeof(WINMALI_SLOTREC)));
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"UvSlotsN",
+            g_WinMaliSlotRecN);
+}
+
+static VOID
+WinMaliCandThumbPublish_(VOID)
+{
+    if (InterlockedExchange(&g_WinMaliCandThumbPending, 0) == 0 ||
+        g_WinMaliCandThumb == NULL) {
+        return;
+    }
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"CandThumbBo",
+            (ULONG)g_WinMaliCandThumbBo);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"CandThumbPid",
+            (ULONG)g_WinMaliCandThumbPid);
+    {
+        NTSTATUS st = WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"CandThumb",
+                g_WinMaliCandThumb, WINMALI_CT_W * WINMALI_CT_H * 3u);
+        /* ★ A WRITE THAT CAN FAIL MUST PUBLISH ITS STATUS. CandThumbBo landed
+           while CandThumb did not, and with no status there was no way to tell a
+           refused write from a capture that never ran. */
+        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"CandThumbSt",
+                (ULONG)st);
+        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"CandThumbLen",
+                WINMALI_CT_W * WINMALI_CT_H * 3u);
+    }
+}
+
 static VOID
 WinMaliUvSrcLock_(VOID)
 {
@@ -491,19 +595,56 @@ WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size,
            Blind round-robin threw away DWM's live backbuffers to make room for
            surfaces far too small to ever be a scanout source. Only if every slot
            holds a big surface do we fall back to round-robin. */
+        /* ⛔★★★★★ THE FALLBACK WAS INVERTED, AND IT THREW AWAY dwm's FRAMES.
+         *
+         * The size guard above only fires when the INCOMING surface is bigger
+         * than the smallest resident one. When a tiny scratch surface arrives at
+         * a full table, `smallest.Size < Size` is FALSE, so it fell through to
+         * blind round-robin - which happily evicted a 21 MB full-screen buffer to
+         * make room for 4 KB of scratch. Exactly backwards, and it is why dwm's
+         * two panel-sized flip buffers (bo=233, bo=235, both imported fine, 0
+         * skipped / 0 failed) never survived in the table while ~24 churny small
+         * imports did: only ONE panel-sized entry was ever left.
+         *
+         * Correct policy: evict the SMALLEST evictable slot, and if even that is
+         * bigger than the newcomer then the NEWCOMER is the least valuable thing
+         * in the room - drop it rather than displace something better.
+         *
+         * ⛔ AND NEVER TOUCH A SLOT THE WORKER IS READING. This function takes
+         * the same mutex the present worker holds across its copy, but InUse /
+         * Dying were not consulted at all, so a takeover could RtlZeroMemory a
+         * slot mid-copy. That is the same class as the BoFree/Revoke race that
+         * already wedged this machine once. */
         ULONG smallest = WINMALI_UVSRC_SLOTS;
         for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
+            if (g_WinMaliUvSrc[i].InUse != 0 || g_WinMaliUvSrc[i].Dying) {
+                continue;           /* in flight - not ours to reclaim */
+            }
             if (smallest == WINMALI_UVSRC_SLOTS ||
                 g_WinMaliUvSrc[i].Size < g_WinMaliUvSrc[smallest].Size) {
                 smallest = i;
             }
         }
-        if (smallest != WINMALI_UVSRC_SLOTS &&
-            g_WinMaliUvSrc[smallest].Size < Size) {
-            slot = smallest;
-        } else {
-            slot = g_WinMaliUvSrcNext % WINMALI_UVSRC_SLOTS;
-            g_WinMaliUvSrcNext++;
+        if (smallest == WINMALI_UVSRC_SLOTS) {
+            /* every slot is in use or dying: publishing would corrupt one */
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcEvictBusy);
+            WinMaliUvSrcUnlock_();
+            return;
+        }
+        if (g_WinMaliUvSrc[smallest].Size > Size) {
+            /* the newcomer is smaller than everything resident - it is the least
+               plausible scanout source. Dropping it is strictly better than
+               evicting a bigger one. */
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcDropSmall);
+            WinMaliUvSrcUnlock_();
+            return;
+        }
+        slot = smallest;
+        /* ★ Count evictions of a FULL-SCREEN-capable slot separately: if this
+           number is ever non-zero the policy is still losing frames, and that is
+           provable on the next boot instead of assumed. */
+        if (g_WinMaliUvSrc[slot].Size >= (SIZE_T)WINMALI_FB_HEIGHT * WINMALI_FB_STRIDE) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcEvictBig);
         }
         (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcEvict);
     }
@@ -513,6 +654,26 @@ WinMaliUvSrcPublish(_In_ ULONG Handle, _In_ PMDL Mdl, _In_ SIZE_T Size,
     if (g_WinMaliUvSrc[slot].Handle != 0 &&
         g_WinMaliUvSrc[slot].Handle != Handle) {
         RtlZeroMemory(&g_WinMaliUvSrc[slot], sizeof(g_WinMaliUvSrc[slot]));
+    }
+    /* ⛔★★★★★ COUNT PANEL-CLASS PUBLISHES, TO PAIR WITH StatUvRevokeBig.
+     *
+     * The refcount fix was a no-op (StatBoDedup=0): dwm's two panel-sized
+     * surfaces are DISTINCT allocations at distinct VAs, so nothing is closing a
+     * shared alias early - dwm really does destroy them. That leaves two very
+     * different worlds, and one number separates them:
+     *
+     *   PubBig - RevokeBig == 1  ->  dwm CHURNS surfaces; only one panel-sized
+     *                                allocation ever EXISTS at a time, so the
+     *                                table cannot hold two and "one flip stale"
+     *                                is a consequence of dwm's lifecycle, not of
+     *                                anything we do. Fix moves to the present /
+     *                                flip-model contract.
+     *   PubBig - RevokeBig >= 2  ->  several DO coexist and we are still losing
+     *                                them somewhere between publish and scan.
+     *
+     * ★ WHEN TWO STORIES PREDICT DIFFERENT ARITHMETIC, PUBLISH THE ARITHMETIC. */
+    if (Size >= (SIZE_T)WINMALI_FB_HEIGHT * WINMALI_FB_STRIDE) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPubBig);
     }
     g_WinMaliUvSrc[slot].Handle = Handle;
     g_WinMaliUvSrc[slot].Mdl    = Mdl;
@@ -583,6 +744,71 @@ WinMaliUvSrcRevoke(_In_ ULONG Handle)
             (VOID)InterlockedIncrement(&g_WinMaliStatUvRevokeTimeout);
         }
         if (g_WinMaliUvSrc[i].Handle == Handle) {
+            /* ⛔★★★★★ A REVOKED SLOT READS AS **EMPTY**, NOT AS "DYING".
+             *
+             * Dying is only the transient state while BoFree waits for InUse to
+             * drain; the zero below then returns the slot to the empty pool. So a
+             * dump of the table shows `empty` for something that was, moments
+             * ago, a live full-screen scanout candidate - which is exactly why
+             * 38 empty slots and one panel-sized entry looked like "the second
+             * flip buffer was never registered".
+             *
+             * MEASURED: dwm's two panel-sized buffers BOTH import (21,667,840 B
+             * each, 0 skipped / 0 failed) and publish unconditionally, yet only
+             * one is ever in the table, with the table 60% empty and eviction
+             * never firing. Revocation is the only remaining way an entry leaves.
+             *
+             * Count it, and count full-screen ones separately: if a panel-sized
+             * candidate is being revoked while dwm still owns it as a live back
+             * buffer, that is the bug - same shape as the syncobj-ownership bug
+             * where an import minted one handle and freed a different one. */
+            if (g_WinMaliUvSrc[i].Size >=
+                    (SIZE_T)WINMALI_FB_HEIGHT * WINMALI_FB_STRIDE) {
+                (VOID)InterlockedIncrement(&g_WinMaliStatUvRevokeBig);
+                /* ⛔★★★★★ LATCH A TRIGGERED RING SNAPSHOT.
+                 *
+                 * The line that says WHY this buffer is being freed is already in
+                 * the DbgPrint ring - `KMT import COLLISION`, `import FAILED at
+                 * vm_bind`, or `BoRundown ... owner device died`. It is simply
+                 * unreadable after the fact: these revokes happen in the first
+                 * seconds of boot, WinRM is not reachable until ~70 s, and the
+                 * ring wraps. Two late reads showed COLLISION=0 / BoRundown=0,
+                 * which proves NOTHING - the window no longer held the events.
+                 *
+                 * Same fix that finally caught the syncobj burst: latch here, let
+                 * the present worker copy the ring into its OWN registry value on
+                 * its next tick (registry I/O must not run under this mutex), and
+                 * capture the FIRST occurrence only so later traffic cannot
+                 * dilute it.
+                 * ★ FOR A BOOT-TIME EVENT, CAPTURE MUST BE TRIGGERED BY THE EVENT,
+                 *   NOT BY A LATER READ. */
+                /* ⛔★★★★★ COPY THE RING **HERE**, NOT ON THE WORKER'S NEXT TICK.
+                 *
+                 * v1 latched here and let the present worker snapshot later. The
+                 * trigger fired and captured 192 KB - and the revoke line was NOT
+                 * in it, because the ring had already wrapped between the revoke
+                 * and the worker's next pass (this KMD emits VmUnmap/BoDestroy/
+                 * bo_free continuously). Decoupling the trigger from the event is
+                 * not enough; the CAPTURE has to happen at the event too.
+                 *
+                 * So: memcpy the ring into a preallocated buffer right now - no
+                 * registry I/O under this mutex, which is the constraint that
+                 * pushed it to the worker in the first place - and let the worker
+                 * merely FLUSH the buffer afterwards.
+                 * ★ A SNAPSHOT IS ONLY AS TIMELY AS THE MOMENT IT IS TAKEN, NOT
+                 *   THE MOMENT IT IS PUBLISHED. */
+                /* ⛔ REVERTED: capturing the ring HERE ran WinMaliSerialSnapshot and a
+                   pool allocation from inside WinMaliUvSrcRevoke - i.e. under the
+                   UvSrc mutex, on the BoFree_ path. Suspect in the 1.1.6.x
+                   FAILED_DRIVER_ENTRY regression; the counter below is enough. */
+                (VOID)InterlockedCompareExchange(&g_WinMaliTrapRevokeBig, 1, 0);
+                WINMALI_WARN("UvSrcRevoke: FULL-SCREEN slot revoked "
+                             "bo=%u pid=%u pages=%u pitch=%u",
+                             Handle, g_WinMaliUvSrc[i].Pid,
+                             (ULONG)(g_WinMaliUvSrc[i].Size >> PAGE_SHIFT),
+                             g_WinMaliUvSrc[i].Pitch);
+            }
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvRevokeAny);
             RtlZeroMemory(&g_WinMaliUvSrc[i], sizeof(g_WinMaliUvSrc[i]));
         }
         break;
@@ -590,6 +816,26 @@ WinMaliUvSrcRevoke(_In_ ULONG Handle)
     WinMaliUvSrcUnlock_();
 }
 
+
+/* Is "prefer a candidate that is actually being written" enabled?
+   Registry knob (UvPreferLive, default 1) so a bad first trial can be undone
+   over WinRM without a rebuild - this changes which surface the panel shows,
+   so it is exactly the sort of change that must be revertible. Cached: this is
+   consulted per candidate per tick. */
+static BOOLEAN
+WinMaliUvPreferLive_(VOID)
+{
+    static LONG s_cached = -1;
+    LONG v = InterlockedCompareExchange(&s_cached, -1, -1);
+
+    if (v < 0) {
+        ULONG r = 1;
+        (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"UvPreferLive", 1, &r);
+        v = (r != 0) ? 1 : 0;
+        (VOID)InterlockedExchange(&s_cached, v);
+    }
+    return (v != 0) ? TRUE : FALSE;
+}
 PVOID
 WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                         _In_ ULONG Stride,
@@ -611,7 +857,17 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
        this tick, so the pair splits them: max high + best low = we chose wrong;
        both low = the composed frame is not among the candidates at all. */
     ULONG  maxCoverage = 0;
+    /* ⛔ SAME SPLIT AS maxCoverage, FOR CHANGE-COUNT - and this is the pair that
+       decides the taskbar question. bestChg alone is ambiguous: 0 could mean
+       "we picked a dead buffer while a live one was on offer" or "nothing on
+       offer is being written at all". Those need opposite fixes (change the
+       selector vs. find out where dwm actually composes). maxChanges is the best
+       change-count ANY candidate had this tick, so:
+          max high + best low -> we chose wrong
+          both zero          -> the composed frame is NOT among the candidates */
+    ULONG  maxChanges = 0;
     ULONG  nQual = 0;   /* candidates that passed the size gate THIS tick */
+    ULONG  recN = 0;
 
     *OutHandle = 0;
     *OutHits   = 0;
@@ -625,15 +881,58 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
     /* Held until Release - see the locking note above. */
     WinMaliUvSrcLock_();
     g_WinMaliUvSrcTick++;
+    recN = 0;   /* one complete picture of the table per sweep */
 
     for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
         PUCHAR base;
         ULONG  hits = 0, nonBlack = 0, y;   /* hits = TRANSITIONS, not non-black */
         ULONG  sum = 2166136261u, changes = 0, lastTick = 0;
         ULONG  lastNz = 0, coverage = 0;    /* how far down content reaches, % */
+        /* â BOUNDING BOX OF NON-BLACK CONTENT. nonBlack alone cannot tell
+           "a small painted rectangle" (damage-only rendering into a buffer whose
+           previous content was not preserved) from "sparse content scattered over
+           the whole screen" (composition running but producing black). Those need
+           opposite fixes, and the count reads identically for both. */
+        ULONG  firstNz = 0xFFFFFFFFu, firstCol = 0xFFFFFFFFu, lastCol = 0;
+        WINMALI_SLOTREC *rec = NULL;
+        ULONG  sp = 0, rows = 0;
 
-        if (g_WinMaliUvSrc[i].Handle == 0 || g_WinMaliUvSrc[i].Mdl == NULL ||
-            g_WinMaliUvSrc[i].Dying) {
+        /* ⛔★★★★★ RECORD BEFORE EVERY `continue`, AND MAKE THE REASON A FIELD.
+         *
+         * This record used to live further down, inside the size-gate block -
+         * i.e. AFTER the filter immediately below. So any slot that was empty,
+         * Dying, or had a released Mdl was INVISIBLE to it, and I read "only one
+         * panel-sized slot exists" off a dump that structurally could not show
+         * the others. dwm's two flip buffers (bo=233/235) both import fine and
+         * publish unconditionally, so they ARE in this table - the dump just
+         * could not see them.
+         *
+         * Fifth instrument this session to sit behind the condition it existed to
+         * measure. Record every slot, then let each rejection stamp its own
+         * reason. */
+        if (recN < WINMALI_SLOTREC_MAX) {
+            rec = &g_WinMaliSlotRec[recN];
+            rec->Handle    = g_WinMaliUvSrc[i].Handle;
+            rec->Pid       = g_WinMaliUvSrc[i].Pid;
+            rec->Pages     = (ULONG)(g_WinMaliUvSrc[i].Size >> PAGE_SHIFT);
+            rec->Pitch     = g_WinMaliUvSrc[i].Pitch;
+            rec->NeedPages = 0;
+            rec->Rej       = 0;
+            recN++;
+        } else {
+            rec = NULL;
+        }
+
+        if (g_WinMaliUvSrc[i].Handle == 0) {
+            if (rec != NULL) { rec->Rej = 2; }        /* empty slot */
+            continue;
+        }
+        if (g_WinMaliUvSrc[i].Mdl == NULL) {
+            if (rec != NULL) { rec->Rej = 4; }        /* Mdl released */
+            continue;
+        }
+        if (g_WinMaliUvSrc[i].Dying) {
+            if (rec != NULL) { rec->Rej = 3; }        /* revoked - BoFree waiting */
             continue;   /* Dying: BoFree is waiting to unmap this - never adopt it */
         }
         /* ★ COUNT THE POPULATION SEPARATELY FROM THE WINNER. A bare "uvBo=0"
@@ -657,6 +956,11 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                                                          : Stride;
             SIZE_T need = (SIZE_T)Height * gp;
             if (need < NeedBytes) { need = NeedBytes; }
+            if (rec != NULL) {
+                rec->Pitch     = gp;
+                rec->NeedPages = (ULONG)(need >> PAGE_SHIFT);
+                rec->Rej       = (g_WinMaliUvSrc[i].Size < need) ? 1u : 0u;
+            }
             if (g_WinMaliUvSrc[i].Size < need) {
                 (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcTooSmall);
                 continue;   /* cannot cover the panel at its own stride */
@@ -739,17 +1043,38 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
              * frame. Every selection decision rested on that.
              * ★ The pitch has been available per-slot since the UMD started
              * reporting it; this is the code that was still assuming. */
-            ULONG sp   = (g_WinMaliUvSrc[i].Pitch != 0) ? g_WinMaliUvSrc[i].Pitch
-                                                        : Stride;
-            ULONG rows = (ULONG)(g_WinMaliUvSrc[i].Size / sp);
+            sp   = (g_WinMaliUvSrc[i].Pitch != 0) ? g_WinMaliUvSrc[i].Pitch
+                                                   : Stride;
+            rows = (ULONG)(g_WinMaliUvSrc[i].Size / sp);
             if (rows > Height) { rows = Height; }
-            for (y = 0; y < rows; y += 97) {
+            /* ⛔★★★★★ SAMPLE THE LAST ROW, OR THE BOX IS A CEILING.
+             *
+             * Stepping y += 97 over 1840 rows visits 0,97,...,1746 and NEVER the
+             * bottom 93 rows. So lastNz saturates at 1746, coverage saturates at
+             * (1746*100)/1840 = **94**, and the packed box saturates at
+             * (1746/8)*8 = **1744** - for a COMPLETELY painted buffer.
+             *
+             * I read "painted rows 0..1744" off a full desktop and concluded the
+             * bottom 1840-1744 = 96 rows were unpainted, which is exactly the
+             * taskbar's height, and built a whole mechanism on the coincidence.
+             * Both numbers were the instrument hitting its own ceiling. An older
+             * note recording "coverage 94% => the bottom 6% is unpainted" is the
+             * same artefact.
+             *
+             * ★ IF A METRIC'S MAXIMUM IS NOT THE MAXIMUM OF WHAT IT MEASURES, IT
+             * WILL BE READ AS A FINDING. Visit the final row explicitly so a full
+             * buffer reports the full extent. */
+            for (y = 0; y < rows; ) {
                 const ULONG *row = (const ULONG *)(base + (SIZE_T)y * sp);
                 ULONG x;
                 BOOLEAN rowNz = FALSE;
                 for (x = 0; x < (sp / 4); x += 89) {
                     ULONG px = row[x] & 0x00FFFFFFu;
-                    if (px != 0) { nonBlack++; rowNz = TRUE; }
+                    if (px != 0) {
+                        nonBlack++; rowNz = TRUE;
+                        if (x < firstCol) { firstCol = x; }
+                        if (x > lastCol)  { lastCol  = x; }
+                    }
                     if (havePrev && px != prev) { hits++; }
                     /* Order-sensitive so a permutation of the same pixels still
                        registers as a change. */
@@ -764,7 +1089,11 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                    with 19 non-black rows means the latched winner held only a top
                    strip while 25,476 of 25,549 candidates were rejected on size
                    alone. */
-                if (rowNz) { lastNz = y; }
+                if (rowNz) { lastNz = y; if (firstNz == 0xFFFFFFFFu) { firstNz = y; } }
+                /* advance, but never skip past the final row */
+                if (y == rows - 1u) { break; }
+                y += 97u;
+                if (y >= rows) { y = rows - 1u; }
             }
             coverage = (rows != 0) ? ((lastNz * 100u) / rows) : 0u;
         }
@@ -797,6 +1126,54 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                                       (LONG)g_WinMaliUvSrc[i].Scans);
             (VOID)InterlockedExchange(&g_WinMaliUvCandPages[nCand],
                                       (LONG)(g_WinMaliUvSrc[i].Size >> PAGE_SHIFT));
+            /* Packed bounding box of painted content, 1 byte per edge:
+               firstRow/8 | lastRow/8 | firstCol/16 | lastCol/16. */
+            {
+                ULONG fr = (firstNz  == 0xFFFFFFFFu) ? 0u : (firstNz  / 8u);
+                ULONG lr = lastNz / 8u;
+                ULONG fc = (firstCol == 0xFFFFFFFFu) ? 0u : (firstCol / 16u);
+                ULONG lc = lastCol / 16u;
+                if (fr > 255u) { fr = 255u; }
+                if (lr > 255u) { lr = 255u; }
+                if (fc > 255u) { fc = 255u; }
+                if (lc > 255u) { lc = 255u; }
+                (VOID)InterlockedExchange(&g_WinMaliUvCandBox[nCand],
+                        (LONG)((fr << 24) | (lr << 16) | (fc << 8) | lc));
+            }
+            /* One candidate imaged per capture, rotating over the slots. */
+            if ((g_WinMaliUvSrcTick % 64u) == 0u && sp != 0u && rows != 0u &&
+                (ULONG)nCand == ((g_WinMaliUvSrcTick / 64u) % 3u)) {
+                if (g_WinMaliCandThumb == NULL) {
+                    g_WinMaliCandThumb = (PUCHAR)ExAllocatePoolWithTag(
+                        NonPagedPoolNx, WINMALI_CT_W * WINMALI_CT_H * 3u, 'tCmW');
+                }
+                if (g_WinMaliCandThumb != NULL) {
+                    ULONG width = sp / 4u;
+                    ULONG stepX = (width > WINMALI_CT_W) ? (width / WINMALI_CT_W) : 1u;
+                    ULONG stepY = (rows  > WINMALI_CT_H) ? (rows  / WINMALI_CT_H) : 1u;
+                    ULONG tx, ty;
+                    RtlZeroMemory(g_WinMaliCandThumb,
+                                  WINMALI_CT_W * WINMALI_CT_H * 3u);
+                    for (ty = 0; ty < WINMALI_CT_H; ty++) {
+                        ULONG sy = ty * stepY;
+                        if (sy >= rows) { break; }
+                        for (tx = 0; tx < WINMALI_CT_W; tx++) {
+                            ULONG sx = tx * stepX;
+                            const UCHAR *pxs;
+                            PUCHAR o;
+                            if (sx >= width) { break; }
+                            pxs = (const UCHAR *)(base + (SIZE_T)sy * sp +
+                                                  (SIZE_T)sx * 4u);
+                            o = g_WinMaliCandThumb +
+                                ((SIZE_T)ty * WINMALI_CT_W + tx) * 3u;
+                            o[0] = pxs[0]; o[1] = pxs[1]; o[2] = pxs[2];
+                        }
+                    }
+                    g_WinMaliCandThumbBo  = (LONG)g_WinMaliUvSrc[i].Handle;
+                    g_WinMaliCandThumbPid = (LONG)g_WinMaliUvSrc[i].Pid;
+                    (VOID)InterlockedExchange(&g_WinMaliCandThumbPending, 1);
+                }
+            }
             nCand++;
         }
 
@@ -807,6 +1184,7 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
            that is dropped for being uniform still counts toward "was anything
            better available". */
         if (coverage > maxCoverage) { maxCoverage = coverage; }
+        if (changes  > maxChanges)  { maxChanges  = changes;  }
 
         if (hits == 0) {
             (VOID)InterlockedIncrement(&g_WinMaliStatUvSrcUniform);
@@ -839,13 +1217,53 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         {
             ULONG covBucket     = coverage / 10u;
             ULONG bestCovBucket = bestCoverage / 10u;
-            BOOLEAN better =
+            /* ⛔★★★★★ LIVENESS **AND** COVERAGE - NEITHER ALONE IS THE KEY.
+             *
+             * Two measured failures, one in each direction:
+             *
+             * 1) coverage-only (<=1.1.3.3):  StatUvSrcChg=0 StatUvMaxChg=19,
+             *    coverage 94. A fully-painted DEAD buffer outranked a live one,
+             *    so the panel froze on the frame dwm had abandoned and the
+             *    taskbar - drawn later - could never appear.
+             * 2) liveness-only (1.1.3.4):    StatUvSrcChg=11 = StatUvMaxChg,
+             *    but StatUvCoverage fell 94 -> 5 and StatUvSrcPid changed from
+             *    dwm to another process. We faithfully followed the liveliest
+             *    surface in the system: a 5%-covered partial render. The user
+             *    saw shell32 icons on black, now ANIMATING instead of frozen.
+             *
+             * A 5%-covered surface cannot be the whole screen no matter who is
+             * writing it, and a never-written surface cannot be the live screen
+             * however complete it looks. So: a candidate must first be PLAUSIBLY
+             * FULL-SCREEN to be eligible at all, and only among those does
+             * liveness decide. Falls back to the old order if nothing clears the
+             * bar, so a boot that has not composed yet still paints something. */
+            BOOLEAN eligible     = (coverage     >= WINMALI_UVSRC_MIN_COVERAGE);
+            BOOLEAN bestEligible = (bestCoverage >= WINMALI_UVSRC_MIN_COVERAGE);
+            BOOLEAN live     = (changes > 0);
+            BOOLEAN bestLive = (bestChg > 0);
+            BOOLEAN better;
+
+            if (!WinMaliUvPreferLive_()) {
+                live = bestLive = FALSE;   /* knob off: exactly the old ranking */
+                eligible = bestEligible = FALSE;
+            }
+
+            better =
                 (bestVa == NULL) ||
-                (covBucket > bestCovBucket) ||
-                (covBucket == bestCovBucket && lastTick > bestTick) ||
-                (covBucket == bestCovBucket && lastTick == bestTick &&
+                /* full-screen-ness first: a partial render is never the desktop */
+                (eligible && !bestEligible) ||
+                /* then liveness, among equally plausible screens */
+                (eligible == bestEligible && live && !bestLive) ||
+                /* then the original order, untouched */
+                (eligible == bestEligible && live == bestLive &&
+                 covBucket > bestCovBucket) ||
+                (eligible == bestEligible && live == bestLive &&
+                 covBucket == bestCovBucket && lastTick > bestTick) ||
+                (eligible == bestEligible && live == bestLive &&
+                 covBucket == bestCovBucket && lastTick == bestTick &&
                  hits > bestHits) ||
-                (covBucket == bestCovBucket && lastTick == bestTick &&
+                (eligible == bestEligible && live == bestLive &&
+                 covBucket == bestCovBucket && lastTick == bestTick &&
                  hits == bestHits && g_WinMaliUvSrc[i].Size < bestSize);
             if (!better) { continue; }
         }
@@ -874,6 +1292,7 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         (VOID)InterlockedExchange(&g_WinMaliUvCandChg[i], 0);
         (VOID)InterlockedExchange(&g_WinMaliUvCandScans[i], 0);
         (VOID)InterlockedExchange(&g_WinMaliUvCandPages[i], 0);
+        (VOID)InterlockedExchange(&g_WinMaliUvCandBox[i], 0);
     }
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcChg, (LONG)bestChg);
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcPid,   (LONG)bestPid);
@@ -884,11 +1303,18 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
        pick is visible as a number instead of only as a wrong picture. */
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcCoverage, (LONG)bestCoverage);
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcMaxCov, (LONG)maxCoverage);
+    (VOID)InterlockedExchange(&g_WinMaliStatUvSrcMaxChg, (LONG)maxChanges);
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcQual, (LONG)nQual);
 
+    g_WinMaliSlotRecN = recN;
+    if (recN != 0) { (VOID)InterlockedExchange(&g_WinMaliSlotRecPending, 1); }
     *OutHits = bestHits;
     if (bestVa == NULL) {
         WinMaliUvSrcUnlock_();   /* nothing to hold the lock for */
+        g_WinMaliSlotRecN = recN;
+        if (recN != 0) { (VOID)InterlockedExchange(&g_WinMaliSlotRecPending, 1); }
+        WinMaliCandThumbPublish_();
+        WinMaliSlotRecPublish_();
     } else if (bestIdx < WINMALI_UVSRC_SLOTS) {
         if (OutPitch != NULL) { *OutPitch = g_WinMaliUvSrc[bestIdx].Pitch; }
         if (OutSize  != NULL) { *OutSize  = g_WinMaliUvSrc[bestIdx].Size; }
@@ -904,6 +1330,20 @@ VOID
 WinMaliUvSrcRelease(VOID)
 {
     WinMaliUvSrcUnlock_();
+    /* â REGISTRY I/O **AFTER** THE UNLOCK. WinMaliUvSrcPublish takes this same
+       mutex from the 0x93 escape path, so a 63 KB write while holding it would
+       block dwm inside its escape - the exact shape of the wedge that froze the
+       machine when the worker held this lock across the frame copy. */
+    /* ⛔ THIS is the path that actually runs. The first attempt armed the
+       slot-record publish only in AcquireBest's bestVa==NULL branch - which
+       almost never executes, because a candidate normally DOES qualify - so
+       UvSlots read ABSENT while the sweep was recording fine. Fourth time this
+       session that an instrument sat on a path that does not run. */
+    if (g_WinMaliSlotRecN != 0) {
+        (VOID)InterlockedExchange(&g_WinMaliSlotRecPending, 1);
+    }
+    WinMaliCandThumbPublish_();
+    WinMaliSlotRecPublish_();
 }
 
 /* ⛔★★★★★ IS THE CANDIDATE WE SELECTED STILL ALIVE?
@@ -995,6 +1435,46 @@ WinMaliUvSrcReacquireVa(_In_ ULONG Handle, _Out_opt_ ULONG* OutPitch,
     }
     WinMaliUvSrcUnlock_();
     return va;
+}
+
+/* ⛔★★★★★ ONE ALLOCATION = ONE BO = ONE SCANOUT SLOT.
+ *
+ * CAPTURED (triggered ring snapshot, 1.1.6.3): dwm's panel-sized imported
+ * surface is destroyed by an ORDINARY alias release - mesa's pipe_resource
+ * refcount reaches zero, bo_free runs, BoDestroy frees the BO, and
+ * WinMaliUvSrcRevoke empties the scanout slot with it. No import collision, no
+ * device rundown. It is simply that NOTHING in the chain refcounts the
+ * allocation: RefCount existed but was decorative, so the FIRST close of ANY
+ * alias tore out a live full-screen candidate. That is why dwm's two flip
+ * buffers never coexisted in the table and the panel stayed one flip stale.
+ *
+ * Dedup on the identity the pages actually have - (process, UserVa, Size) - so
+ * a re-import of the same allocation returns the SAME handle with a reference
+ * instead of minting a second BO over the same frames.
+ * ★ IF TWO NAMES CAN REFER TO ONE OBJECT, THE OBJECT NEEDS THE REFCOUNT, NOT
+ *   THE NAMES. */
+static PWINMALI_BO
+WinMaliBoFindByUserVa_(_Inout_ PWINMALI_ADAPTER Adapter,
+                       _In_ PVOID UserVa, _In_ SIZE_T Size)
+{
+    KIRQL       oldIrql;
+    PLIST_ENTRY e;
+    PWINMALI_BO hit = NULL;
+    PEPROCESS   me  = PsGetCurrentProcess();
+
+    KeAcquireSpinLock(&Adapter->BoTable.Lock, &oldIrql);
+    for (e = Adapter->BoTable.Head.Flink; e != &Adapter->BoTable.Head;
+         e = e->Flink) {
+        PWINMALI_BO b = CONTAINING_RECORD(e, WINMALI_BO, Link);
+        if (b->PagesImported && b->UserVa == UserVa &&
+            b->UserVaProcess == me && b->Size == Size) {
+            InterlockedIncrement(&b->RefCount);
+            hit = b;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->BoTable.Lock, oldIrql);
+    return hit;
 }
 
 int
@@ -1130,6 +1610,11 @@ WinMaliBoTakeByHandle_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
 int
 WinMaliBoDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
 {
+    /* ⛔ REVERTED to the simple form. The refcounted variant (1.1.6.4) walked the
+       BoTable under its spinlock and is the other prime suspect in the
+       FAILED_DRIVER_ENTRY regression. It was ALSO measured to be a no-op
+       (StatBoDedup=0: dwm's two panel buffers are distinct allocations, not
+       aliases), so nothing of value is lost by removing it. */
     PWINMALI_BO bo = WinMaliBoTakeByHandle_(Adapter, Handle);
     if (bo == NULL) {
         return WMERR_ENOENT;

@@ -50,6 +50,31 @@
 #define WINMALI_CS_EXTRACT_EVENT           (1u << 4)
 #define WINMALI_CS_IDLE_SYNC_WAIT          (1u << 8)
 #define WINMALI_CS_IDLE_EMPTY              (1u << 10)
+/* ⛔★★★★★ BIT 26 IS THE ONE THAT WEDGED THE GPU FOR THE WHOLE PROJECT.
+ *
+ * The FW raises CS_ACK bit 26 (TILER_OOM) when the tiler heap runs out of
+ * chunks, then PARKS the command stream until the host links in a new chunk and
+ * toggles CS_REQ bit 26 to match. Nothing in this driver ever read it, and
+ * WINMALI_CS_REQ_MASK below omits it, so WinMaliCsfCsUpdateReqs_ strips bit 26
+ * from every REQ write - the request could not be acknowledged even in principle.
+ * There was also no tiler-heap grow path at all (Create + Destroy only), so
+ * there was nothing to hand back. First exhaustion = permanent wedge.
+ *
+ * MEASURED at the FIRST timeout of a boot 2026-08-20, and identically 2026-08-18:
+ *     CsAck = 0x04000011  (bit26 SET)      CsReq = 0x00000511  (bit26 clear)
+ *     CsOk frozen at 1146, CsTimeouts climbing, CsfLastAs=6
+ *     bit30 FATAL = 0/0, bit31 FAULT = 0/0, every MMU/GPU fault bank zero
+ * The zeros are not "nothing is wrong" - TILER_OOM is a REQUEST, not a fault.
+ *
+ * ⚠ WINMALI_CS_REQ_MASK is deliberately left UNCHANGED. Adding TILER_OOM to it
+ * would let WinMaliCsfCsUpdateReqs_ (called on every CSG start) write bit 26 as
+ * 0 and so CLEAR a pending acknowledgement. WinMaliCsfServiceTilerOom_ writes
+ * csIn->Req directly instead, which is the only place that bit should move.
+ * bit30/bit31 are defined for decoding only: acking a real FAULT/FATAL is a
+ * behaviour change needing its own measurement, and both read 0 at the wedge. */
+#define WINMALI_CS_TILER_OOM               (1u << 26)
+#define WINMALI_CS_FATAL                   (1u << 30)
+#define WINMALI_CS_FAULT                   (1u << 31)
 #define WINMALI_CS_REQ_MASK                (WINMALI_CS_STATE_MASK | WINMALI_CS_EXTRACT_EVENT \
                                               | WINMALI_CS_IDLE_SYNC_WAIT | WINMALI_CS_IDLE_EMPTY)
 
@@ -1904,6 +1929,52 @@ WinMaliCsfRebindCsgAs_(_Inout_ PWINMALI_ADAPTER Adapter,
      * submit is cheap insurance that the slot is provably bound to THIS group's
      * VM before we run its stream. Correctness over the skip's micro-opt. */
 
+    /* ⛔★★★★★ NEVER TEAR DOWN A SLOT THAT STILL HAS WORK QUEUED.
+     *
+     * The comment above states this function's precondition: "the previous one
+     * has completed (seqno signalled) before we get here, so the slot is idle".
+     * ⛔ THAT IS FALSE THE MOMENT A SUBMIT TIMES OUT. A timed-out submit has NOT
+     * completed and its job is STILL IN THE RING, but we terminate anyway - so
+     * the first timeout poisons every submit after it and the GPU never recovers.
+     *
+     * MEASURED LIVE 2026-08-18 at the stall, with a frozen desktop on screen:
+     *     CsOk FROZEN at 942, CsTimeouts climbing, CsfLastStatus=0xC00000B5
+     *     RingInsert-RingExtract = 128   (one job queued, never consumed)
+     *     CsFatal=0 CsFault=0 GpuFaultSt=0 AsFaultSt=0 McuFaultSt=0  (no fault)
+     *     one CSG slot rebound across THREE address spaces as apps started:
+     *     AS=5 -> AS=1 -> AS=5 -> AS=1 -> AS=6, and the timeout was on AS 6.
+     *
+     * Give the FW a bounded chance to drain first. If it still has not consumed
+     * the bytes, say so loudly rather than silently destroying the context that
+     * job was going to run in - "the ring looking empty and no fault" is the
+     * exact symptom WinMaliCsfProgramAndStartCsg_ already warns about.
+     *
+     * ⚠ Diagnostic + mitigation only; it does NOT fix the underlying handshake.
+     * The WMTERMBUSY1 marker is also the deploy proof for this build.
+     */
+    if (Fw->QRingIn != NULL && Fw->QRingOut != NULL) {
+        UINT64 ins = Fw->QRingIn->Insert;
+        UINT64 ext = Fw->QRingOut->Extract;
+        if (ins != ext) {
+            ULONG spins;
+            for (spins = 0; spins < 100u && ins != ext; ++spins) {
+                LARGE_INTEGER d;
+                d.QuadPart = -10000;   /* 1 ms, relative */
+                (VOID)KeDelayExecutionThread(KernelMode, FALSE, &d);
+                ext = Fw->QRingOut->Extract;
+            }
+            if (ins != ext) {
+                WINMALI_WARN("CSF: WMTERMBUSY1 terminating AS %u->%u with %I64u B "
+                             "STILL QUEUED (insert=%I64u extract=%I64u) - the FW "
+                             "never consumed it; this poisons the next submit",
+                             Fw->CurrentCsgAs, AsSlot, ins - ext, ins, ext);
+            } else {
+                WINMALI_TRACE("CSF: WMTERMBUSY1 ring drained after wait "
+                              "(AS %u->%u)", Fw->CurrentCsgAs, AsSlot);
+            }
+        }
+    }
+
     /* Tear the current group off the slot (if any), then program + start the
        slot fresh for the target AS. */
     status = WinMaliCsfTerminateCsg_(Adapter, Fw);
@@ -1962,6 +2033,228 @@ WinMaliCsfRecoverFaultedAs_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG AsSlot)
     }
 }
 
+/* Forward decl: the post-service check inside the OOM handler needs a real
+   status refresh, and that helper is defined below it. */
+static VOID WinMaliCsfRequestStatusUpdate_(_Inout_ PWINMALI_ADAPTER Adapter,
+                                           _Inout_ WINMALI_FWCTX*   Fw);
+
+/* Service a firmware TILER_OOM request on CS slot 0.
+ *
+ * THE BUG THIS FIXES. When the tiler heap runs out of chunks the FW sets
+ * CS_ACK bit 26 and PARKS the command stream, waiting for the host to link in a
+ * fresh chunk and toggle CS_REQ bit 26 to match. This driver never read the bit,
+ * had no way to write it (WINMALI_CS_REQ_MASK strips it), and had no heap grow
+ * path to satisfy it - so the first heap exhaustion of a boot wedged the GPU for
+ * the rest of that boot. Every diagnostic pointed at "nothing is wrong" because
+ * TILER_OOM is a REQUEST, not a fault: all MMU/GPU/CS fault banks read zero.
+ *
+ * Called from the submit wait loop, so a stream that parks mid-wait is unblocked
+ * and the SAME submit goes on to complete - no retry, no terminate, no rebind.
+ *
+ * ⚠ We acknowledge even when we cannot supply a chunk (cap hit, allocation
+ * failed, no heap on this VM). An unacknowledged request parks the stream
+ * forever; acking with a null chunk makes the tiler op fail loudly instead,
+ * which is recoverable. Never leave the request pending.
+ *
+ * Returns TRUE if a request was pending and has now been acknowledged. */
+static BOOLEAN
+WinMaliCsfServiceTilerOom_(_Inout_ PWINMALI_ADAPTER Adapter,
+                           _Inout_ WINMALI_FWCTX*   Fw,
+                           _In_    ULONG            CsgAsSlot)
+{
+    volatile WINMALI_PANTHOR_FW_CS_INPUT_IFACE*  csIn;
+    volatile WINMALI_PANTHOR_FW_CS_OUTPUT_IFACE* csOut;
+    ULONG    ack, req, irqReq = 0;
+    UINT64   chunkVa   = 0;
+    ULONG    chunkSize = 0;
+    NTSTATUS st;
+
+    csIn  = Fw->Cs00Input;
+    csOut = Fw->Cs00Output;
+    if (csIn == NULL || csOut == NULL) {
+        return FALSE;
+    }
+
+    ack = csOut->Ack;
+    req = csIn->Req;
+    if (((ack ^ req) & WINMALI_CS_TILER_OOM) == 0u) {
+        return FALSE;                        /* no request pending */
+    }
+
+    (VOID)InterlockedIncrement(&g_WinMaliStatTilerOomCount);
+
+    st = WinMaliTilerHeapGrow(Adapter, CsgAsSlot, &chunkVa, &chunkSize);
+    if (NT_SUCCESS(st) && chunkVa != 0) {
+        /* ⛔★★★★★ THE FW WANTS THE **PACKED** CHUNK POINTER IN **BOTH** FIELDS.
+         * panthor (cs_slot_process_tiler_oom) and kbase both write the SAME encoded
+         * value - (va & ~0xFFF) | (chunk_size >> 12) - into CS_TILER_HEAP_START and
+         * CS_TILER_HEAP_END. 1.1.9.15-21 wrote the RAW va into HeapStart and
+         * va+size into HeapEnd, so the low 12 bits encoded a chunk size of ZERO.
+         * That matches the symptom exactly: the ack is honoured (the FW never
+         * re-asks, StatTilerOom stays 1) but the chunk is unusable, so the tiler
+         * stays parked and WAIT(scoreboard 2) never signals.
+         * ★ The driver already knew this encoding - WinMaliTilerHeapGrow computes it
+         * for the ctx head - it just did not use it here. */
+        UINT64 packed = (chunkVa & ~0xFFFull) | ((UINT64)chunkSize >> 12);
+        csIn->HeapStart = packed;
+        csIn->HeapEnd   = packed;
+    } else {
+        csIn->HeapStart = 0;
+        csIn->HeapEnd   = 0;
+        (VOID)InterlockedIncrement(&g_WinMaliStatTilerOomFail);
+        WINMALI_WARN("CSF: WMTILEROOM2 TILER_OOM on AS %u could not be satisfied "
+                     "(0x%08x) - acking with a NULL chunk so the CS makes progress "
+                     "instead of parking forever", CsgAsSlot, st);
+    }
+    KeMemoryBarrier();
+
+    /* Toggle only bit 26, under CsfIfaceLock. The per-call mask is what makes
+       this safe: the global WINMALI_CS_REQ_MASK omits TILER_OOM on purpose, so
+       the CSG-start path can never clear a pending acknowledgement. */
+    WinMaliCsfCsUpdateReqs_(Fw, csIn, ack, WINMALI_CS_TILER_OOM);
+
+    /* ⛔★★★★★ THE MISSING STEP: TELL THE FW **WHICH CS** NEEDS ATTENTION.
+     *
+     * kbase's tiler-OOM resume is:
+     *     heap_start/end -> CS_REQ(masked toggle) -> **CSG_DB_REQ ^= BIT(cs_id)**
+     *     -> GLB_DB_REQ -> CSF_DOORBELL(0)
+     * We performed every step EXCEPT the per-CS CSG_DB_REQ toggle. That bit is the
+     * only channel that says *which CS in the group* has a host response pending;
+     * the user doorbell (DOORBELL(1)) means only "INSERT advanced".
+     *
+     * ⚠ AND IT INVALIDATES THE READING THAT RETIRED THE HANDOFF WORK. I concluded
+     * "the chunk is accepted at the protocol level" because csReq came to equal
+     * csAck - but WE wrote csReq. The FW never confirmed anything, and a parked CS
+     * cannot re-ask (re-asking means toggling CS_ACK). So the four chunk-delivery
+     * configurations that "all wedged identically" were CONFOUNDED: they varied the
+     * payload while the wake-up sequence stayed constant and incomplete.
+     *
+     * This helper already existed with exactly kbase's semantics
+     * (n = ((ack ^ mask) & mask) | (cur & ~mask)) and had ONE caller: CSG start. */
+    WinMaliCsfCsgToggleDoorbellReqs_(Fw, 1u);
+    KeMemoryBarrier();
+
+    /* ⛔★★★★★ ALSO ACK THE CSG-LEVEL PER-CS INTERRUPT, OR THE FW NEVER
+     * RE-DISPATCHES THE STREAM.
+     *
+     * Toggling CS_REQ bit 26 above tells the FW WHAT WE DID about the request.
+     * This tells it we have HANDLED THE INTERRUPT for this CS slot. panthor's
+     * sched_process_csg_irq_locked mirrors csg_iface->output->cs_irq_req into
+     * ->input->cs_irq_ack for exactly this reason, and until 2026-08-20 nothing
+     * in this driver read or wrote either field - grep found the two struct
+     * members and ZERO uses.
+     *
+     * MEASURED with the CS-level ack alone (1.1.9.15): StatTilerOom tracked
+     * CsTimeouts exactly (1/2, 4/5, 7/8, 10/11, 17/18, 20/21) - one OOM serviced
+     * per timeout, chunks allocated successfully every time (OOMfail=0), and CsOk
+     * still frozen at 1173. So the CS-level ack DOES clear the request (it never
+     * spins), but the stream is never resumed. An unacked CSG interrupt is the
+     * remaining half of the handshake. */
+    irqReq = Fw->Csg0Output->CsIrqReq;
+    Fw->Csg0Input->CsIrqAck = irqReq;
+    KeMemoryBarrier();
+    KeMemoryBarrier();
+    /* Ring BOTH doorbells: 1 = the CS whose request we answered, 0 = the CSG
+       whose per-CS interrupt we just acked. panthor rings the CSG doorbell after
+       mirroring cs_irq_req; ringing only the CS doorbell leaves the group-level
+       notification undelivered. */
+    /* ⛔ SAME DELIVERY BUG AS THE STATUS-UPDATE PATH: DOORBELL(0) is not seen by
+       the FW unless the global doorbell mask is toggled first. Measured there as
+       req=0x31 ack=0x11 acked=0x0 - "never delivered", not "refused". */
+    WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
+    WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(1), 1u);
+    WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
+
+    /* kbase reads these as INPUTS to the OOM decision: it rejects the request if
+       (frag_end > vt_end) || (vt_end >= vt_start), and computes
+       pending_frag_count = vt_end - frag_end. We had ZERO readers for any of them.
+       pending_frag_count is the number that says whether this is the
+       tiler-waits-for-a-fragment-pass deadlock that incremental rendering exists
+       to break. */
+    WINMALI_WARN("CSF: WMTILEROOM1 serviced TILER_OOM as=%u chunk=0x%llx size=%u "
+                 "(csAck=0x%08x csReq=0x%08x csgIrqReq=0x%08x dbReq=0x%08x dbAck=0x%08x) "
+                 "heap: addr=0x%llx vtStart=%u vtEnd=%u fragEnd=%u pendingFrag=%d inFlight=%d",
+                 CsgAsSlot, (ULONGLONG)chunkVa, chunkSize, ack, req, irqReq,
+                 Fw->Csg0Input->DoorbellReq, Fw->Csg0Output->DoorbellAck,
+                 (ULONGLONG)csOut->HeapAddress, csOut->HeapVtStart, csOut->HeapVtEnd,
+                 csOut->HeapFragEnd,
+                 (int)(csOut->HeapVtEnd - csOut->HeapFragEnd),
+                 (int)(csOut->HeapVtStart - csOut->HeapFragEnd));
+
+    /* ★ DID THE TILER ACTUALLY RESUME? This is the question four builds of chunk
+       plumbing could not answer. Give the FW a moment, refresh the status page for
+       real, and report where the CS is now. If CMD_PTR is UNCHANGED and still
+       BLOCKED on scoreboard 2, then the chunk was accepted at the protocol level
+       (the FW stops re-asking) but the tiler did NOT restart - which separates
+       "our handoff is malformed" from "the tiler needs something other than memory".
+       Runs at most once per boot (one OOM), and we are at PASSIVE here: the submit
+       wait loop calls KeDelayExecutionThread. */
+    {
+        LARGE_INTEGER d;
+        d.QuadPart = -500000;          /* 50 ms, relative */
+        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &d);
+        WinMaliCsfRequestStatusUpdate_(Adapter, Fw);
+        WINMALI_WARN("CSF: WMOOMPOST1 after service: CMD_PTR=0x%llx blocked=%u "
+                     "wait=0x%08x sb=0x%08x csAck=0x%08x csReq=0x%08x seqno=%llu",
+                     (ULONGLONG)Fw->Cs00Output->StatusCmdPtr,
+                     Fw->Cs00Output->StatusBlockedReason & 0xFu,
+                     Fw->Cs00Output->StatusWait,
+                     Fw->Cs00Output->StatusScoreboards,
+                     Fw->Cs00Output->Ack, Fw->Cs00Input->Req,
+                     (ULONGLONG)0);
+    }
+    return TRUE;
+}
+
+/* Ask the firmware to REFRESH the CS/CSG status page, then wait briefly for the ack.
+ *
+ * ⛔★★★★★ WITHOUT THIS, EVERY Status* FIELD IS AN UNINITIALISED STRUCT.
+ *
+ * `WINMALI_CSG_STATUS_UPDATE` (bit 5) has existed since the CSF bring-up and had
+ * exactly ONE occurrence in the whole driver - its own #define. Nothing ever
+ * requested a status update, so `Cs00Output->StatusCmdPtr`, `StatusBlockedReason`,
+ * `StatusWait`, `StatusScoreboards` and `HeapAddress` are whatever the page
+ * happened to contain. Reading 0 from them means "nobody filled this in", NOT
+ * "the CS never ran".
+ *
+ * That misreading cost a root cause: on 2026-08-18 `CMD_PTR=0 BLOCKED_REASON=0`
+ * was taken as proof the command stream never started, which "refuted" TILER_OOM
+ * for two days. The registers that ARE real - CsAck/CsReq, read directly from the
+ * FW interface - said the opposite the whole time.
+ *
+ * Same handshake shape as the CSG state requests: toggle the bit relative to ACK,
+ * ring the CSG doorbell, wait for the ack to match. Bounded at 100 ms because this
+ * runs on the timeout path, which is already slow, and a FW that will not answer a
+ * status request is itself the finding. */
+static VOID
+WinMaliCsfRequestStatusUpdate_(_Inout_ PWINMALI_ADAPTER Adapter,
+                               _Inout_ WINMALI_FWCTX*   Fw)
+{
+    ULONG ack;
+    ULONG acked = 0;
+
+    if (Fw->Csg0Input == NULL || Fw->Csg0Output == NULL) {
+        return;
+    }
+    ack = Fw->Csg0Output->Ack;
+    WinMaliCsfCsgUpdateReqs_(Fw, Fw->Csg0Input,
+                             (ack ^ WINMALI_CSG_STATUS_UPDATE),
+                             WINMALI_CSG_STATUS_UPDATE);
+    KeMemoryBarrier();
+    /* ⛔ THE GLOBAL DOORBELL MASK MUST BE TOGGLED FIRST, exactly as the CSG
+     * state path does (WinMaliCsfProgramAndStartCsg_). 1.1.9.20 rang DOORBELL(0)
+     * WITHOUT it and the FW never looked: measured
+     *   WMSTATUPD1 req=0x00000031 ack=0x00000011 acked=0x00000000
+     * i.e. our REQ bit 5 set, the FW's ACK bit 5 never moved in 100 ms - while the
+     * SAME firmware was acking the rebind handshake on every retry. The request was
+     * not refused, it was never delivered. */
+    WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
+    WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
+    (VOID)WinMaliFwCsgWaitReqAck_(Fw, WINMALI_CSG_STATUS_UPDATE, 100u, &acked);
+    WINMALI_TRACE("CSF: WMSTATUPD1 status update req=0x%08x ack=0x%08x acked=0x%08x",
+                  Fw->Csg0Input->Req, Fw->Csg0Output->Ack, acked);
+}
+
 static NTSTATUS
 WinMaliCsfSubmitStreamCall_(
     _Inout_ PWINMALI_ADAPTER Adapter,
@@ -1981,6 +2274,7 @@ WinMaliCsfSubmitStreamCall_(
     UINT64             insertCont;   /* the continuous counter, unmasked */
     UINT64             ringInsert;   /* insertCont & ringMask: the copy offset */
     UINT64             ringExtract;
+    SIZE_T             padBytes;     /* NOP filler when the block would cross the seam */
     UINT64             callInstrs[WINMALI_CSF_NUM_INSTRS_PER_SLOT];
     volatile WINMALI_PANTHOR_SYNCOBJ64* sync;
     volatile UINT64*   tagSlot;
@@ -2098,8 +2392,55 @@ WinMaliCsfSubmitStreamCall_(
     ringInsert  = insertCont & (UINT64)ringMask;           /* offset, for the copy */
     ringExtract = Fw->QRingOut->Extract;
 
+    /* ⛔★★★★★ A RING MUST WRAP. REFUSING AT THE SEAM WEDGES THE GPU PERMANENTLY.
+     *
+     * The old guard returned STATUS_BUFFER_OVERFLOW whenever the 128-byte block
+     * would not fit between the wrapped insert offset and the END of the 64 KiB
+     * ring - i.e. it treated the seam as an error instead of wrapping. Because
+     * Insert is NOT advanced on that path, the offset stays in the dead zone,
+     * so EVERY subsequent submit fails too. It is a one-way wedge.
+     *
+     * MEASURED LIVE 2026-08-18, with a full desktop up:
+     *     RingInsert   = 131048   -> offset 65512   (dead zone starts at 65409)
+     *     RingExtract  = 130920
+     *     outstanding  = 128 bytes of 65536         <-- the ring was EMPTY
+     *     CsOk         = 955 ... then CsfFailCount  = 21956, all 0x80000005
+     *     dwm AND explorer: "panfrost_batch_submit failed: 5", forever
+     * 955 submits worked, then Insert landed 24 bytes short of the end and the
+     * GPU never accepted another job. Retrying made it worse, not better:
+     * WinMaliCsfProgramAndStartCsg_ reseeds Insert from the FW's Extract on every
+     * rebind, so the "reset the slot and retry" path re-entered the SAME dead
+     * offset each time - 21,956 times.
+     *
+     * ⚠ The offset is not 128-aligned (65512 = 65536-24) because Insert is
+     * seeded from the FW's Extract after the bring-up NOP self-test, so you
+     * cannot assume the block lands on a tidy boundary and "just fits".
+     *
+     * FIX: pad the tail to the seam with NOPs and restart the block at 0.
+     * Opcode 0 is NOP (v10.xml CEU Opcode - same fact instrs 13/14 rely on), so
+     * zero-fill is executable filler. Padding is consumed by the CONTINUOUS
+     * counter, which keeps Insert monotonic - never masked, see the note above.
+     * The block therefore stays contiguous; nothing is split across the seam.
+     *
+     * The overflow return now means what it says: the ring is genuinely FULL
+     * (unconsumed bytes + what we are about to add exceed its capacity).
+     */
+    padBytes = 0;
     if (ringInsert + sizeof(callInstrs) > WINMALI_CSF_RING_BYTES) {
+        padBytes = (SIZE_T)((UINT64)WINMALI_CSF_RING_BYTES - ringInsert);
+    }
+    if ((insertCont + padBytes + sizeof(callInstrs)) - ringExtract >
+        (UINT64)WINMALI_CSF_RING_BYTES) {
+        WINMALI_WARN("CSF: ring genuinely FULL - insert=%I64u extract=%I64u pad=%Iu",
+                     insertCont, ringExtract, padBytes);
         return STATUS_BUFFER_OVERFLOW;
+    }
+    if (padBytes != 0) {
+        RtlZeroMemory((PUCHAR)Fw->HostRingVa + (SIZE_T)ringInsert, padBytes);
+        insertCont += padBytes;
+        ringInsert  = 0;
+        WINMALI_TRACE("CSF: WMRINGWRAP1 padded %Iu B of NOP to the seam; insert now %I64u",
+                      padBytes, insertCont);
     }
 
     RtlCopyMemory((PUCHAR)Fw->HostRingVa + (SIZE_T)ringInsert, callInstrs, sizeof(callInstrs));
@@ -2219,6 +2560,14 @@ WinMaliCsfSubmitStreamCall_(
 
     for (i = 0; i < TimeoutMs; ++i) {
         KeMemoryBarrier();
+        /* ★ UNBLOCK A PARKED STREAM INSTEAD OF TIMING OUT ON IT.
+           The FW parks the CS on TILER_OOM and waits for the host to supply a
+           tiler chunk. Servicing it here lets THIS submit run to completion -
+           no retry, no terminate, no rebind. Before this existed the wait simply
+           expired and the "recovery" path tore down a slot that was only ever
+           waiting for memory, which is why one exhaustion wedged the GPU for the
+           rest of the boot. Cost is two volatile reads per millisecond. */
+        (VOID)WinMaliCsfServiceTilerOom_(Adapter, Fw, CsgAsSlot);
         if (sync->Seqno >= jobSeq) {
             /* A COMPLETION COUNTER. "no timeouts" is not evidence of success -
                it is also what an idle GPU looks like. d(CsOk) > 0 with
@@ -2350,6 +2699,8 @@ WinMaliCsfSubmitStreamCall_(
            names the stall. This is the primary witness - v25's "ATOMIC@0
            fault" was a misread of an all-zero FAULTSTATUS (access-type 0
            decodes as ATOMIC); fault lines below only print when real. */
+        /* ★ MAKE THE STATUS PAGE REAL BEFORE READING IT. */
+        WinMaliCsfRequestStatusUpdate_(Adapter, Fw);
         {
             UINT64 cmdPtr  = Fw->Cs00Output->StatusCmdPtr;
             ULONG  blocked = Fw->Cs00Output->StatusBlockedReason & 0xFu;
@@ -2390,6 +2741,51 @@ WinMaliCsfSubmitStreamCall_(
              * Latched (last-value-wins) plus a count, so one registry read gives
              * the reason and how often it happens. Same discipline as the other
              * published counters: new value names, exactly ONE writer. */
+            /* ★★★★★ ONE-SHOT: ONLY THE FIRST TIMEOUT CARRIES INFORMATION.
+             *
+             * MEASURED 2026-08-20 on a live wedge: every retry after the first
+             * prints an IDENTICAL report - want climbs 1178,1179,1180... while
+             * got stays pinned at 1154, same tag, same stream_va, CMD_PTR=0,
+             * BLOCKED_REASON=0(UNBLOCKED), every fault bank zero, and the FW
+             * consuming exactly 40 B of each 128 B block we write. That steady
+             * state is all a timer-published TraceTail can ever contain, because
+             * the 256 KB ring wraps many times before WinRM is reachable (~70 s),
+             * and it says nothing about the cause: it is the shape of an
+             * already-wedged GPU, not the transition into one.
+             *
+             * So dump the whole state ONCE, on the first timeout only, then latch
+             * the trap so the present worker snapshots the ring around it into
+             * TraceAtFirstTmo. What that snapshot buys is the part nobody has
+             * seen: the lines covering the ~1150 submits that SUCCEEDED right
+             * before this one, which is the only available comparison.
+             *
+             * ⚠ This is a WITNESS, not a fix - it changes no submit behaviour. */
+            if (InterlockedCompareExchange(&g_WinMaliTrapFirstTmo, 1, 0) == 0) {
+                WINMALI_WARN("CSF: WMFIRSTTMO1 FIRST TIMEOUT OF BOOT after %d ok submits: "
+                             "seq want=%llu got=%llu callee=%s as=%u pid=%p "
+                             "stream_va=0x%llx size=%u insert=%llu extract=%llu "
+                             "cmdptr=0x%llx blocked=%u wait=0x%08x sb=0x%08x "
+                             "csfault=0x%08x csfatal=0x%08x faultinfo=0x%llx "
+                             "asfault=0x%08x@0x%08x%08x mcufault=0x%08x gpufault=0x%08x "
+                             "|| ISR-LATCHED: faultCount=%d as=%d fst=0x%08x addr=0x%08x%08x",
+                             (int)g_WinMaliStatCsOkCount,
+                             jobSeq, sync->Seqno,
+                             calleeReturned ? "RETURNED" : "NO-RETURN",
+                             CsgAsSlot, PsGetCurrentProcessId(),
+                             (ULONGLONG)StreamGpuVa, StreamSizeBytes,
+                             (ULONGLONG)Fw->QRingIn->Insert,
+                             (ULONGLONG)Fw->QRingOut->Extract,
+                             (ULONGLONG)cmdPtr, blocked,
+                             Fw->Cs00Output->StatusWait,
+                             Fw->Cs00Output->StatusScoreboards,
+                             Fw->Cs00Output->Fault, Fw->Cs00Output->Fatal,
+                             (ULONGLONG)Fw->Cs00Output->FaultInfo,
+                             gfst, gfhi, gflo, mfst, gpfs,
+                             (int)InterlockedCompareExchange(&Adapter->FaultCount, 0, 0),
+                             (int)Adapter->FaultAs, (ULONG)Adapter->FaultFst,
+                             (ULONG)Adapter->FaultAddrHi, (ULONG)Adapter->FaultAddrLo);
+            }
+
             (VOID)InterlockedIncrement(&g_WinMaliStatCsTimeoutCount);
             (VOID)InterlockedExchange(&g_WinMaliStatCsCmdPtrLo,
                                       (LONG)(ULONG)(Fw->Cs00Output->StatusCmdPtr & 0xFFFFFFFFull));

@@ -48,9 +48,28 @@ typedef struct _WINMALI_SYNCOBJ {
     KSPIN_LOCK          Lock;           /* protects TimelineValue */
     UINT64              TimelineValue;  /* monotonic; binary uses 0/1 */
     LONG                RefCount;
-    /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this handle;
-       freed by DestroyDevice rundown if the UMD never destroys it. */
+    /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this handle.
+       ⚠ NO LONGER A LIFETIME OWNER - see OwnerProcessId. Set to NULL when the
+       creating device dies while the owning process is still alive. */
     PVOID               OwnerDevice;
+    /* ⛔★★★★★ THE LIFETIME OWNER IS THE **PROCESS**, NOT THE DEVICE.
+     *
+     * MEASURED 2026-08-18: dwm's every submit died err=-2 and dwm stopped
+     * compositing for the whole boot - frozen desktop, no taskbar, dead input,
+     * StatSrcChg=0 across 11,521 scans.
+     *   WMSIGENOENT1 SyncObjSignal: handle=1 NOT IN TABLE
+     *       (live count=38, point=10, caller pid=dwm)
+     *   GroupSubmit: ... the CS RAN but the SIGNAL sync ops failed err=-2
+     * `point=10` proves dwm had been advancing that timeline successfully, so
+     * the object was destroyed underneath a LIVE user, not malformed. Cause:
+     * WinMaliSyncObjRundownOwner bulk-freeing a dying DEVICE's syncobjs -
+     *   SyncObjRundown: handle=41/42/43 (owner device died without SyncObjDestroy)
+     *
+     * DRM/panfrost semantics - which this UMD is written against - scope sync
+     * objects per FILE, i.e. per PROCESS. A process legitimately outlives any
+     * single D3D device and keeps using its handles. Per-device lifetime was
+     * the model mismatch. */
+    HANDLE              OwnerProcessId;
 } WINMALI_SYNCOBJ, *PWINMALI_SYNCOBJ;
 
 typedef struct _WINMALI_SYNCOBJ_TABLE {

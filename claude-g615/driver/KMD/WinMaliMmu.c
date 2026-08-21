@@ -417,6 +417,30 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
            segment is safe everywhere downstream. */
         PVOID  dmaVa = NULL;
         SIZE_T dmaBytes;
+        /* ⛔★★★★★ THE FLOOR MUST BE BIGGER THAN ONE FRAME.
+         *
+         * The old floor was 16 MiB. A panel frame is 2944*1840*4 =
+         * 21,667,840 B (~20.7 MiB). So this loop could SUCCEED at 16 MiB and
+         * hand back a segment too small to hold a single frame - after which
+         * the present worker's range check
+         *     if (offset >= DmaSegmentBytes || bytes > DmaSegmentBytes - offset)
+         * correctly refuses EVERY blit, forever, silently. MEASURED
+         * 2026-08-20: LiveScanoutBlts=0 with StatScanoutSkipped=36,360 and the
+         * panel frozen on the firmware image, while the driver reported
+         * problem=0 and dxgk was happily latching flips.
+         *
+         * ⛔ TRIED 32 MiB (the smallest power-of-two that fits a frame) AND THE
+         * ALLOCATION FAILED OUTRIGHT -> StartDevice returned
+         * STATUS_INSUFFICIENT_RESOURCES -> device Code 37, driver does not load
+         * at all. So on this machine, in its current memory state, 16 MiB is all
+         * that is available and a frame CANNOT fit. Reverted to 16 so the driver
+         * at least starts; the real fix is either a cold power cycle (contiguous
+         * memory is fragmented after repeated hangs) or reserving this block
+         * early/at boot rather than opportunistically.
+         * ⇒ StatDmaSegBytes now PUBLISHES what was actually obtained, so
+         * "blts=0, skipped=everything" is never silent again.
+         * ★ AN OPPORTUNISTIC ALLOCATION NEEDS A FLOOR SET BY WHAT THE CALLER
+         *   ACTUALLY NEEDS, NOT BY WHAT SEEMED SMALL AT THE TIME. */
         for (dmaBytes = WINMALI_DMA_SEGMENT_BYTES;
              dmaBytes >= (16UL * 1024UL * 1024UL);
              dmaBytes >>= 1)
@@ -442,6 +466,10 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
         Adapter->DmaSegmentVa    = dmaVa;
         Adapter->DmaSegmentPhys  = MmGetPhysicalAddress(dmaVa);
         Adapter->DmaSegmentBytes = dmaBytes;
+        /* ★ PUBLISH IT. This value silently decides whether the panel can ever
+           be written, and nothing exposed it. */
+        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatDmaSegBytes",
+                                      (ULONG)dmaBytes);
         RtlFillMemory(dmaVa, dmaBytes, 0);
         WINMALI_TRACE(
             "DMA segment: va=%p phys=0x%llx bytes=%u (cached, seg id 1 backing)",

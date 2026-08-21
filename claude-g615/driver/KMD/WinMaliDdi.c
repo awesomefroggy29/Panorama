@@ -1334,6 +1334,7 @@ LONG g_WinMaliStatUvSrcPages        = 0;
 LONG g_WinMaliStatUvSrcNCand        = 0;
 LONG g_WinMaliUvCandBo[4]           = { 0 };
 LONG g_WinMaliUvCandPid[4]          = { 0 };
+LONG g_WinMaliUvCandBox[4]          = { 0 };
 LONG g_WinMaliUvCandHits[4]         = { 0 };
 LONG g_WinMaliUvCandNonBlack[4]     = { 0 };
 LONG g_WinMaliUvCandChg[4]          = { 0 };
@@ -1341,6 +1342,15 @@ LONG g_WinMaliUvCandScans[4]        = { 0 };
 LONG g_WinMaliStatUvSrcUniform      = 0;
 LONG g_WinMaliStatUvSrcChg          = 0;
 LONG g_WinMaliStatUvSrcEvict        = 0;
+LONG g_WinMaliStatUvRevokeBig       = 0;
+LONG g_WinMaliTrapRevokeBig         = 0;
+LONG g_WinMaliStatBoDedup           = 0;
+LONG g_WinMaliStatUvPubBig          = 0;
+LONG g_WinMaliStatBoDeref           = 0;
+LONG g_WinMaliStatUvRevokeAny       = 0;
+LONG g_WinMaliStatUvSrcEvictBig     = 0;
+LONG g_WinMaliStatUvSrcEvictBusy    = 0;
+LONG g_WinMaliStatUvSrcDropSmall    = 0;
 /* Why GroupSubmit rejected a frame. NoGroup = a handle this adapter instance
    never issued (the stale-handle-across-restart class); FatalGroup = the group
    exists but the GPU already faulted it. Two very different bugs. */
@@ -1364,6 +1374,35 @@ LONG g_WinMaliStatSyncBadHandle     = 0;
 LONG g_WinMaliStatSyncBadFlags      = 0;
 LONG g_WinMaliStatSyncWaitTimeout   = 0;
 LONG g_WinMaliStatSubmitSignalFail  = 0;
+/* ⛔ TRIGGER-ARMED RING SNAPSHOT. 0 = idle, 1 = ARMED (a signal ENOENT just
+   happened), 2 = already captured. The failure burst is ~57 s after boot and
+   WinRM only arrives ~70 s in, so a TIMER-published tail always misses it - even
+   at 192 KB. The escape sets this to 1 the moment the first SIGNAL fails; the
+   present worker snapshots the ring into its own registry value on the next tick
+   (~2 s) and latches to 2 so the evidence is never overwritten. */
+LONG g_WinMaliTrapSignalFail       = 0;
+
+/* Same triggered-snapshot mechanism, third trigger: the FIRST CSF job wait
+   timeout of the boot. Every timeout after the first is the STEADY STATE of an
+   already-wedged GPU (want climbs, got frozen, same tag, same stream VA), and
+   that is all a timer-published TraceTail can ever show - the 256 KB ring wraps
+   long before WinRM is reachable. What has never been captured is what the ring
+   held JUST BEFORE the first one, which is where the cause has to be. Latched
+   here, snapshotted by the present worker on the next tick. */
+LONG g_WinMaliTrapFirstTmo         = 0;
+
+/* TILER_OOM servicing. StatTilerOom counts requests we answered; StatTilerOomFail
+   counts those we could not satisfy (chunk cap, allocation failure, no heap on
+   the VM) and had to ack with a NULL chunk. Before the fix both were structurally
+   impossible to observe: the request was never read, so a heap exhaustion looked
+   exactly like a healthy idle GPU with a frozen CsOk. */
+LONG g_WinMaliStatTilerOomCount    = 0;
+LONG g_WinMaliStatTilerOomFail     = 0;
+/* Table rebuild census. Three theories assumed the per-adapter syncobj table is
+   rebuilt mid-boot; nobody ever counted. Published so the answer is a number,
+   not a ring-capture race. */
+LONG g_WinMaliStatSyncTableInits    = 0;
+LONG g_WinMaliStatSyncTableTeardowns = 0;
 LONG g_WinMaliStatSignalErr         = 0;
 LONG g_WinMaliStatSignalBadHandle   = 0;
 LONG g_WinMaliFlipAllocW            = 0;
@@ -1413,6 +1452,7 @@ LONG g_WinMaliStatPowerStop        = 0;
    size-qualifying surface is often a partial-update strip. */
 LONG g_WinMaliStatUvSrcCoverage    = 0;
 LONG g_WinMaliStatUvSrcMaxCov      = 0;
+LONG g_WinMaliStatUvSrcMaxChg      = 0;
 /* Denominator for MaxCov: candidates that passed the size gate this tick.
    MaxCov=0 with Qual=0 means 'nothing qualified', with Qual>0 means 'all blank'
    - opposite problems that read identically without this. */
@@ -1461,6 +1501,42 @@ LONG g_WinMaliUvCandPages[4]        = { 0 };
    pointer under Interlocked access - one adapter, and the worker only ever
    reads it. */
 PVOID g_WinMaliFlipSourceAlloc = NULL;
+
+/* ⛔★★★★★ EVERY EXIT FROM DxgkDdiPresent MUST EMIT A NON-EMPTY DMA BUFFER.
+ *
+ * MEASURED 2026-08-18 from a FULL-BOOT DxgKrnl ETW capture, event id=494:
+ *   x25  "DMABufferLength > 0 || GetVidSchExport()->VidSchIsTDRPending(...)"
+ *   x25  "... || static_cast<BYTE*>(pPresentDdiArg->pDmaBuffer) >
+ *          static_cast<BYTE*>(pDmaBuffer)"
+ * against StatPresentCalls = 25. A 25:25 match - EVERY call to this DDI fired
+ * both asserts, because all four early-outs below returned STATUS_SUCCESS
+ * without ever touching pPresent->pDmaBuffer. Only the Blt tail emitted one.
+ *
+ * THE CONTRACT: the driver translates the present into GPU commands in
+ * pDmaBuffer and leaves the pointer PAST the last byte written; dxgk derives
+ * DmaBufferLength from that delta and asserts it is non-zero. Our real payload
+ * rides in pDmaBufferPrivateData (WINMALI_BLT_DESC, consumed by SubmitCommand),
+ * so the DMA buffer only has to be non-empty - but it MUST be non-empty.
+ *
+ * ⚠ "Too small" is NOT skip-and-succeed - that shape is how this bug was born.
+ * STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER makes dxgk re-issue with more room,
+ * and is already the documented contract elsewhere in this driver
+ * (see WinMaliPaging.c:16).
+ */
+static NTSTATUS
+WinMaliPresentEmitDmaToken_(_Inout_ DXGKARG_PRESENT* pPresent)
+{
+    if (pPresent->pDmaBuffer == NULL || pPresent->DmaSize < sizeof(ULONG)) {
+        /* Marker string doubles as the DEPLOY PROOF: grep the packaged .sys
+           for WMDMATOK1. A hash cannot serve - signing changes it. */
+        WINMALI_WARN("Present: WMDMATOK1 dma buffer too small (DmaSize=%u) "
+                     "- returning INSUFFICIENT_DMA_BUFFER", pPresent->DmaSize);
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    }
+    *(ULONG UNALIGNED*)pPresent->pDmaBuffer = WINMALI_BLT_DESC_MAGIC;
+    pPresent->pDmaBuffer = (PVOID)((PUCHAR)pPresent->pDmaBuffer + sizeof(ULONG));
+    return STATUS_SUCCESS;
+}
 
 _Function_class_(DXGKDDI_PRESENT)
 NTSTATUS
@@ -1554,13 +1630,13 @@ WinMaliKmdPresent(
             if (fsrc != NULL && fsrc->Magic == WINMALI_KMD_ALLOC_MAGIC) {
                 (VOID)InterlockedExchangePointer(&g_WinMaliFlipSourceAlloc, fsrc);
                 (VOID)InterlockedIncrement(&g_WinMaliStatPresentFlips);
-                return STATUS_SUCCESS;
+                return WinMaliPresentEmitDmaToken_(pPresent);
             }
         }
 
         /* Nothing we can (or need to) do; complete so the swap chain proceeds. */
         (VOID)InterlockedIncrement(&g_WinMaliStatPresentNotBlt);
-        return STATUS_SUCCESS;
+        return WinMaliPresentEmitDmaToken_(pPresent);
     }
 
     /* ⛔★★★★★★ THIS IS THE DOCUMENTED CONTRACT. DO NOT "FIX" IT AGAIN.
@@ -1683,7 +1759,7 @@ WinMaliKmdPresent(
                     (VOID)InterlockedExchangePointer(&g_WinMaliFlipSourceAlloc,
                                                      fsrc);
                     (VOID)InterlockedIncrement(&g_WinMaliStatPresentPrivHits);
-                    return STATUS_SUCCESS;
+                    return WinMaliPresentEmitDmaToken_(pPresent);
                 }
             }
         }
@@ -1691,7 +1767,7 @@ WinMaliKmdPresent(
         /* THE suspected black-screen path: a NULL cookie here means
            OpenAllocation never bound this surface to one of ours. */
         (VOID)InterlockedIncrement(&g_WinMaliStatPresentNullCookie);
-        return STATUS_SUCCESS;
+        return WinMaliPresentEmitDmaToken_(pPresent);
     }
 
     (VOID)InterlockedIncrement(&g_WinMaliStatPresentBlts);
@@ -1769,11 +1845,7 @@ WinMaliKmdPresent(
 
     /* Consume a DMA-buffer token so dxgk still routes this through the submit
        path (fence/complete); the copy above already happened synchronously. */
-    if (pPresent->pDmaBuffer != NULL && pPresent->DmaSize >= sizeof(ULONG)) {
-        *(ULONG UNALIGNED*)pPresent->pDmaBuffer = WINMALI_BLT_DESC_MAGIC;
-        pPresent->pDmaBuffer = (PVOID)((PUCHAR)pPresent->pDmaBuffer + sizeof(ULONG));
-    }
-    return STATUS_SUCCESS;
+    return WinMaliPresentEmitDmaToken_(pPresent);
 }
 
 /* ------------------------------------------------------------------------ */

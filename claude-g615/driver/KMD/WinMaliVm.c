@@ -249,6 +249,36 @@ WinMaliVmPut(_In_ PWINMALI_VM Vm)
     }
 }
 
+/* Find the VM bound to MMU address space `AsSlot`. Same locking and refcount
+   contract as WinMaliVmGet.
+
+   ★ Why this exists: a firmware TILER_OOM request identifies the stalled
+   command stream only by the CSG's address-space slot, but the tiler heap it
+   wants grown is per-VM state. Walking the table is fine here - the list has at
+   most WINMALI_AS_SLOT_MAX live entries and this runs once per OOM event, not
+   per submit. */
+PWINMALI_VM
+WinMaliVmGetByAsSlot(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG AsSlot)
+{
+    KIRQL oldIrql;
+    PLIST_ENTRY entry;
+    PWINMALI_VM found = NULL;
+
+    KeAcquireSpinLock(&Adapter->VmTable.Lock, &oldIrql);
+    for (entry = Adapter->VmTable.Head.Flink;
+         entry != &Adapter->VmTable.Head;
+         entry = entry->Flink) {
+        PWINMALI_VM vm = CONTAINING_RECORD(entry, WINMALI_VM, Link);
+        if (vm->PtInitialized && vm->Pt.AsSlot == AsSlot) {
+            InterlockedIncrement(&vm->RefCount);
+            found = vm;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->VmTable.Lock, oldIrql);
+    return found;
+}
+
 int
 WinMaliVmGetState(_In_ PWINMALI_ADAPTER Adapter,
                   _In_ ULONG Id,

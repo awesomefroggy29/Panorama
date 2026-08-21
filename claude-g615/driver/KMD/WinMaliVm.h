@@ -53,6 +53,25 @@ typedef struct _WINMALI_VM {
        dies without VmDestroy must not leak the AS slot (there are only
        8; leaking 6 bricks VmCreate adapter-wide with -ENOMEM). */
     PVOID                   OwnerDevice;
+    /* ---- Tiler heap state, for servicing firmware TILER_OOM ---------------
+       MEASURED 2026-08-20 on a live wedge: the FW raises CS_ACK bit 26
+       (TILER_OOM) when the tiler heap runs out of chunks, then PARKS the
+       command stream until the host links in a new chunk and acknowledges.
+       We never did - the heap was created once with a fixed chunk count and
+       had NO grow path at all - so the first exhaustion wedged the GPU
+       permanently:  CsAck=0x04000011 (bit26 set) vs CsReq=0x00000511 (clear),
+       CsOk frozen, CsTimeouts climbing, and EVERY fault bank zero because
+       TILER_OOM is a REQUEST, not a fault.
+       Recorded at TilerHeapCreate so WinMaliTilerHeapGrow can extend the
+       chunk list on demand. HeapFirstChunkVa is the newest chunk, i.e. the
+       head of the panthor-style newest->oldest list. */
+    UINT64                  HeapCtxVa;
+    ULONG                   HeapCtxHandle;   /* BO backing the 32-byte ctx descriptor */
+    UINT64                  HeapFirstChunkVa;
+    ULONG                   HeapChunkSize;
+    ULONG                   HeapChunkCount;
+    ULONG                   HeapMaxChunks;
+    PVOID                   HeapOwnerDevice;
 } WINMALI_VM, *PWINMALI_VM;
 
 typedef struct _WINMALI_VM_TABLE {
@@ -93,3 +112,9 @@ int WinMaliVmGetState(_In_ PWINMALI_ADAPTER Adapter,
 PWINMALI_VM WinMaliVmGet(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG Id);
 
 VOID WinMaliVmPut(_In_ PWINMALI_VM Vm);
+
+/* Find the VM currently bound to MMU address space `AsSlot`, refcounted exactly
+   like WinMaliVmGet (release with WinMaliVmPut). Servicing a TILER_OOM request
+   needs this: the request arrives with only the CSG's AS slot to identify which
+   heap the firmware is asking us to grow. */
+PWINMALI_VM WinMaliVmGetByAsSlot(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG AsSlot);
