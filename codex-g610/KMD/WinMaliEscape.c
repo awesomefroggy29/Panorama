@@ -592,6 +592,20 @@ WinMaliEscapeSyncObjSignal_(_In_    PWINMALI_ADAPTER       adapter,
 }
 
 static int
+WinMaliEscapeSyncObjTransfer_(_In_    PWINMALI_ADAPTER       adapter,
+                              _Inout_ WINMALI_ESCAPE_HEADER* hdr,
+                              _In_    const DXGKARG_ESCAPE*  pEscape)
+{
+    WINMALI_SYNC_OBJ_TRANSFER* args =
+        (WINMALI_SYNC_OBJ_TRANSFER*)WinMaliEscapeAt_(
+            pEscape, sizeof(*hdr), sizeof(*args));
+    if (args == NULL)
+        return WMERR_EINVAL;
+    return WinMaliSyncObjTransfer(adapter, args->DstHandle, args->DstPoint,
+                                  args->SrcHandle, args->SrcPoint);
+}
+
+static int
 WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
                        _Inout_ WINMALI_ESCAPE_HEADER* hdr,
                        _In_    const DXGKARG_ESCAPE*  pEscape)
@@ -1531,6 +1545,9 @@ WinMaliKmdEscape(
             : WMERR_EINVAL;
         break;
     }
+    case WinMaliEscapeOp_SyncObjTransfer:
+        hdr->Status = WinMaliEscapeSyncObjTransfer_(adapter, hdr, pEscape);
+        break;
     case WinMaliEscapeOp_SyncObjWait:
         hdr->Status = WinMaliEscapeSyncObjWait_(adapter, hdr, pEscape);
         break;

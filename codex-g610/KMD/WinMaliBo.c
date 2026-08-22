@@ -417,25 +417,58 @@ WinMaliBoFlushVm(_Inout_ PWINMALI_ADAPTER Adapter,
                  _In_ ULONG VmId,
                  _In_ BOOLEAN Clean)
 {
-    KIRQL       oldIrql;
-    PLIST_ENTRY entry;
+    enum { WINMALI_FLUSH_BATCH = 64 };
+    PWINMALI_BO refs[WINMALI_FLUSH_BATCH];
+    ULONG       lastHandle = 0;
+    ULONG       totalFlushed = 0;
+    ULONGLONG   start100ns = KeQueryInterruptTime();
     /* KeFlushIoBuffers ReadOperation: TRUE = device->memory (invalidate CPU
        cache so CPU sees GPU writes); FALSE = memory->device (clean CPU cache
        to DRAM so GPU sees CPU writes). MDL-based, so it works regardless of
        the (non-cacheable) GPU mapping attribute - alias-safe. */
     BOOLEAN readOp = Clean ? FALSE : TRUE;
 
-    KeAcquireSpinLock(&Adapter->BoTable.Lock, &oldIrql);
-    for (entry = Adapter->BoTable.Head.Flink;
-         entry != &Adapter->BoTable.Head;
-         entry = entry->Flink) {
-        PWINMALI_BO bo = CONTAINING_RECORD(entry, WINMALI_BO, Link);
-        if (bo->Mdl != NULL &&
-            (bo->ExclusiveVmId == VmId || bo->ExclusiveVmId == 0)) {
-            KeFlushIoBuffers(bo->Mdl, readOp, TRUE);
+    /* Never run KeFlushIoBuffers while holding the global BO-table spinlock.
+       Large MDLs can take milliseconds to maintain; doing that at DISPATCH
+       level blocked allocation teardown, DPC fence publication, and other
+       processes. Snapshot referenced BOs in bounded batches, then perform
+       cache maintenance at the worker's original PASSIVE_LEVEL. Handles are
+       monotonic and list insertion is ordered, so lastHandle is a stable
+       cursor even when BOs are destroyed between batches. */
+    for (;;) {
+        KIRQL oldIrql;
+        PLIST_ENTRY entry;
+        ULONG count = 0;
+        ULONG i;
+
+        KeAcquireSpinLock(&Adapter->BoTable.Lock, &oldIrql);
+        for (entry = Adapter->BoTable.Head.Flink;
+             entry != &Adapter->BoTable.Head && count < WINMALI_FLUSH_BATCH;
+             entry = entry->Flink) {
+            PWINMALI_BO bo = CONTAINING_RECORD(entry, WINMALI_BO, Link);
+            if (bo->Handle <= lastHandle)
+                continue;
+            lastHandle = bo->Handle;
+            if (bo->Mdl != NULL &&
+                (bo->ExclusiveVmId == VmId || bo->ExclusiveVmId == 0)) {
+                InterlockedIncrement(&bo->RefCount);
+                refs[count++] = bo;
+            }
         }
+        KeReleaseSpinLock(&Adapter->BoTable.Lock, oldIrql);
+
+        for (i = 0; i < count; ++i) {
+            KeFlushIoBuffers(refs[i]->Mdl, readOp, TRUE);
+            WinMaliBoPut(refs[i]);
+        }
+        totalFlushed += count;
+        if (count < WINMALI_FLUSH_BATCH)
+            break;
     }
-    KeReleaseSpinLock(&Adapter->BoTable.Lock, oldIrql);
+
+    WINMALI_DIAG("CacheSync: vm=%u direction=%s bos=%u elapsed100ns=%llu",
+                 VmId, Clean ? "CPU->GPU" : "GPU->CPU", totalFlushed,
+                 (ULONGLONG)(KeQueryInterruptTime() - start100ns));
 }
 
 int

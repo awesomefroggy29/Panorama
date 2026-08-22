@@ -24,6 +24,19 @@
 #define WMERR_EIO         -5
 #define WMERR_ETIMEDOUT   -110
 
+struct _WINMALI_SYNC_TRANSFER {
+    LIST_ENTRY          SourceLink;
+    PWINMALI_SYNCOBJ    Destination; /* referenced until propagation */
+    UINT64              SourcePoint;
+    UINT64              DestinationPoint;
+    BOOLEAN             SourceFailed;
+};
+
+static VOID WinMaliSyncObjCompleteDirect_(_Inout_ PWINMALI_SYNCOBJ So,
+                                           _In_ UINT64 Point,
+                                           _In_ BOOLEAN Failed);
+static VOID WinMaliSyncObjCancelDependents_(_Inout_ PWINMALI_SYNCOBJ So);
+
 VOID
 WinMaliSyncObjTableInit(_Out_ PWINMALI_SYNCOBJ_TABLE Table)
 {
@@ -37,6 +50,7 @@ static VOID
 WinMaliSyncObjFree_(_Inout_ PWINMALI_SYNCOBJ So)
 {
     if (So != NULL) {
+        NT_ASSERT(IsListEmpty(&So->Dependents));
         So->Magic = 0;
         ExFreePoolWithTag(So, WINMALI_POOL_TAG);
     }
@@ -64,6 +78,8 @@ WinMaliSyncObjTableTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
     KeAcquireSpinLock(&Table->Lock, &oldIrql);
     while (!IsListEmpty(&Table->Head)) {
         entry = RemoveHeadList(&Table->Head);
+        InterlockedExchange(
+            &CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link)->Removed, 1);
         InsertTailList(&freeHead, entry);
     }
     Table->Count = 0;
@@ -71,7 +87,12 @@ WinMaliSyncObjTableTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
 
     while (!IsListEmpty(&freeHead)) {
         entry = RemoveHeadList(&freeHead);
-        WinMaliSyncObjPut_(CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link));
+        {
+            PWINMALI_SYNCOBJ so =
+                CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link);
+            WinMaliSyncObjCancelDependents_(so);
+            WinMaliSyncObjPut_(so);
+        }
     }
 }
 
@@ -100,6 +121,7 @@ WinMaliSyncObjCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     so->RefCount      = 1;
     so->OwnerDevice   = OwnerDevice;
     KeInitializeSpinLock(&so->Lock);
+    InitializeListHead(&so->Dependents);
     KeInitializeEvent(&so->Event, NotificationEvent,
                       (InitialState != 0) ? TRUE : FALSE);
 
@@ -130,6 +152,7 @@ WinMaliSyncObjTakeByHandle_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
         if (so->Handle == Handle) {
             RemoveEntryList(&so->Link);
             Adapter->SyncObjTable.Count--;
+            InterlockedExchange(&so->Removed, 1);
             found = so;
             break;
         }
@@ -208,6 +231,7 @@ WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
         if (so->OwnerDevice == OwnerDevice) {
             RemoveEntryList(&so->Link);
             Adapter->SyncObjTable.Count--;
+            InterlockedExchange(&so->Removed, 1);
             InsertTailList(&freeHead, &so->Link);
         }
     }
@@ -218,6 +242,7 @@ WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
                                                 WINMALI_SYNCOBJ, Link);
         WINMALI_TRACE("SyncObjRundown: handle=%u (owner device died without "
                       "SyncObjDestroy)", so->Handle);
+        WinMaliSyncObjCancelDependents_(so);
         WinMaliSyncObjPut_(so);
         ++freed;
     }
@@ -232,8 +257,88 @@ WinMaliSyncObjDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
         return WMERR_ENOENT;
     }
     WINMALI_TRACE("SyncObjDestroy: handle=%u", so->Handle);
+    WinMaliSyncObjCancelDependents_(so);
     WinMaliSyncObjPut_(so);
     return WMERR_OK;
+}
+
+static VOID
+WinMaliSyncObjCompleteDirect_(_Inout_ PWINMALI_SYNCOBJ So,
+                              _In_ UINT64 Point,
+                              _In_ BOOLEAN Failed)
+{
+    KIRQL oldIrql;
+    LIST_ENTRY ready;
+    PLIST_ENTRY entry, next;
+    UINT64 before;
+    UINT64 after;
+    BOOLEAN timeline;
+
+    InitializeListHead(&ready);
+    KeAcquireSpinLock(&So->Lock, &oldIrql);
+    timeline = So->IsTimeline;
+    before = timeline ? So->TimelineValue : So->BinaryCompletedValue;
+    if (timeline) {
+        if (Failed) {
+            if (Point > So->TimelineFailedValue)
+                So->TimelineFailedValue = Point;
+        } else if (Point > So->TimelineValue) {
+            So->TimelineValue = Point;
+        }
+    } else {
+        if (Point == 0) {
+            Point = So->BinarySubmittedValue;
+        }
+        if (Failed) {
+            if (Point > So->BinaryFailedValue)
+                So->BinaryFailedValue = Point;
+        } else if (Point > So->BinaryCompletedValue) {
+            So->BinaryCompletedValue = Point;
+        }
+    }
+
+    after = timeline ? So->TimelineValue : So->BinaryCompletedValue;
+    for (entry = So->Dependents.Flink;
+         entry != &So->Dependents;
+         entry = next) {
+        PWINMALI_SYNC_TRANSFER transfer =
+            CONTAINING_RECORD(entry, WINMALI_SYNC_TRANSFER, SourceLink);
+        BOOLEAN reached;
+        BOOLEAN sourceFailed;
+        next = entry->Flink;
+        if (timeline) {
+            reached = So->TimelineValue >= transfer->SourcePoint;
+            sourceFailed = So->TimelineFailedValue >= transfer->SourcePoint &&
+                           transfer->SourcePoint != 0;
+        } else {
+            reached = So->BinaryCompletedValue >= transfer->SourcePoint;
+            sourceFailed = So->BinaryFailedValue >= transfer->SourcePoint;
+        }
+        if (reached || sourceFailed) {
+            RemoveEntryList(entry);
+            /* Preserve whether this source point failed for the unlocked
+               propagation pass. */
+            transfer->SourceFailed = sourceFailed;
+            InsertTailList(&ready, entry);
+        }
+    }
+    KeReleaseSpinLock(&So->Lock, oldIrql);
+
+    KeSetEvent(&So->Event, IO_NO_INCREMENT, FALSE);
+    WINMALI_DIAG("SyncObj%s: handle=%u point=%llu timeline=%u value=%llu->%llu",
+                 Failed ? "Fail" : "Signal", So->Handle,
+                 (unsigned long long)Point, timeline,
+                 (unsigned long long)before, (unsigned long long)after);
+
+    while (!IsListEmpty(&ready)) {
+        PWINMALI_SYNC_TRANSFER transfer = CONTAINING_RECORD(
+            RemoveHeadList(&ready), WINMALI_SYNC_TRANSFER, SourceLink);
+        WinMaliSyncObjCompleteDirect_(transfer->Destination,
+                                      transfer->DestinationPoint,
+                                      transfer->SourceFailed);
+        WinMaliSyncObjPut_(transfer->Destination);
+        ExFreePoolWithTag(transfer, WINMALI_POOL_TAG);
+    }
 }
 
 int
@@ -242,29 +347,12 @@ WinMaliSyncObjSignal(_Inout_ PWINMALI_ADAPTER Adapter,
                      _In_ UINT64 Point)
 {
     PWINMALI_SYNCOBJ so = WinMaliSyncObjGet_(Adapter, Handle);
-    KIRQL oldIrql;
     if (so == NULL) {
+        WINMALI_ERROR("SyncObjSignal: handle=%u point=%llu -> ENOENT",
+                      Handle, (unsigned long long)Point);
         return WMERR_ENOENT;
     }
-    KeAcquireSpinLock(&so->Lock, &oldIrql);
-    if (so->IsTimeline) {
-        if (Point > so->TimelineValue) {
-            so->TimelineValue = Point;
-        }
-    } else {
-        /* Point==0 is an explicit userspace signal. A queued GPU signal has
-           the generation assigned by WinMaliSyncObjArmSignal. */
-        if (Point == 0) {
-            so->BinaryCompletedValue = so->BinarySubmittedValue;
-        } else if (Point > so->BinaryCompletedValue) {
-            so->BinaryCompletedValue = Point;
-        }
-    }
-    KeReleaseSpinLock(&so->Lock, oldIrql);
-    /* PulseEvent so any waiters re-check; for binary that's just "signal".
-       NotificationEvent SetEvent semantics make it stay signalled until
-       reset; we use SetEvent + the waiter re-checks on its own. */
-    KeSetEvent(&so->Event, IO_NO_INCREMENT, FALSE);
+    WinMaliSyncObjCompleteDirect_(so, Point, FALSE);
     WinMaliSyncObjPut_(so);
     return WMERR_OK;
 }
@@ -275,28 +363,9 @@ WinMaliSyncObjFail(_Inout_ PWINMALI_ADAPTER Adapter,
                    _In_ UINT64 Point)
 {
     PWINMALI_SYNCOBJ so = WinMaliSyncObjGet_(Adapter, Handle);
-    KIRQL oldIrql;
-
-    if (so == NULL) {
+    if (so == NULL)
         return WMERR_ENOENT;
-    }
-    KeAcquireSpinLock(&so->Lock, &oldIrql);
-    if (so->IsTimeline) {
-        if (Point > so->TimelineFailedValue) {
-            so->TimelineFailedValue = Point;
-        }
-    } else {
-        if (Point == 0) {
-            Point = so->BinarySubmittedValue;
-        }
-        if (Point > so->BinaryFailedValue) {
-            so->BinaryFailedValue = Point;
-        }
-    }
-    KeReleaseSpinLock(&so->Lock, oldIrql);
-    KeSetEvent(&so->Event, IO_NO_INCREMENT, FALSE);
-    WINMALI_ERROR("SyncObjFail: handle=%u point=%llu timeline=%u",
-                  Handle, (unsigned long long)Point, so->IsTimeline);
+    WinMaliSyncObjCompleteDirect_(so, Point, TRUE);
     WinMaliSyncObjPut_(so);
     return WMERR_OK;
 }
@@ -332,6 +401,123 @@ WinMaliSyncObjArmSignal(_Inout_ PWINMALI_ADAPTER Adapter,
     WINMALI_TRACE("SyncObjArm: handle=%u point=%llu timeline=%u",
                   Handle, (unsigned long long)*InOutPoint, so->IsTimeline);
     WinMaliSyncObjPut_(so);
+    return WMERR_OK;
+}
+
+static VOID
+WinMaliSyncObjCancelDependents_(_Inout_ PWINMALI_SYNCOBJ So)
+{
+    KIRQL oldIrql;
+    LIST_ENTRY cancelled;
+
+    InitializeListHead(&cancelled);
+    KeAcquireSpinLock(&So->Lock, &oldIrql);
+    while (!IsListEmpty(&So->Dependents)) {
+        PLIST_ENTRY entry = RemoveHeadList(&So->Dependents);
+        InsertTailList(&cancelled, entry);
+    }
+    KeReleaseSpinLock(&So->Lock, oldIrql);
+
+    while (!IsListEmpty(&cancelled)) {
+        PWINMALI_SYNC_TRANSFER transfer = CONTAINING_RECORD(
+            RemoveHeadList(&cancelled), WINMALI_SYNC_TRANSFER, SourceLink);
+        WinMaliSyncObjCompleteDirect_(transfer->Destination,
+                                      transfer->DestinationPoint, TRUE);
+        WinMaliSyncObjPut_(transfer->Destination);
+        ExFreePoolWithTag(transfer, WINMALI_POOL_TAG);
+    }
+}
+
+int
+WinMaliSyncObjTransfer(_Inout_ PWINMALI_ADAPTER Adapter,
+                       _In_ ULONG DstHandle,
+                       _In_ UINT64 DstPoint,
+                       _In_ ULONG SrcHandle,
+                       _In_ UINT64 SrcPoint)
+{
+    PWINMALI_SYNCOBJ source;
+    PWINMALI_SYNCOBJ destination;
+    PWINMALI_SYNC_TRANSFER transfer;
+    KIRQL oldIrql;
+    BOOLEAN reached;
+    BOOLEAN failed;
+
+    if (Adapter == NULL || DstHandle == 0 || SrcHandle == 0 ||
+        DstHandle == SrcHandle) {
+        return WMERR_EINVAL;
+    }
+
+    source = WinMaliSyncObjGet_(Adapter, SrcHandle);
+    if (source == NULL)
+        return WMERR_ENOENT;
+    destination = WinMaliSyncObjGet_(Adapter, DstHandle);
+    if (destination == NULL) {
+        WinMaliSyncObjPut_(source);
+        return WMERR_ENOENT;
+    }
+
+    transfer = (PWINMALI_SYNC_TRANSFER)ExAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(*transfer), WINMALI_POOL_TAG);
+    if (transfer == NULL) {
+        WinMaliSyncObjPut_(destination);
+        WinMaliSyncObjPut_(source);
+        return WMERR_ENOMEM;
+    }
+    RtlZeroMemory(transfer, sizeof(*transfer));
+
+    /* Replacing a binary destination fence creates a new generation. A
+       timeline destination retains the caller-selected destination point. */
+    KeAcquireSpinLock(&destination->Lock, &oldIrql);
+    if (InterlockedCompareExchange(&destination->Removed, 0, 0) != 0) {
+        KeReleaseSpinLock(&destination->Lock, oldIrql);
+        ExFreePoolWithTag(transfer, WINMALI_POOL_TAG);
+        WinMaliSyncObjPut_(destination);
+        WinMaliSyncObjPut_(source);
+        return WMERR_ENOENT;
+    }
+    if (!destination->IsTimeline) {
+        ++destination->BinarySubmittedValue;
+        if (destination->BinarySubmittedValue == 0)
+            ++destination->BinarySubmittedValue;
+        DstPoint = destination->BinarySubmittedValue;
+        KeClearEvent(&destination->Event);
+    }
+    KeReleaseSpinLock(&destination->Lock, oldIrql);
+
+    transfer->Destination = destination; /* transfer owns this reference */
+    transfer->DestinationPoint = DstPoint;
+
+    KeAcquireSpinLock(&source->Lock, &oldIrql);
+    if (InterlockedCompareExchange(&source->Removed, 0, 0) != 0) {
+        reached = FALSE;
+        failed = TRUE;
+    } else if (!source->IsTimeline && SrcPoint == 0) {
+        SrcPoint = source->BinarySubmittedValue;
+        reached = source->BinaryCompletedValue >= SrcPoint;
+        failed = source->BinaryFailedValue >= SrcPoint;
+    } else if (source->IsTimeline) {
+        reached = source->TimelineValue >= SrcPoint;
+        failed = source->TimelineFailedValue >= SrcPoint && SrcPoint != 0;
+    } else {
+        reached = source->BinaryCompletedValue >= SrcPoint;
+        failed = source->BinaryFailedValue >= SrcPoint;
+    }
+    transfer->SourcePoint = SrcPoint;
+    if (!reached && !failed)
+        InsertTailList(&source->Dependents, &transfer->SourceLink);
+    KeReleaseSpinLock(&source->Lock, oldIrql);
+
+    WINMALI_DIAG("SyncObjTransfer: src=%u/%llu dst=%u/%llu pending=%u failed=%u",
+                 SrcHandle, (unsigned long long)SrcPoint,
+                 DstHandle, (unsigned long long)DstPoint,
+                 (!reached && !failed), failed);
+
+    if (reached || failed) {
+        WinMaliSyncObjCompleteDirect_(destination, DstPoint, failed);
+        WinMaliSyncObjPut_(destination);
+        ExFreePoolWithTag(transfer, WINMALI_POOL_TAG);
+    }
+    WinMaliSyncObjPut_(source);
     return WMERR_OK;
 }
 
@@ -371,13 +557,18 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
     int err = WMERR_OK;
 
     if (Count == 0 || Handles == NULL) {
+        WINMALI_ERROR("SyncObjWait: invalid args count=%u handles=%p", Count, Handles);
         return WMERR_EINVAL;
     }
+    WINMALI_DIAG("SyncObjWait: ENTER count=%u waitAll=%u timeoutNs=%lld handle0=%u point0=%llu",
+                 Count, WaitAll, (long long)TimeoutNs, Handles[0],
+                 (unsigned long long)(Points != NULL ? Points[0] : 0));
     pTimeout = WinMaliSyncObjMakeTimeout_(&timeout, TimeoutNs);
 
     if (Count == 1) {
         singleSo = WinMaliSyncObjGet_(Adapter, Handles[0]);
         if (singleSo == NULL) {
+            WINMALI_ERROR("SyncObjWait: EXIT handle=%u -> ENOENT", Handles[0]);
             return WMERR_ENOENT;
         }
 
@@ -485,6 +676,23 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                 }
             }
         }
+        {
+            KIRQL oldIrql;
+            UINT64 current;
+            UINT64 failed;
+            BOOLEAN timeline = singleSo->IsTimeline;
+            KeAcquireSpinLock(&singleSo->Lock, &oldIrql);
+            current = timeline ? singleSo->TimelineValue
+                               : singleSo->BinaryCompletedValue;
+            failed = timeline ? singleSo->TimelineFailedValue
+                              : singleSo->BinaryFailedValue;
+            KeReleaseSpinLock(&singleSo->Lock, oldIrql);
+            WINMALI_DIAG("SyncObjWait: EXIT handle=%u point=%llu timeline=%u current=%llu failed=%llu err=%d",
+                         Handles[0],
+                         (unsigned long long)(Points != NULL ? Points[0] : 0),
+                         timeline, (unsigned long long)current,
+                         (unsigned long long)failed, err);
+        }
         WinMaliSyncObjPut_(singleSo);
         return err;
     }
@@ -496,6 +704,8 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
         PWINMALI_SYNCOBJ refs[MAXIMUM_WAIT_OBJECTS];
         ULONG i;
         if (Count > MAXIMUM_WAIT_OBJECTS) {
+            WINMALI_ERROR("SyncObjWait: EXIT count=%u exceeds max=%u",
+                          Count, MAXIMUM_WAIT_OBJECTS);
             return WMERR_EINVAL;
         }
         for (i = 0; i < Count; ++i) {
@@ -504,6 +714,8 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                 while (i > 0) {
                     WinMaliSyncObjPut_(refs[--i]);
                 }
+                WINMALI_ERROR("SyncObjWait: EXIT missing handle[%u]=%u",
+                              i, Handles[i]);
                 return WMERR_ENOENT;
             }
             if (refs[i]->IsTimeline) {
@@ -514,6 +726,7 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
                         break;
                     }
                 }
+                WINMALI_ERROR("SyncObjWait: EXIT multi-handle timeline unsupported");
                 return WMERR_EINVAL;
             }
             objects[i] = &refs[i]->Event;
@@ -526,11 +739,16 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
             WinMaliSyncObjPut_(refs[i]);
         }
         if (st == STATUS_TIMEOUT) {
+            WINMALI_DIAG("SyncObjWait: EXIT multi count=%u err=%d",
+                         Count, WMERR_ETIMEDOUT);
             return WMERR_ETIMEDOUT;
         }
         if (!NT_SUCCESS(st)) {
+            WINMALI_ERROR("SyncObjWait: EXIT multi count=%u waitStatus=0x%08x err=%d",
+                          Count, st, WMERR_EINVAL);
             return WMERR_EINVAL;
         }
+        WINMALI_DIAG("SyncObjWait: EXIT multi count=%u err=0", Count);
         return WMERR_OK;
     }
 }

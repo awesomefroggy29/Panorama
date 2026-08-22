@@ -18,9 +18,14 @@
 #include "WinMaliVm.h"
 #include "WinMaliGroup.h"
 
-/* Driver-wide trace shim. WPP isn't wired yet; route everything through
-   DbgPrint so the kdnet/COM trace shows what's happening. */
+/* Driver-wide trace shim. Focused builds remove routine success chatter while
+   retaining warnings/errors and WINMALI_DIAG state-transition breadcrumbs. */
+#if defined(WINMALI_LOG_FOCUSED)
+#define WINMALI_TRACE(fmt, ...) ((void)0)
+#else
 #define WINMALI_TRACE(fmt, ...) DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#endif
+#define WINMALI_DIAG(fmt, ...)  DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
 #define WINMALI_WARN(fmt, ...)  DbgPrint("[WinMali] WARN " fmt "\n", ##__VA_ARGS__)
 #define WINMALI_ERROR(fmt, ...) DbgPrint("[WinMali] ERR  " fmt "\n", ##__VA_ARGS__)
 

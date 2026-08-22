@@ -51,10 +51,21 @@ param(
     [switch]$SkipIfPresent,
     [switch]$ConfigureOnly,
 
+    # Internal bootstrap mode used by ARM64 cross-builds. Build only the
+    # native executables consumed during the cross-build; do not build or
+    # publish x64 WinMali driver DLLs.
+    [switch]$HostToolsOnly,
+
     # WinMaliVk.dll wraps panvk-v10. The Windows port is still in
     # progress; pass -SkipVulkan to build just the GL+D3D10 targets
     # while panvk Windows porting catches up.
     [switch]$SkipVulkan,
+
+    # Verbose retains the historical UMD diagnostics. Focused removes the
+    # noisy adapter-enumeration dump while retaining failures and the render,
+    # synchronization, and DXGI presentation breadcrumbs used for bring-up.
+    [ValidateSet("Verbose","Focused")]
+    [string]$DriverLogProfile = "Verbose",
 
     # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
     # ARM64-native and Prism-emulated x64 processes (Microsoft's
@@ -94,6 +105,7 @@ if (-not $WinMaliPython) {
 # and we need to start fresh without deleting.
 $buildTag  = $env:WINMALI_BUILD_TAG
 $treeName  = "mesa\" + $Configuration.ToLower() + "-" + $Platform.ToLower() +
+             "-" + $DriverLogProfile.ToLower() +
              $(if ($buildTag) { "-$buildTag" } else { "" })
 $buildTree = Join-Path $WinMaliBuildDir $treeName
 $binDir    = Join-Path $WinMaliBuildDir ("bin\$Configuration\$Platform")
@@ -122,6 +134,12 @@ $outDlls = @{
     "WinMaliVk.dll"  = "src\panfrost\vulkan\vulkan_panfrost.dll"
 }
 
+$hostTools = @(
+    @{ Target = "mesa_clc";         Dir = "src\compiler\clc";   Tool = "mesa_clc.exe" },
+    @{ Target = "vtn_bindgen2";     Dir = "src\compiler\spirv"; Tool = "vtn_bindgen2.exe" },
+    @{ Target = "panfrost_compile"; Dir = "src\panfrost\clc";   Tool = "panfrost_compile.exe" }
+)
+
 if ($Clean) {
     if (Test-Path $buildTree) {
         Write-Host "Removing mesa build tree: $buildTree" -ForegroundColor Cyan
@@ -137,7 +155,7 @@ if ($Clean) {
     exit 0
 }
 
-if ($SkipIfPresent) {
+if ($SkipIfPresent -and $DriverLogProfile -eq "Verbose" -and -not $HostToolsOnly) {
     $allPresent = $true
     foreach ($name in $outDlls.Keys) {
         if (-not (Test-Path (Join-Path $binDir $name))) { $allPresent = $false; break }
@@ -214,18 +232,18 @@ if ($Platform -ne "x64") {
     # Cross builds cannot produce executables that run on the x64 build
     # machine.  Bootstrap the matching-configuration native build once,
     # then reuse its build-time tools.
-    $hostTools = @(
-        @{ Dir = "src\compiler\clc";       Tool = "mesa_clc.exe" },
-        @{ Dir = "src\compiler\spirv";     Tool = "vtn_bindgen2.exe" },
-        @{ Dir = "src\panfrost\clc";       Tool = "panfrost_compile.exe" }
-    )
-    $hostTree = Join-Path $WinMaliBuildDir "mesa\$($Configuration.ToLower())-x64"
+    $hostTree = Join-Path $WinMaliBuildDir "mesa\$($Configuration.ToLower())-x64-verbose"
     $missingHostTools = @($hostTools | Where-Object {
         -not (Test-Path (Join-Path (Join-Path $hostTree $_.Dir) $_.Tool))
     })
     if ($missingHostTools.Count -gt 0) {
         Write-Host "Building x64 Mesa host tools required by $Platform..." -ForegroundColor Cyan
-        $hostArgs = @{ Configuration = $Configuration; Platform = "x64" }
+        $hostArgs = @{
+            Configuration = $Configuration
+            Platform = "x64"
+            DriverLogProfile = "Verbose"
+            HostToolsOnly = $true
+        }
         if ($Reconfigure) { $hostArgs.Reconfigure = $true }
         & $PSCommandPath @hostArgs | Out-Host
         if ($LASTEXITCODE -ne 0) {
@@ -507,6 +525,10 @@ if ($env:WindowsSdkDir -and $env:WindowsSDKVersion) {
 #       Clang < 19 in <yvals_core.h>. We ABI-match fine in practice.
 $env:CFLAGS   = "$env:CFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 $env:CXXFLAGS = "$env:CXXFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+if ($DriverLogProfile -eq "Focused") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_FOCUSED=1"
+}
 
 # MSYS2 flex emits POSIX names even for Windows scanners.  Force-include a
 # guarded compatibility header; its __ASSEMBLER__ guard keeps Mesa's .S files
@@ -561,13 +583,17 @@ if ($ConfigureOnly) {
 }
 
 # --------------------------------------------------------------------------
-# Compile all three targets
+# Compile the requested driver DLLs, or only native cross-build tools.
 # --------------------------------------------------------------------------
-$mesonTargets = @(
-    "WinMaliGL",
-    "WinMaliUmd"
-)
-if (-not $SkipVulkan) {
+$mesonTargets = if ($HostToolsOnly) {
+    @($hostTools | ForEach-Object { $_.Target })
+} else {
+    @(
+        "WinMaliGL",
+        "WinMaliUmd"
+    )
+}
+if (-not $HostToolsOnly -and -not $SkipVulkan) {
     $mesonTargets += "vulkan_panfrost"
 }
 
@@ -576,6 +602,18 @@ Write-Host "meson compile ($($mesonTargets -join ', '))" -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) {
     Write-Host "meson compile failed (exit=$LASTEXITCODE)" -ForegroundColor Red
     exit $LASTEXITCODE
+}
+
+if ($HostToolsOnly) {
+    foreach ($t in $hostTools) {
+        $builtTool = Join-Path (Join-Path $buildTree $t.Dir) $t.Tool
+        if (-not (Test-Path $builtTool)) {
+            Write-Host "Mesa host tool was not produced: $builtTool" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "Built host tool: $builtTool" -ForegroundColor Green
+    }
+    exit 0
 }
 
 # --------------------------------------------------------------------------

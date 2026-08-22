@@ -100,13 +100,15 @@
     <WinMaliVersionBuild Condition="'$(WinMaliVersionBuild)' == ''">0</WinMaliVersionBuild>
     <WinMaliVersionRevision Condition="'$(WinMaliVersionRevision)' == ''">85</WinMaliVersionRevision>
     <WinMaliKmdVersion>$(WinMaliVersionMajor).$(WinMaliVersionMinor).$(WinMaliVersionBuild).$(WinMaliVersionRevision)</WinMaliKmdVersion>
+    <WinMaliLogProfile Condition="'$(WinMaliLogProfile)' == ''">Verbose</WinMaliLogProfile>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Focused'">WINMALI_LOG_FOCUSED=1;</WinMaliLogDefine>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_WIN64;WIN32_LEAN_AND_MEAN;WINMALI_VERSION_MAJOR=$(WinMaliVersionMajor);WINMALI_VERSION_MINOR=$(WinMaliVersionMinor);WINMALI_VERSION_BUILD=$(WinMaliVersionBuild);WINMALI_VERSION_REVISION=$(WinMaliVersionRevision);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_WIN64;WIN32_LEAN_AND_MEAN;$(WinMaliLogDefine)WINMALI_VERSION_MAJOR=$(WinMaliVersionMajor);WINMALI_VERSION_MINOR=$(WinMaliVersionMinor);WINMALI_VERSION_BUILD=$(WinMaliVersionBuild);WINMALI_VERSION_REVISION=$(WinMaliVersionRevision);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\Shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <ResourceCompile>
@@ -185,7 +187,7 @@
     <ResourceCompile Include="WinMaliKmd.rc" />
   </ItemGroup>
   <!--
-    Vulkan loader manifest JSONs - one per process bitness/emulator.
+    Native ARM64 Vulkan loader manifest.
     These travel into the driver package via the INF's CopyFiles
     section but they're authored as source-tree files; declaring them
     here makes the KMD project track them so VS rebuilds the package
@@ -195,10 +197,6 @@
   -->
   <ItemGroup>
     <None Include="WinMaliVk_icd.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <DeploymentContent>true</DeploymentContent>
-    </None>
-    <None Include="WinMaliVk_icd_x86.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <DeploymentContent>true</DeploymentContent>
     </None>

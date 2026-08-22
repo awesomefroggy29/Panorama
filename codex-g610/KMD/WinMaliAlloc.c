@@ -275,9 +275,12 @@ WinMaliKmdCreateAllocation(
         info->AllocationPriority       = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
         info->hAllocation              = (HANDLE)ka;
 
-        WINMALI_TRACE("CreateAllocation[%u]: ka=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x flags=0x%x",
-                      i, ka, ka->Size, ka->Width, ka->Height, ka->Alignment,
-                      ka->Pitch, ka->Format, ka->Usage, info->Flags.Value);
+        WINMALI_DIAG("Flow CreateAllocation[%u]: ka=%p resource=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x flags=0x%x private=%s",
+                     i, ka, pCreateAllocation->hResource, ka->Size, ka->Width,
+                     ka->Height, ka->Alignment, ka->Pitch, ka->Format,
+                     ka->Usage, info->Flags.Value,
+                     bbPriv != NULL ? "WinMali/DXGI" :
+                     (priv != NULL ? "legacy" : "runtime/raw"));
     }
 
     return STATUS_SUCCESS;
@@ -313,8 +316,8 @@ WinMaliKmdDestroyAllocation(
         }
         {
             LONG refs = InterlockedDecrement(&ka->ReferenceCount);
-            WINMALI_TRACE("DestroyAllocation[%u]: ka=%p sz=0x%Ix refs=%ld",
-                          i, ka, ka->Size, refs);
+            WINMALI_DIAG("Flow DestroyAllocation[%u]: ka=%p sz=0x%Ix refs=%ld",
+                         i, ka, ka->Size, refs);
             if (refs == 0) {
                 ka->Magic = 0;
                 ExFreePoolWithTag(ka, WINMALI_POOL_TAG);
@@ -348,16 +351,13 @@ WinMaliKmdOpenAllocation(
         return STATUS_INVALID_HANDLE;
     }
 
-    WINMALI_TRACE("OpenAllocation: dev=%p adapter=%p num=%u "
-                  "flags=0x%08x [create=%u readonly=%u] getData=%p getParent=%p",
-                  hDevice,
-                  adapter,
-                  pOpenAllocation->NumAllocations,
-                  pOpenAllocation->Flags.Value,
-                  pOpenAllocation->Flags.Create,
-                  pOpenAllocation->Flags.ReadOnly,
-                  (adapter != NULL) ? adapter->DxgkInterface.DxgkCbGetHandleData : NULL,
-                  (adapter != NULL) ? adapter->DxgkInterface.DxgkCbGetHandleParent : NULL);
+    WINMALI_DIAG("Flow OpenAllocation: dev=%p adapter=%p num=%u "
+                 "flags=0x%08x [create=%u readonly=%u] getData=%p getParent=%p",
+                 hDevice, adapter, pOpenAllocation->NumAllocations,
+                 pOpenAllocation->Flags.Value, pOpenAllocation->Flags.Create,
+                 pOpenAllocation->Flags.ReadOnly,
+                 adapter->DxgkInterface.DxgkCbGetHandleData,
+                 adapter->DxgkInterface.DxgkCbGetHandleParent);
 
     for (i = 0; i < pOpenAllocation->NumAllocations; ++i) {
         DXGK_OPENALLOCATIONINFO* oi = &pOpenAllocation->pOpenAllocation[i];
@@ -453,11 +453,11 @@ WinMaliKmdOpenAllocation(
         }
 
         oi->hDeviceSpecificAllocation = (HANDLE)open;
-        WINMALI_TRACE("OpenAllocation[%u]: open=%p global=%p size=0x%Ix "
-                      "%ux%u pitch=%u fmt=%u usage=0x%x readonly=%u",
-                      i, open, open->Global, open->Size, open->Width,
-                      open->Height, open->Pitch, open->Format, open->Usage,
-                      open->ReadOnly);
+        WINMALI_DIAG("Flow OpenAllocation[%u]: hAlloc=0x%x open=%p global=%p size=0x%Ix "
+                     "%ux%u pitch=%u fmt=%u usage=0x%x readonly=%u",
+                     i, (ULONG)oi->hAllocation, open, open->Global, open->Size,
+                     open->Width, open->Height, open->Pitch, open->Format,
+                     open->Usage, open->ReadOnly);
     }
     return STATUS_SUCCESS;
 

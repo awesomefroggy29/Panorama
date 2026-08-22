@@ -507,7 +507,7 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
                 notify.DmaPreempted.EngineOrdinal = engineOrd;
                 adapter->DxgkInterface.DxgkCbNotifyInterrupt(
                     adapter->DxgkHandle, &notify);
-                WINMALI_TRACE("DPC: notified DMA_PREEMPTED preemptFence=%u lastCompleted=%u node=%u",
+                WINMALI_DIAG("DPC: notified DMA_PREEMPTED preemptFence=%u lastCompleted=%u node=%u",
                               fenceId, lastDone, nodeOrd);
             } else if (isFault) {
                 notify.InterruptType = DXGK_INTERRUPT_GPU_ENGINE_TIMEOUT;
@@ -529,7 +529,7 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
                 notify.DmaCompleted.EngineOrdinal = engineOrd;
                 adapter->DxgkInterface.DxgkCbNotifyInterrupt(
                     adapter->DxgkHandle, &notify);
-                WINMALI_TRACE("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
+                WINMALI_DIAG("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
                               fenceId, nodeOrd, engineOrd);
             }
             notified = TRUE;

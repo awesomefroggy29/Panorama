@@ -1406,6 +1406,10 @@ WinMaliSchedFinishSubmit_(_Inout_ PWINMALI_ADAPTER a,
     }
     for (i = 0; i < cs->SyncCount; ++i) {
         if (cs->SyncOps[i].Flags & WINMALI_SYNC_OP_SIGNAL) {
+            WINMALI_DIAG("Sched: finish sync ENTER fence=%u status=0x%08x index=%u handle=%u point=%llu flags=0x%x",
+                         fence, status, i, cs->SyncOps[i].Handle,
+                         (unsigned long long)cs->SyncOps[i].TimelineValue,
+                         cs->SyncOps[i].Flags);
             int err = NT_SUCCESS(status)
                 ? WinMaliSyncObjSignal(a, cs->SyncOps[i].Handle,
                                        cs->SyncOps[i].TimelineValue)
@@ -1416,6 +1420,10 @@ WinMaliSchedFinishSubmit_(_Inout_ PWINMALI_ADAPTER a,
                               err, status, cs->SyncOps[i].Handle,
                               (unsigned long long)cs->SyncOps[i].TimelineValue,
                               fence);
+            } else {
+                WINMALI_DIAG("Sched: finish sync EXIT fence=%u index=%u handle=%u point=%llu err=0",
+                             fence, i, cs->SyncOps[i].Handle,
+                             (unsigned long long)cs->SyncOps[i].TimelineValue);
             }
         }
     }
@@ -1613,6 +1621,13 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             {
                 NTSTATUS st = STATUS_SUCCESS;
                 ULONG i;
+                ULONGLONG executeStart100ns = KeQueryInterruptTime();
+
+                WINMALI_DIAG("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
+                             fence, node, engine, hasCs, hasCs ? cs.VmId : 0,
+                             asSlot, hasCs ? (ULONGLONG)cs.StreamGpuVa : 0,
+                             hasCs ? cs.StreamSize : 0,
+                             hasCs ? cs.SyncCount : 0);
 
                 if (hasCs) {
                     for (i = 0; i < cs.SyncCount; ++i) {
@@ -1654,6 +1669,12 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                                                         cs.StreamSize,
                                                         0u, 500u);
                         WinMaliBoFlushVm(a, cs.VmId, FALSE);
+                        WINMALI_DIAG("CSF WORKER EXECUTED: fence=%u vm=%u AS%u stream=0x%llx size=%u status=0x%08x elapsed100ns=%llu",
+                                     fence, cs.VmId, asSlot,
+                                     (ULONGLONG)cs.StreamGpuVa, cs.StreamSize,
+                                     st,
+                                     (ULONGLONG)(KeQueryInterruptTime() -
+                                                 executeStart100ns));
                     }
                 }
                 if (resetGeneration !=
@@ -1678,6 +1699,11 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                                                 STATUS_SUCCESS)) {
                         WinMaliSchedQueueTimeout_(a, fence, node, engine,
                                                   STATUS_INSUFFICIENT_RESOURCES);
+                    } else {
+                        WINMALI_DIAG("CSF FENCE QUEUED: fence=%u node=%u engine=%u elapsed100ns=%llu",
+                                     fence, node, engine,
+                                     (ULONGLONG)(KeQueryInterruptTime() -
+                                                 executeStart100ns));
                     }
                 }
             }
@@ -1949,7 +1975,7 @@ WinMaliKmdValidateSubmitCommand(
         }
     }
 
-    WINMALI_TRACE("ValidateSubmitCommand: accepted ctx=%p vm=%u va=0x%llx "
+    WINMALI_DIAG("ValidateSubmitCommand: accepted ctx=%p vm=%u va=0x%llx "
                   "size=%u syncs=%u",
                   ctx, cs.VmId, (unsigned long long)cs.StreamGpuVa,
                   cs.StreamSize, cs.SyncCount);
@@ -1986,7 +2012,7 @@ WinMaliKmdSubmitCommandVirtual(
         return STATUS_INVALID_HANDLE;
     }
 
-    WINMALI_TRACE("SubmitCommandVirtual: fenceId=%u node=%u engine=%u ctx=%p dmaVa=0x%llx dmaSize=%u flags=0x%x private=%p/%u umd=%u",
+    WINMALI_DIAG("SubmitCommandVirtual: fenceId=%u node=%u engine=%u ctx=%p dmaVa=0x%llx dmaSize=%u flags=0x%x private=%p/%u umd=%u",
                   pSubmit->SubmissionFenceId,
                   pSubmit->NodeOrdinal,
                   pSubmit->EngineOrdinal,
@@ -2309,6 +2335,13 @@ WinMaliKmdPresent(
         return STATUS_INVALID_PARAMETER;
     }
 
+    WINMALI_DIAG("Flow Present ENTER ctx=%p flags=0x%x blt=%u flip=%u srcCount=%u dstCount=%u private=%p/%u dma=%p/%u",
+                 hContext, pPresent->Flags.Value, pPresent->Flags.Blt,
+                 pPresent->Flags.Flip, pPresent->NumSrcAllocations,
+                 pPresent->NumDstAllocations, pPresent->pDmaBufferPrivateData,
+                 pPresent->DmaBufferPrivateDataSize, pPresent->pDmaBuffer,
+                 pPresent->DmaSize);
+
     if (!pPresent->Flags.Blt ||
         pPresent->pAllocationList == NULL ||
         pPresent->NumSrcAllocations < 1 ||
@@ -2316,6 +2349,7 @@ WinMaliKmdPresent(
         pPresent->pDmaBufferPrivateData == NULL ||
         pPresent->DmaBufferPrivateDataSize < sizeof(WINMALI_BLT_DESC)) {
         /* Nothing we can (or need to) do; complete so the swap chain proceeds. */
+        WINMALI_DIAG("Flow Present EXIT ctx=%p result=no-blt-work", hContext);
         return STATUS_SUCCESS;
     }
 
@@ -2390,11 +2424,11 @@ WinMaliKmdPresent(
                     break;
                 RtlCopyMemory(dstBase + dOff, srcBase + sOff, rowBytes);
             }
-            WINMALI_TRACE("Present: Blt COPIED %dx%d bpp=%u src=%p dst=%p "
-                          "dst=[%d,%d..%d,%d]",
-                          w, h, bpp, src, dst, pPresent->DstRect.left,
-                          pPresent->DstRect.top, pPresent->DstRect.right,
-                          pPresent->DstRect.bottom);
+            WINMALI_DIAG("Flow Present: Blt COPIED %dx%d bpp=%u src=%p dst=%p "
+                         "dst=[%d,%d..%d,%d]",
+                         w, h, bpp, src, dst, pPresent->DstRect.left,
+                         pPresent->DstRect.top, pPresent->DstRect.right,
+                         pPresent->DstRect.bottom);
         } else {
             WINMALI_WARN("Present: Blt SKIPPED (src resident=%d dst resident=%d) "
                          "- destination likely cross-adapter (DWM), needs a "
@@ -2409,6 +2443,8 @@ WinMaliKmdPresent(
         *(ULONG UNALIGNED*)pPresent->pDmaBuffer = WINMALI_BLT_DESC_MAGIC;
         pPresent->pDmaBuffer = (PVOID)((PUCHAR)pPresent->pDmaBuffer + sizeof(ULONG));
     }
+    WINMALI_DIAG("Flow Present EXIT ctx=%p result=blt-described src=%p dst=%p",
+                 hContext, src, dst);
     return STATUS_SUCCESS;
 }
 

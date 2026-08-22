@@ -83,7 +83,8 @@ extern "C" {
 
 /* Bumped for additive changes. KMD returns -EOPNOTSUPP for unknown ops.       */
 /* 1: + WinMaliEscapeOp_DebugLog (UMD -> UART log mirroring)                    */
-#define WINMALI_ABI_MINOR       1
+/* 2: + asynchronous SyncObjTransfer (pending-fence propagation)                */
+#define WINMALI_ABI_MINOR       2
 
 /* KMD pool tag. Appears as "WinM" in !pooltrack / Driver Verifier output.    */
 #define WINMALI_POOL_TAG        'MniW'
@@ -149,16 +150,17 @@ typedef enum _WINMALI_ESCAPE_OP {
      * and the UMD silently stops mirroring.                            */
     WinMaliEscapeOp_DebugLog            = 0x8F,
     WinMaliEscapeOp_PresentToHdc        = 0x90,
-    /* Signal a syncobj to a value (binary: any Point>0 => signalled;
-     * timeline: raise to Point). Backs libdrm drmSyncobjSignal and the
-     * synchronous drmSyncobjTransfer used by panvk (Vulkan) to signal an
-     * app VkFence/semaphore after GROUP_SUBMIT - our submits are already
-     * GPU-complete on return, so signalling the destination is correct.
-     * Additive (ABI minor 1); older KMDs return -EOPNOTSUPP.            */
+    /* Signal a syncobj to a value (binary: complete its current generation;
+     * timeline: raise to Point). Backs libdrm drmSyncobjSignal. Pending-fence
+     * copies use SyncObjTransfer below; WDDM submission is asynchronous. */
     WinMaliEscapeOp_SyncObjSignal       = 0x91,
     /* Replace a syncobj's current binary fence with a new pending GPU
      * generation before the corresponding WDDM render packet is queued. */
     WinMaliEscapeOp_SyncObjArm          = 0x92,
+    /* Install src[srcPoint] as the fence represented by dst[dstPoint]
+     * without waiting for src.  Completion/failure is propagated by the KMD.
+     * This is the WinMali equivalent of DRM_IOCTL_SYNCOBJ_TRANSFER. */
+    WinMaliEscapeOp_SyncObjTransfer     = 0x93,
 } WINMALI_ESCAPE_OP;
 
 /* -------------------------------------------------------------------------- */
@@ -613,6 +615,13 @@ typedef struct _WINMALI_SYNC_OBJ_SIGNAL {
     uint32_t Pad;
     uint64_t Point;         /* timeline value; binary treats >0 as signalled */
 } WINMALI_SYNC_OBJ_SIGNAL;
+
+typedef struct _WINMALI_SYNC_OBJ_TRANSFER {
+    uint32_t DstHandle;
+    uint32_t SrcHandle;
+    uint64_t DstPoint;       /* 0 selects/replaces a binary destination fence */
+    uint64_t SrcPoint;       /* timeline point; 0 snapshots a binary source */
+} WINMALI_SYNC_OBJ_TRANSFER;
 
 /* WAIT_FLAG bits: ALL = wait for every handle to reach its point. The       */
 /* default is "any one of them suffices" (i.e. ANY). FOR_SUBMIT means        */

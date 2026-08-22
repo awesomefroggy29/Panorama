@@ -710,7 +710,7 @@ WinMaliFwBuildPtForSections_(_Inout_ WINMALI_FWCTX* Fw)
             (ULONGLONG)attrs,
             (ULONGLONG)s->BackingPa.QuadPart);
     }
-    WINMALI_TRACE(
+    WINMALI_DIAG(
         "FW: PT build done sections=%lu pages=%lu PtUsed=%lu/%lu KiB",
         Fw->SectionCount,
         totalPagesMapped,
@@ -1921,7 +1921,7 @@ WinMaliCsfWakeCsgIfIdle_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
 
     status = WinMaliFwCsgWaitReqAck_(Fw, WINMALI_CSG_REQ_MASK, 1000u, &acked);
-    WINMALI_TRACE(
+    WINMALI_DIAG(
         "CSF wake: state=0x%08x ep_cur=0x%08x evt=0x%08x req 0x%08x->0x%08x ack=0x%08x acked=0x%08x st=0x%08x",
         state, epCur, evtPending, reqOld, reqNew, ack, acked, status);
     return status;
@@ -1974,7 +1974,7 @@ WinMaliCsfRebindCsgAs_(_Inout_ PWINMALI_ADAPTER Adapter,
     }
 
     status = WinMaliCsfProgramAndStartCsg_(Adapter, Fw, AsSlot);
-    WINMALI_TRACE("CSF: bind CSG -> AS %u (start st=0x%08x)", AsSlot, status);
+    WINMALI_DIAG("CSF: bind CSG -> AS %u (start st=0x%08x)", AsSlot, status);
     return status;
 }
 
@@ -2249,8 +2249,15 @@ WinMaliCsfSubmitStreamCall_(
                              "CS Fault=0x%08x Fatal=0x%08x FaultInfo=0x%llx FatalInfo=0x%llx",
                              mfst, gpfs, csFault, csFatal,
                              (ULONGLONG)Fw->Cs00Output->FaultInfo,
-                             (ULONGLONG)Fw->Cs00Output->FatalInfo);
+                              (ULONGLONG)Fw->Cs00Output->FatalInfo);
             }
+            /* Keep the definitive hardware-completion breadcrumb in both
+               Verbose and Focused builds.  Userspace's CSFSubmit EXIT only
+               means that dxgkrnl accepted the packet; this line means the
+               firmware executed the stream through its terminal SYNC_ADD. */
+            WINMALI_DIAG("CSF COMPLETE: AS%u stream=0x%llx size=%u seq=%llu observed=%llu polls=%lu",
+                         CsgAsSlot, (ULONGLONG)StreamGpuVa, StreamSizeBytes,
+                         (ULONGLONG)jobSeq, (ULONGLONG)sync->Seqno, i);
             return STATUS_SUCCESS;
         }
         t.QuadPart = -10000LL;

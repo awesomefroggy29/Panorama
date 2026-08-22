@@ -27,6 +27,9 @@ typedef struct _WINMALI_ADAPTER WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 
 #define WINMALI_SYNCOBJ_MAGIC   'oSmW'  /* 'WmSo' little-endian */
 
+typedef struct _WINMALI_SYNC_TRANSFER WINMALI_SYNC_TRANSFER,
+                                      *PWINMALI_SYNC_TRANSFER;
+
 typedef struct _WINMALI_SYNCOBJ {
     LIST_ENTRY          Link;
     ULONG               Magic;
@@ -34,6 +37,7 @@ typedef struct _WINMALI_SYNCOBJ {
     BOOLEAN             IsTimeline;     /* TRUE for timeline-mode handles */
     KEVENT              Event;          /* NotificationEvent so all waiters wake */
     KSPIN_LOCK          Lock;           /* protects values below */
+    LIST_ENTRY          Dependents;     /* WINMALI_SYNC_TRANSFER::SourceLink */
     UINT64              TimelineValue;  /* monotonic timeline value */
     /* A binary drm_syncobj represents the fence most recently installed in
        it, not a permanently-signalled bit.  Give every queued GPU signal a
@@ -43,6 +47,7 @@ typedef struct _WINMALI_SYNCOBJ {
     UINT64              BinaryCompletedValue;
     UINT64              BinaryFailedValue;
     UINT64              TimelineFailedValue;
+    LONG                Removed;        /* no longer addressable by handle */
     LONG                RefCount;
     /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this handle;
        freed by DestroyDevice rundown if the UMD never destroys it. */
@@ -94,6 +99,15 @@ int WinMaliSyncObjFail(_Inout_ PWINMALI_ADAPTER Adapter,
 int WinMaliSyncObjArmSignal(_Inout_ PWINMALI_ADAPTER Adapter,
                             _In_ ULONG Handle,
                             _Inout_ UINT64* InOutPoint);
+
+/* Make DstHandle represent completion of SrcHandle/SrcPoint without blocking
+   the caller. Binary destinations receive a fresh generation; timeline
+   destinations use DstPoint. Completion and failure both propagate. */
+int WinMaliSyncObjTransfer(_Inout_ PWINMALI_ADAPTER Adapter,
+                           _In_ ULONG DstHandle,
+                           _In_ UINT64 DstPoint,
+                           _In_ ULONG SrcHandle,
+                           _In_ UINT64 SrcPoint);
 
 /* Validate that a submission's opaque sync handle still names a live object
    and that the advertised handle type matches it. OwnerDevice is optional:
