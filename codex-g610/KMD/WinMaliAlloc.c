@@ -15,9 +15,6 @@
 #include "WinMaliKmd.h"
 #include "WinMaliAlloc.h"
 
-#define WINMALI_ALLOC_PRIV_MAGIC     'PaWM'
-#define WINMALI_ALLOC_PRIV_VERSION   1u
-
 /* Default pitch alignment for linear surfaces. Mali utiles want 64-byte
    row alignment for AFBC/tile layouts; D3D11 promises 256 for staging.
    64 is the conservative floor that satisfies both. */

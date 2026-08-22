@@ -704,6 +704,35 @@ typedef struct _WINMALI_BO_FROM_ALLOCATION {
     uint64_t GpuVa;             /* 0 if not mapped */
 } WINMALI_BO_FROM_ALLOCATION;
 
+/* Per-allocation metadata shared by the UMD, KMD and any process that opens
+ * a shared allocation.  Dxgkrnl preserves this blob and exposes it through
+ * D3DDDI_OPENALLOCATIONINFO::pPrivateDriverData. */
+#define WINMALI_ALLOC_PRIV_MAGIC            'PaWM'
+#define WINMALI_ALLOC_PRIV_VERSION          1u
+
+#define WINMALI_ALLOC_USAGE_TEXTURE         0x00000001UL
+#define WINMALI_ALLOC_USAGE_RENDER_TARGET   0x00000002UL
+#define WINMALI_ALLOC_USAGE_DEPTH_STENCIL   0x00000004UL
+#define WINMALI_ALLOC_USAGE_UAV             0x00000008UL
+#define WINMALI_ALLOC_USAGE_VERTEX_BUFFER   0x00000010UL
+#define WINMALI_ALLOC_USAGE_INDEX_BUFFER    0x00000020UL
+#define WINMALI_ALLOC_USAGE_CONSTANT_BUFFER 0x00000040UL
+#define WINMALI_ALLOC_USAGE_STAGING         0x00000080UL
+#define WINMALI_ALLOC_USAGE_PRIMARY         0x00000100UL
+#define WINMALI_ALLOC_USAGE_DMA_BUFFER      0x00000200UL
+
+typedef struct _WINMALI_ALLOC_PRIV {
+    uint32_t Magic;
+    uint32_t Version;
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t Pitch;
+    uint32_t Format;
+    uint32_t Usage;
+    uint32_t Flags;
+    uint64_t Size;
+} WINMALI_ALLOC_PRIV;
+
 /*
  * Magic + private data the D3D11 UMD packs into D3DDDI_ALLOCATIONINFO::
  * pPrivateDriverData when calling pfnAllocateCb for a backbuffer. The KMD's

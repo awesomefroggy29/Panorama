@@ -720,10 +720,13 @@ WinMaliKmdCreateProcess(
     proc->CsfGpuVaReserved = TRUE;
 
     pCreateProcess->hKmdProcess = (HANDLE)proc;
-    WINMALI_TRACE("CreateProcess: proc=%p hDxgk=%p flags=0x%x pasid=%u CSF-reserved=0x%llx/0x%llx",
-                  proc, proc->hDxgkProcess, proc->Flags, proc->Pasid,
-                  (ULONGLONG)proc->CsfReservedGpuVa,
-                  (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BYTES);
+    /* Process lifetime is a low-volume diagnostic breadcrumb. Keep it in
+       Focused builds so UMD crashes/restarts can be correlated without the
+       routine paging/allocation chatter enabled by Verbose. */
+    WINMALI_DIAG("CreateProcess: proc=%p hDxgk=%p flags=0x%x pasid=%u CSF-reserved=0x%llx/0x%llx",
+                 proc, proc->hDxgkProcess, proc->Flags, proc->Pasid,
+                 (ULONGLONG)proc->CsfReservedGpuVa,
+                 (ULONGLONG)WINMALI_CSF_RESERVED_GPU_VA_BYTES);
     return STATUS_SUCCESS;
 }
 
@@ -744,7 +747,7 @@ WinMaliKmdDestroyProcess(
         WINMALI_WARN("DestroyProcess: proc=%p leaks %ld devices",
                      proc, proc->DeviceCount);
     }
-    WINMALI_TRACE("DestroyProcess: proc=%p", proc);
+    WINMALI_DIAG("DestroyProcess: proc=%p", proc);
     WinMaliKmdFreeProcessReservedPt_(proc);
     proc->Magic = 0;
     ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
