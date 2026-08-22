@@ -1,11 +1,10 @@
 /*
  * WinMaliVm.c - VM handle table implementation.
  *
- * Fully wired: VmCreate binds a per-VM Mali AS slot and builds its L0 root
- * page table (WinMaliMmuVmInit); VmBind maps/unmaps BO pages into that VM's
- * LPAE page table (WinMaliMmuVmMap/VmUnmap). The CSG executes against these
- * per-VM AS slots. (The old "metadata-only / VmBind isn't wired" note was
- * stale.)
+ * Fully wired: VmCreate builds a per-VM L0 root page table without consuming
+ * a scarce hardware AS slot. VmBind maps/unmaps BO pages into the LPAE page
+ * table. Execution leases a hardware AS just long enough to run the CSG and
+ * returns it after parking the CSG on the permanent bring-up AS.
  */
 
 #include "WinMaliKmd.h"
@@ -37,6 +36,13 @@ static VOID
 WinMaliVmFree_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM Vm)
 {
     if (Vm != NULL) {
+        /* Removing a VM from the table drops its owning reference. Worker or
+           replay paths may still hold lookup references while a transient AS
+           is executing, so wait before tearing down page tables. */
+        if (InterlockedDecrement(&Vm->RefCount) != 0) {
+            KeWaitForSingleObject(&Vm->RefZeroEvent, Executive, KernelMode,
+                                  FALSE, NULL);
+        }
         if (Vm->PtInitialized) {
             WinMaliMmuVmTeardown(Adapter, &Vm->Pt);
             Vm->PtInitialized = FALSE;
@@ -109,6 +115,7 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     vm->UserVaBase  = WINMALI_VM_DEFAULT_USER_VA_BASE;
     vm->UserVaSize  = granted;
     vm->RefCount    = 1;
+    KeInitializeEvent(&vm->RefZeroEvent, NotificationEvent, FALSE);
     vm->OwnerDevice = OwnerDevice;
     /* KMD GPU-VA bump allocator starts just past the advertised user VA
        window (base + range), page-aligned. */
@@ -118,8 +125,9 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     {
         WINMALI_TRACE("VmCreateDiag: calling MmuVmInit vm=%p", vm);
         NTSTATUS st = WinMaliMmuVmInit(Adapter, &vm->Pt);
-        WINMALI_TRACE("VmCreateDiag: MmuVmInit returned 0x%08x AS=%u root=0x%llx",
-                      st, vm->Pt.AsSlot, (ULONGLONG)vm->Pt.RootPa.QuadPart);
+        WINMALI_TRACE("VmCreateDiag: MmuVmInit returned 0x%08x resident=%u root=0x%llx",
+                      st, vm->Pt.AsSlot < WINMALI_AS_SLOT_MAX,
+                      (ULONGLONG)vm->Pt.RootPa.QuadPart);
         if (!NT_SUCCESS(st)) {
             ExFreePoolWithTag(vm, WINMALI_POOL_TAG);
             WINMALI_WARN("VmCreate: WinMaliMmuVmInit failed 0x%08x", st);
@@ -133,7 +141,8 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
        fixed KMD-reserved VAs so the MCU can execute in its own AS. Best-
        effort: if CSF isn't booted yet the submit path falls back to the NOP. */
     {
-        WINMALI_TRACE("VmCreateDiag: calling CsfMapIntoVm AS=%u", vm->Pt.AsSlot);
+        WINMALI_TRACE("VmCreateDiag: calling CsfMapIntoVm root=0x%llx",
+                      (ULONGLONG)vm->Pt.RootPa.QuadPart);
         NTSTATUS csfSt = WinMaliCsfMapIntoVm(Adapter, &vm->Pt);
         WINMALI_TRACE("VmCreateDiag: CsfMapIntoVm returned 0x%08x", csfSt);
         if (!NT_SUCCESS(csfSt) && csfSt != STATUS_DEVICE_NOT_READY) {
@@ -255,7 +264,12 @@ VOID
 WinMaliVmPut(_In_ PWINMALI_VM Vm)
 {
     if (Vm != NULL) {
-        InterlockedDecrement(&Vm->RefCount);
+        LONG refs = InterlockedDecrement(&Vm->RefCount);
+        if (refs == 0) {
+            KeSetEvent(&Vm->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        } else if (refs < 0) {
+            WINMALI_ERROR("VmPut: refcount underflow vm=%p id=%u", Vm, Vm->Id);
+        }
     }
 }
 

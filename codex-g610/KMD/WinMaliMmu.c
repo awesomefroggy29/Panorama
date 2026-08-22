@@ -663,6 +663,7 @@ WinMaliMmuInitAsAllocator(_Inout_ PWINMALI_ADAPTER Adapter)
     }
 
     KeInitializeSpinLock(&Adapter->AsSlotLock);
+    KeInitializeMutex(&Adapter->TransientAsMutex, 0);
     Adapter->AsSlotPresentMask = (Adapter->Hw.AsPresent != 0)
                                      ? Adapter->Hw.AsPresent
                                      : 0xFFu;
@@ -981,6 +982,24 @@ WinMaliMmuVmPickAs_(_Inout_ PWINMALI_ADAPTER Adapter)
     return as;
 }
 
+NTSTATUS
+WinMaliMmuEnterTransientExecution(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    if (Adapter == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return KeWaitForSingleObject(&Adapter->TransientAsMutex, Executive,
+                                 KernelMode, FALSE, NULL);
+}
+
+VOID
+WinMaliMmuLeaveTransientExecution(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    if (Adapter != NULL) {
+        KeReleaseMutex(&Adapter->TransientAsMutex, FALSE);
+    }
+}
+
 static VOID
 WinMaliMmuVmReleaseAs_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG As)
 {
@@ -1000,15 +1019,13 @@ NTSTATUS
 WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
 {
     PWINMALI_VM_PT_PAGE root;
-    UINT64 transcfg = 0, memattr = 0;
-    NTSTATUS status;
-    ULONG as;
 
     WINMALI_TRACE("MmuVmInitDiag: ENTER adapter=%p vmpt=%p regs=%u",
                   Adapter, VmPt, Adapter != NULL ? Adapter->GpuRegsMapped : 0);
     RtlZeroMemory(VmPt, sizeof(*VmPt));
     InitializeListHead(&VmPt->AllocatedPages);
     ExInitializeFastMutex(&VmPt->Lock);
+    ExInitializeFastMutex(&VmPt->ResidencyLock);
     VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
 
     if (Adapter == NULL || !Adapter->GpuRegsMapped) {
@@ -1025,47 +1042,113 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
     VmPt->RootVa = root->Va;
     VmPt->RootPa = root->Pa;
     InsertTailList(&VmPt->AllocatedPages, &root->Link);
+    WINMALI_DIAG("VM RESIDENCY: created nonresident root=0x%llx inUse=0x%x",
+                 (ULONGLONG)VmPt->RootPa.QuadPart,
+                 Adapter->AsSlotInUseMask);
+    return STATUS_SUCCESS;
+}
 
-    as = WinMaliMmuVmPickAs_(Adapter);
-    WINMALI_TRACE("MmuVmInitDiag: picked AS%u inUseMask=0x%x",
-                  as, Adapter->AsSlotInUseMask);
+NTSTATUS
+WinMaliMmuVmAcquireAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                      _Inout_ PWINMALI_VM_PT VmPt,
+                      _Out_ PULONG OutAs)
+{
+    KIRQL irql;
+    ULONG as;
+    UINT64 transcfg = 0, memattr = 0;
+    NTSTATUS status;
+
+    if (OutAs != NULL) {
+        *OutAs = WINMALI_AS_SLOT_MAX;
+    }
+    if (Adapter == NULL || VmPt == NULL || OutAs == NULL ||
+        VmPt->RootVa == NULL || !Adapter->GpuRegsMapped) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    ExAcquireFastMutex(&VmPt->ResidencyLock);
+    if (VmPt->AsLeaseCount > 0 && VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
+        ++VmPt->AsLeaseCount;
+        *OutAs = VmPt->AsSlot;
+        WINMALI_TRACE("VmAcquireAs: reuse AS%u root=0x%llx leases=%ld",
+                      VmPt->AsSlot, (ULONGLONG)VmPt->RootPa.QuadPart,
+                      VmPt->AsLeaseCount);
+        ExReleaseFastMutex(&VmPt->ResidencyLock);
+        return STATUS_SUCCESS;
+    }
+
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    as = WinMaliMmuPickFreeAs_(Adapter);
+    if (as < WINMALI_AS_SLOT_MAX) {
+        Adapter->AsSlotInUseMask |= (1u << as);
+        Adapter->AsBindings[as].Bound = TRUE;
+        Adapter->AsBindings[as].hContext = NULL;
+        Adapter->AsBindings[as].RootPtPa = (UINT64)VmPt->RootPa.QuadPart;
+    }
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
     if (as >= WINMALI_AS_SLOT_MAX) {
-        WinMaliMmuPtFreePage_(CONTAINING_RECORD(
-            RemoveHeadList(&VmPt->AllocatedPages), WINMALI_VM_PT_PAGE, Link));
-        VmPt->RootVa = NULL;
+        WINMALI_WARN("VmAcquireAs: no free transient AS (inUse=0x%x present=0x%x root=0x%llx)",
+                     Adapter->AsSlotInUseMask, Adapter->AsSlotPresentMask,
+                     (ULONGLONG)VmPt->RootPa.QuadPart);
+        ExReleaseFastMutex(&VmPt->ResidencyLock);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    VmPt->AsSlot = as;
 
     WinMaliMmuGetDefaultAsParams(Adapter, &transcfg, &memattr);
-    WINMALI_TRACE("MmuVmInitDiag: enabling AS%u root=0x%llx transcfg=0x%llx memattr=0x%llx",
-                  as, (ULONGLONG)VmPt->RootPa.QuadPart,
-                  (ULONGLONG)transcfg, (ULONGLONG)memattr);
     status = WinMaliMmuAsEnable(Adapter, as,
                                 (UINT64)VmPt->RootPa.QuadPart,
                                 transcfg, memattr);
-    WINMALI_TRACE("MmuVmInitDiag: AsEnable AS%u returned 0x%08x",
-                  as, status);
     if (!NT_SUCCESS(status)) {
         WinMaliMmuVmReleaseAs_(Adapter, as);
-        WinMaliMmuPtFreePage_(CONTAINING_RECORD(
-            RemoveHeadList(&VmPt->AllocatedPages), WINMALI_VM_PT_PAGE, Link));
-        VmPt->RootVa = NULL;
-        VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
-        WINMALI_WARN("VmInit: AsEnable AS%u failed 0x%08x", as, status);
+        WINMALI_WARN("VmAcquireAs: AsEnable AS%u failed 0x%08x", as, status);
+        ExReleaseFastMutex(&VmPt->ResidencyLock);
         return status;
     }
 
-    {
-        KIRQL irql;
-        KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
-        Adapter->AsBindings[as].RootPtPa = (UINT64)VmPt->RootPa.QuadPart;
-        KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+    VmPt->AsSlot = as;
+    VmPt->AsLeaseCount = 1;
+    *OutAs = as;
+    WINMALI_DIAG("VM RESIDENCY: acquire root=0x%llx AS%u inUse=0x%x",
+                 (ULONGLONG)VmPt->RootPa.QuadPart, as,
+                 Adapter->AsSlotInUseMask);
+    ExReleaseFastMutex(&VmPt->ResidencyLock);
+    return STATUS_SUCCESS;
+}
+
+VOID
+WinMaliMmuVmReleaseAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                      _Inout_ PWINMALI_VM_PT VmPt,
+                      _In_ ULONG AsSlot)
+{
+    if (Adapter == NULL || VmPt == NULL) {
+        return;
     }
 
-    WINMALI_TRACE("VmInit: AS%u root_pa=0x%llx",
-                  as, (ULONGLONG)VmPt->RootPa.QuadPart);
-    return STATUS_SUCCESS;
+    ExAcquireFastMutex(&VmPt->ResidencyLock);
+    if (VmPt->AsLeaseCount <= 0 || VmPt->AsSlot != AsSlot ||
+        AsSlot >= WINMALI_AS_SLOT_MAX) {
+        WINMALI_WARN("VmReleaseAs: mismatched lease requested=AS%u current=AS%u leases=%ld",
+                     AsSlot, VmPt->AsSlot, VmPt->AsLeaseCount);
+        ExReleaseFastMutex(&VmPt->ResidencyLock);
+        return;
+    }
+
+    --VmPt->AsLeaseCount;
+    if (VmPt->AsLeaseCount == 0) {
+        /* The caller must first park the CSG away from this transient AS.
+           Keep the slot marked in-use until the hardware is disabled so a
+           concurrent binder cannot reuse it underneath this operation. */
+        if (Adapter->GpuRegsMapped) {
+            (VOID)WinMaliMmuAsDisable(Adapter, AsSlot);
+        }
+        WinMaliMmuVmReleaseAs_(Adapter, AsSlot);
+        VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
+        WINMALI_DIAG("VM RESIDENCY: release root=0x%llx AS%u inUse=0x%x",
+                     (ULONGLONG)VmPt->RootPa.QuadPart, AsSlot,
+                     Adapter->AsSlotInUseMask);
+    }
+    ExReleaseFastMutex(&VmPt->ResidencyLock);
 }
 
 VOID
@@ -1076,13 +1159,16 @@ WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM_PT Vm
     if (VmPt == NULL) {
         return;
     }
-    if (VmPt->AsSlot < WINMALI_AS_SLOT_MAX && Adapter != NULL &&
-        Adapter->GpuRegsMapped) {
-        (VOID)WinMaliMmuAsDisable(Adapter, VmPt->AsSlot);
-    }
+    ExAcquireFastMutex(&VmPt->ResidencyLock);
     if (Adapter != NULL && VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
+        if (Adapter->GpuRegsMapped) {
+            (VOID)WinMaliMmuAsDisable(Adapter, VmPt->AsSlot);
+        }
         WinMaliMmuVmReleaseAs_(Adapter, VmPt->AsSlot);
     }
+    VmPt->AsLeaseCount = 0;
+    VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
+    ExReleaseFastMutex(&VmPt->ResidencyLock);
 
     while (!IsListEmpty(&VmPt->AllocatedPages)) {
         entry = RemoveHeadList(&VmPt->AllocatedPages);
@@ -1090,7 +1176,6 @@ WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM_PT Vm
     }
     VmPt->RootVa = NULL;
     VmPt->RootPa.QuadPart = 0;
-    VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
 }
 
 /* Walk one level deeper. *Cur points at the parent PT entry; if it's
@@ -1185,6 +1270,7 @@ WinMaliMmuVmMap(_Inout_ PWINMALI_ADAPTER Adapter,
         return STATUS_INVALID_PARAMETER;
     }
 
+    ExAcquireFastMutex(&VmPt->ResidencyLock);
     ExAcquireFastMutex(&VmPt->Lock);
     for (i = 0; i < PageCount; ++i) {
         UINT64 va = GpuVa + (UINT64)i * PAGE_SIZE;
@@ -1201,8 +1287,6 @@ WinMaliMmuVmMap(_Inout_ PWINMALI_ADAPTER Adapter,
         l3[i3] = (pa & WINMALI_LPAE_PA_MASK) | Attrs;
     }
     KeMemoryBarrier();
-    ExReleaseFastMutex(&VmPt->Lock);
-
     if (NT_SUCCESS(status) && Adapter->GpuRegsMapped &&
         VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
         (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, VmPt->AsSlot);
@@ -1210,6 +1294,8 @@ WinMaliMmuVmMap(_Inout_ PWINMALI_ADAPTER Adapter,
     WINMALI_TRACE("VmMap: AS%u gpu_va=0x%llx pages=%u attrs=0x%llx st=0x%08x",
                   VmPt->AsSlot, (ULONGLONG)GpuVa, PageCount,
                   (ULONGLONG)Attrs, status);
+    ExReleaseFastMutex(&VmPt->Lock);
+    ExReleaseFastMutex(&VmPt->ResidencyLock);
     return status;
 }
 
@@ -1231,6 +1317,7 @@ WinMaliMmuVmUnmap(_Inout_ PWINMALI_ADAPTER Adapter,
         return STATUS_SUCCESS;
     }
 
+    ExAcquireFastMutex(&VmPt->ResidencyLock);
     ExAcquireFastMutex(&VmPt->Lock);
     for (i = 0; i < PageCount; ++i) {
         UINT64 va = GpuVa + (UINT64)i * PAGE_SIZE;
@@ -1244,12 +1331,12 @@ WinMaliMmuVmUnmap(_Inout_ PWINMALI_ADAPTER Adapter,
            that's a benign unmap-of-already-unmapped. */
     }
     KeMemoryBarrier();
-    ExReleaseFastMutex(&VmPt->Lock);
-
     if (Adapter->GpuRegsMapped && VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
         (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, VmPt->AsSlot);
     }
     WINMALI_TRACE("VmUnmap: AS%u gpu_va=0x%llx pages=%u",
                   VmPt->AsSlot, (ULONGLONG)GpuVa, PageCount);
+    ExReleaseFastMutex(&VmPt->Lock);
+    ExReleaseFastMutex(&VmPt->ResidencyLock);
     return STATUS_SUCCESS;
 }

@@ -2249,7 +2249,29 @@ WinMaliCsfSubmitStreamCall_(
                              "CS Fault=0x%08x Fatal=0x%08x FaultInfo=0x%llx FatalInfo=0x%llx",
                              mfst, gpfs, csFault, csFatal,
                              (ULONGLONG)Fw->Cs00Output->FaultInfo,
-                              (ULONGLONG)Fw->Cs00Output->FatalInfo);
+                             (ULONGLONG)Fw->Cs00Output->FatalInfo);
+            }
+            if (gfst || gpfs || csFault || csFatal) {
+                WinMaliDiagCaptureFault(
+                    Adapter, CsgAsSlot,
+                    Fw->Cs00Output->StatusCmdPtr,
+                    Fw->Cs00Output->StatusWaitSyncPtr,
+                    Fw->Cs00Output->FaultInfo,
+                    Fw->Cs00Output->FatalInfo,
+                    Fw->Cs00Output->HeapAddress,
+                    csFault, csFatal,
+                    Fw->Cs00Output->StatusBlockedReason & 0xFu,
+                    Fw->Cs00Output->StatusWait,
+                    Fw->Cs00Output->StatusReqResource,
+                    Fw->Cs00Output->StatusScoreboards,
+                    gfst,
+                    WinMaliHwRead32(&Adapter->Hw,
+                        WINMALI_REG_AS_FAULTADDR_LO(CsgAsSlot)),
+                    WinMaliHwRead32(&Adapter->Hw,
+                        WINMALI_REG_AS_FAULTADDR_HI(CsgAsSlot)),
+                    gpfs,
+                    WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_GPU_FAULT_ADDR_LO),
+                    WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_GPU_FAULT_ADDR_HI));
             }
             /* Keep the definitive hardware-completion breadcrumb in both
                Verbose and Focused builds.  Userspace's CSFSubmit EXIT only
@@ -2321,6 +2343,21 @@ WinMaliCsfSubmitStreamCall_(
             WINMALI_WARN("CSF CS status: FAULT_INFO=0x%llx FATAL_INFO=0x%llx",
                          (ULONGLONG)Fw->Cs00Output->FaultInfo,
                          (ULONGLONG)Fw->Cs00Output->FatalInfo);
+
+            WinMaliDiagCaptureFault(
+                Adapter, CsgAsSlot,
+                Fw->Cs00Output->StatusCmdPtr,
+                Fw->Cs00Output->StatusWaitSyncPtr,
+                Fw->Cs00Output->FaultInfo,
+                Fw->Cs00Output->FatalInfo,
+                Fw->Cs00Output->HeapAddress,
+                Fw->Cs00Output->Fault,
+                Fw->Cs00Output->Fatal,
+                Fw->Cs00Output->StatusBlockedReason & 0xFu,
+                Fw->Cs00Output->StatusWait,
+                Fw->Cs00Output->StatusReqResource,
+                Fw->Cs00Output->StatusScoreboards,
+                gfst, gflo, gfhi, gpfs, gpflo, gpfhi);
         }
 
         if (gfst != 0u || mfst != 0u || gpfs != 0u) {
@@ -2388,16 +2425,23 @@ WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG TimeoutMs)
  * next context still succeeds. On failure we just reset the slot to the
  * bring-up AS and return the error to this caller.
  */
-NTSTATUS
-WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
-                            _In_ ULONG   GroupAsSlot,
-                            _In_ UINT64  StreamGpuVa,
-                            _In_ ULONG   StreamSizeBytes,
-                            _In_ ULONG   LatestFlush,
-                            _In_ ULONG   TimeoutMs)
+static NTSTATUS
+WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
+                                     _In_ ULONG   GroupAsSlot,
+                                     _In_ UINT64  StreamGpuVa,
+                                     _In_ ULONG   StreamSizeBytes,
+                                     _In_ ULONG   LatestFlush,
+                                     _In_ ULONG   TimeoutMs,
+                                     _In_ BOOLEAN ParkAfterSubmit,
+                                     _Out_opt_ PBOOLEAN OutParked)
 {
     WINMALI_FWCTX* fw;
     NTSTATUS       st;
+    NTSTATUS       parkSt = STATUS_SUCCESS;
+
+    if (OutParked != NULL) {
+        *OutParked = FALSE;
+    }
 
     if (Adapter == NULL || Adapter->FwCtx == NULL) {
         return STATUS_DEVICE_NOT_READY;
@@ -2422,11 +2466,54 @@ WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
     if (!NT_SUCCESS(st)) {
         WINMALI_WARN("CSF: group stream submit failed 0x%08x (as=%u) - resetting "
                      "slot to bring-up AS; next submit retries", st, GroupAsSlot);
-        (VOID)WinMaliCsfRebindCsgAs_(Adapter, fw, Adapter->GpuMmuBringupAs);
+    }
+    if (!NT_SUCCESS(st) || ParkAfterSubmit) {
+        parkSt = WinMaliCsfRebindCsgAs_(Adapter, fw, Adapter->GpuMmuBringupAs);
+        if (OutParked != NULL && NT_SUCCESS(parkSt)) {
+            *OutParked = TRUE;
+        }
+        if (NT_SUCCESS(st) && !NT_SUCCESS(parkSt)) {
+            st = parkSt;
+            WINMALI_WARN("CSF: completed transient AS%u stream but parking failed 0x%08x",
+                         GroupAsSlot, parkSt);
+        } else if (ParkAfterSubmit && NT_SUCCESS(st)) {
+            WINMALI_DIAG("CSF: transient AS%u completed; CSG parked on AS%u",
+                         GroupAsSlot, Adapter->GpuMmuBringupAs);
+        }
     }
 
     KeReleaseMutex(&fw->SubmitLock, FALSE);
     return st;
+}
+
+NTSTATUS
+WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
+                            _In_ ULONG   GroupAsSlot,
+                            _In_ UINT64  StreamGpuVa,
+                            _In_ ULONG   StreamSizeBytes,
+                            _In_ ULONG   LatestFlush,
+                            _In_ ULONG   TimeoutMs)
+{
+    return WinMaliCsfSubmitGroupStreamInternal_(
+        Adapter, GroupAsSlot, StreamGpuVa, StreamSizeBytes, LatestFlush,
+        TimeoutMs, FALSE, NULL);
+}
+
+NTSTATUS
+WinMaliCsfSubmitTransientGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
+                                     _In_ ULONG   GroupAsSlot,
+                                     _In_ UINT64  StreamGpuVa,
+                                     _In_ ULONG   StreamSizeBytes,
+                                     _In_ ULONG   LatestFlush,
+                                     _In_ ULONG   TimeoutMs,
+                                     _Out_ PBOOLEAN OutParked)
+{
+    if (OutParked == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return WinMaliCsfSubmitGroupStreamInternal_(
+        Adapter, GroupAsSlot, StreamGpuVa, StreamSizeBytes, LatestFlush,
+        TimeoutMs, TRUE, OutParked);
 }
 
 /* Scheduler/TDR entry point. The scheduler has already quiesced its worker,
@@ -2517,8 +2604,9 @@ WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ struct _WINMALI_VM
         return status;
     }
 
-    WINMALI_TRACE("CsfMapIntoVm: AS%u ring/sync/shader mapped at 0x%llx/0x%llx/0x%llx",
-                  VmPt->AsSlot, (ULONGLONG)WINMALI_CSF_PROCESS_RING_GPU_VA,
+    WINMALI_TRACE("CsfMapIntoVm: nonresident root=0x%llx ring/sync/shader mapped at 0x%llx/0x%llx/0x%llx",
+                  (ULONGLONG)VmPt->RootPa.QuadPart,
+                  (ULONGLONG)WINMALI_CSF_PROCESS_RING_GPU_VA,
                   (ULONGLONG)WINMALI_CSF_PROCESS_SYNC_GPU_VA,
                   (ULONGLONG)WINMALI_CSF_PROCESS_SHADER_GPU_VA);
     return STATUS_SUCCESS;

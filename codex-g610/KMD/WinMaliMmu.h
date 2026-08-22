@@ -185,9 +185,9 @@ NTSTATUS WinMaliMmuUnmapGpuRange(
    Diagnostic surface will be rebuilt against v1.0 WinMaliEscape.h later. */
 
 //
-// AS-slot allocator and dxgk-context -> Mali AS binding. Used by
-// DxgkDdiCreateProcess / DxgkDdiSetRootPageTable / DxgkDdiDestroyProcess
-// (see WinMaliDxgkInitFill.c).
+// AS-slot allocator and transient dxgk-context -> Mali AS binding. The DDI
+// records a context root without binding it; the scheduler calls these bind /
+// unbind helpers around actual execution.
 //
 // WinMaliMmuInitAsAllocator marks AS0 (CSF MCU) and AS1 (kernel bring-up)
 // as in-use so dxgk handles never reuse them. Must be called once during
@@ -210,18 +210,15 @@ NTSTATUS WinMaliMmuBindContextRootPt(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _Out_opt_ PULONG         OutAs);
 
 //
-// Release the AS slot currently bound to `hContext` (no-op if none). Called
-// from DxgkDdiDestroyContext / DxgkDdiDestroyProcess so we never leak AS
-// slots across process exit.
+// Release the AS slot currently bound to `hContext` (no-op if none). Normally
+// called immediately after the CSG is parked following one submission.
 //
 NTSTATUS WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter,
                                  _In_ HANDLE              hContext);
 
 //
-// Return the Mali AS slot currently bound to `hContext` (via
-// SetRootPageTable / BindContextRootPt), or WINMALI_AS_SLOT_MAX if the
-// context has no dxgk-managed AS. Used by SubmitCommandVirtual to run a CS
-// against the dxgk GpuMmu page tables (Phase 2) rather than the escape VM AS.
+// Return the currently resident slot for diagnostics, or
+// WINMALI_AS_SLOT_MAX while the context is idle/nonresident.
 //
 ULONG    WinMaliMmuGetContextAsSlot(_In_ PWINMALI_ADAPTER Adapter,
                                     _In_ HANDLE            hContext);
@@ -262,15 +259,33 @@ typedef struct _WINMALI_VM_PT {
     /* All allocated pages (root + L1 + L2 + L3...) chained for teardown. */
     LIST_ENTRY          AllocatedPages;
     FAST_MUTEX          Lock;
-    /* AS slot the VM is bound to (WINMALI_AS_SLOT_MAX = unbound). */
+    /* Serializes transitions between non-resident and transiently resident.
+       Page tables exist for the VM's lifetime; scarce hardware AS slots do
+       not. AsSlot is valid only while AsLeaseCount is non-zero. */
+    FAST_MUTEX          ResidencyLock;
     ULONG               AsSlot;
+    LONG                AsLeaseCount;
 } WINMALI_VM_PT, *PWINMALI_VM_PT;
 
-// Initialize a fresh VM PT: allocates the L0 root, picks a free AS slot,
-// programs the AS via AS_TRANSTAB. Returns STATUS_INSUFFICIENT_RESOURCES if
-// no AS slot is available.
+// Initialize a fresh VM PT. This allocates the L0 root but deliberately does
+// not consume a hardware AS slot. The VM becomes resident only for execution.
 NTSTATUS WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter,
                           _Out_ PWINMALI_VM_PT VmPt);
+
+// Make a VM page table transiently resident in a hardware AS. Nested leases
+// share the same binding. Every successful acquire must have one release,
+// after the CSG has been parked away from the returned slot.
+NTSTATUS WinMaliMmuVmAcquireAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                               _Inout_ PWINMALI_VM_PT VmPt,
+                               _Out_ PULONG OutAs);
+VOID     WinMaliMmuVmReleaseAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                               _Inout_ PWINMALI_VM_PT VmPt,
+                               _In_ ULONG AsSlot);
+
+// Serialize the execution-residency window. Callers enter before leasing a
+// VM/context AS and leave only after the CSG is parked and the AS released.
+NTSTATUS WinMaliMmuEnterTransientExecution(_Inout_ PWINMALI_ADAPTER Adapter);
+VOID     WinMaliMmuLeaveTransientExecution(_Inout_ PWINMALI_ADAPTER Adapter);
 
 // Tear down a VM PT: disables the AS, frees all PT pages.
 VOID     WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter,

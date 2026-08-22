@@ -155,15 +155,18 @@
     <ClInclude Include="WinMaliDxgkStubsWire.h" />
     <ClInclude Include="WinMaliAlloc.h" />
     <ClInclude Include="WinMaliMmu.h" />
+    <ClInclude Include="WinMaliDiag.h" />
     <ClInclude Include="winmali_shader_programs.h" />
     <ClInclude Include="hw\WinMaliHw.h" />
     <ClInclude Include="..\Shared\WinMaliEscape.h" />
+    <ClInclude Include="..\Shared\WinMaliDiagnostic.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WinMaliAlloc.c" />
     <ClCompile Include="WinMaliBo.c" />
     <ClCompile Include="WinMaliBringup.c" />
     <ClCompile Include="WinMaliDdi.c" />
+    <ClCompile Include="WinMaliDiag.c" />
     <ClCompile Include="WinMaliDriver.c" />
     <ClCompile Include="WinMaliDxgkInitFill.c" />
     <ClCompile Include="WinMaliDxgkStubs.c" />

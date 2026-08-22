@@ -17,6 +17,7 @@
 #include "WinMaliSync.h"
 #include "WinMaliVm.h"
 #include "WinMaliGroup.h"
+#include "WinMaliDiag.h"
 
 /* Driver-wide trace shim. Focused builds remove routine success chatter while
    retaining warnings/errors and WINMALI_DIAG state-transition breadcrumbs. */
@@ -105,8 +106,12 @@ typedef struct _WINMALI_ADAPTER {
     BOOLEAN             CsfReservedPtValid;
 
     /* AS-slot allocator. AS0 is the CSF MCU; AS1 is the kernel bring-up
-       address space. AS2..AS(N-1) are leased per dxgk context. */
+       address space. AS2..AS(N-1) hold dxgk contexts or transient escape-VM
+       leases. Escape VM creation alone does not consume a slot. */
     KSPIN_LOCK          AsSlotLock;
+    /* One CSG executes at a time. Serialize before acquiring a transient AS
+       so queued jobs wait instead of hoarding all available slots. */
+    KMUTEX              TransientAsMutex;
     ULONG               AsSlotInUseMask;     /* bit i set => AS i programmed */
     ULONG               AsSlotPresentMask;   /* mirror of GPU_AS_PRESENT */
 #define WINMALI_AS_SLOT_MAX  16u
@@ -147,6 +152,11 @@ typedef struct _WINMALI_ADAPTER {
     /* Count of real CS submissions that reached a terminal failure. */
     ULONG               CsfSubmitFailures;
 
+    /* Bounded, nonpaged submission flight recorder. It is deliberately part
+       of the adapter lifetime so a collector can read the failure after the
+       submitting UMD has wedged, without allocating on the failure path. */
+    WINMALI_DIAG_STATE  Diag;
+
     /* Pending fence-completion queue: produced by WinMaliKmdSubmitCommand,
        drained by WinMaliKmdDpcRoutine which calls DxgkCbNotifyInterrupt.
        Synchronous "GPU work done immediately" path for paging submits we
@@ -183,6 +193,7 @@ typedef struct _WINMALI_ADAPTER {
         UINT    EngineOrdinal;
         BOOLEAN HasCs;
         ULONG   AsSlot;
+        PVOID   Context;                 /* referenced WINMALI_KMD_CONTEXT */
         LONG    ResetGeneration;
         WINMALI_CS_SUBMIT_DESC Cs;      /* owned copy; dxgk private data is transient */
     } SubmitQueue[WINMALI_SUBMIT_QUEUE_DEPTH];
@@ -250,11 +261,10 @@ NTSTATUS WinMaliReadParamsDword(_In_ PUNICODE_STRING RegistryPath,
                                 _In_ ULONG Default,
                                 _Out_ ULONG* Value);
 
-/* Bring-up policy: reject dwm.exe's CreateDevice so the compositor stops
-   churning devices/VMs/AS-slots on the render-only adapter. Read from
-   Parameters\AllowDwm at DriverEntry (default 0 = blocked); set to 1 +
-   reboot to let DWM back in without a rebuild. (v28's bugcheck-with-gate
-   was the DriverUnload 0x139 bug, fixed v32 - not this.) */
+/* Compositor policy: DWM is allowed to create devices on this render-only
+   adapter so it can consume application surfaces. Read from
+   Parameters\AllowDwm at DriverEntry (default 1 = enabled); set to 0 +
+   reboot to block DWM as a recovery escape hatch. */
 extern ULONG g_WinMaliAllowDwm;
 
 /* Auto-arm the kill-switch from inside DriverEntry. Used to prevent the
@@ -290,6 +300,17 @@ NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
                                      _In_ ULONG   TimeoutMs);
+/* Execute from a transient VM AS and park CSG0 back on the permanent bring-up
+   AS before returning. OutParked tells the caller whether it is safe to
+   release/recycle GroupAsSlot. */
+NTSTATUS WinMaliCsfSubmitTransientGroupStream(
+                                     _Inout_ PWINMALI_ADAPTER Adapter,
+                                     _In_ ULONG   GroupAsSlot,
+                                     _In_ UINT64  StreamGpuVa,
+                                     _In_ ULONG   StreamSizeBytes,
+                                     _In_ ULONG   LatestFlush,
+                                     _In_ ULONG   TimeoutMs,
+                                     _Out_ PBOOLEAN OutParked);
 NTSTATUS WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter);
 
 /* Cross-map the CSF ring/sync/shader pages into an escape-owned UMD group's

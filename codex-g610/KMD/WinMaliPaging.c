@@ -27,7 +27,8 @@
    diagnostic deliberately narrow: the initial VidMm population touches four
    512-entry tables, and dumping every PTE makes the useful ordering almost
    impossible to recover from DbgView. */
-#define WINMALI_PAGING_DIAG_GPU_VA  (0x0000fffffffe6000ull)
+#define WINMALI_PAGING_DIAG_STREAM_GPU_VA (0x0000fffffffe6000ull)
+#define WINMALI_PAGING_DIAG_FAULT_GPU_VA  (0x0000ffffffa26700ull)
 
 /* DXGK_PTE stores the high 52 bits of a physical address: in other words,
    PageAddress/PageTableAddress are page frame numbers and the implicit low
@@ -48,11 +49,16 @@ static BOOLEAN
 WinMaliPagingIsDiagnosticPte_(
     _In_ const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE* op,
     _In_ UINT entryOffset,
-    _Out_opt_ UINT64* entryGpuVa)
+    _Out_opt_ UINT64* entryGpuVa,
+    _Out_opt_ UINT64* targetGpuVa)
 {
+    static const UINT64 targets[] = {
+        WINMALI_PAGING_DIAG_STREAM_GPU_VA,
+        WINMALI_PAGING_DIAG_FAULT_GPU_VA
+    };
     UINT shift;
     UINT64 va;
-    UINT64 target;
+    ULONG targetIndex;
 
     if (op == NULL || op->PageTableLevel > 3u) {
         return FALSE;
@@ -62,11 +68,21 @@ WinMaliPagingIsDiagnosticPte_(
        bits at every level, one entry covers 4 KiB << (9 * level). */
     shift = 12u + (9u * op->PageTableLevel);
     va = op->FirstPteVirtualAddress + ((UINT64)entryOffset << shift);
-    target = WINMALI_PAGING_DIAG_GPU_VA & ~((1ull << shift) - 1ull);
     if (entryGpuVa != NULL) {
         *entryGpuVa = va;
     }
-    return va == target;
+    for (targetIndex = 0; targetIndex < RTL_NUMBER_OF(targets);
+         ++targetIndex) {
+        UINT64 alignedTarget =
+            targets[targetIndex] & ~((1ull << shift) - 1ull);
+        if (va == alignedTarget) {
+            if (targetGpuVa != NULL) {
+                *targetGpuVa = targets[targetIndex];
+            }
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static VOID
@@ -78,18 +94,21 @@ WinMaliPagingTraceDiagnosticPte_(
 {
     PHYSICAL_ADDRESS tablePa;
     UINT64 entryGpuVa = 0;
+    UINT64 targetGpuVa = 0;
     UINT absoluteIndex;
 
-    if (!WinMaliPagingIsDiagnosticPte_(op, entryOffset, &entryGpuVa)) {
+    if (!WinMaliPagingIsDiagnosticPte_(op, entryOffset, &entryGpuVa,
+                                       &targetGpuVa)) {
         return;
     }
 
     absoluteIndex = op->StartIndex + entryOffset;
     tablePa = MmGetPhysicalAddress(op->PageTableAddress.CpuVirtual);
 
-    WINMALI_TRACE(
+    WINMALI_DIAG(
         "PTW-DIAG: process=%p level=%u tableVa=%p tablePa=0x%llx "
-        "start=%u offset=%u index=%u entryGpuVa=0x%llx firstPteVa=0x%llx "
+        "start=%u offset=%u index=%u targetGpuVa=0x%llx "
+        "entryGpuVa=0x%llx firstPteVa=0x%llx "
         "initial=%u repeat=%u alloc=%p allocOff=0x%llx",
         op->hProcess,
         op->PageTableLevel,
@@ -98,13 +117,14 @@ WinMaliPagingTraceDiagnosticPte_(
         op->StartIndex,
         entryOffset,
         absoluteIndex,
+        (ULONGLONG)targetGpuVa,
         (ULONGLONG)entryGpuVa,
         (ULONGLONG)op->FirstPteVirtualAddress,
         op->Flags.InitialUpdate,
         op->Flags.Repeat,
         op->hAllocation,
         (ULONGLONG)op->AllocationOffsetInBytes);
-    WINMALI_TRACE(
+    WINMALI_DIAG(
         "PTW-DIAG: level=%u index=%u rawFlags=0x%llx valid=%u zero=%u "
         "coherent=%u ro=%u nx=%u segment=%u large=%u adapter=%u "
         "ptPageSize=%u pageNumber=0x%llx resolvedPa=0x%llx "

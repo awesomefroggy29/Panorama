@@ -39,8 +39,9 @@ int winmali_wddm_syncobj_arm(uint32_t handle, uint64_t *inout_point);
 int winmali_wddm_syncobj_complete(uint32_t handle, uint64_t point);
 
 /* When installed, winmali_kmod_bo_alloc routes through these. NULL = escape
- * BoCreate (baseline). Any per-alloc failure falls back to escape BoCreate,
- * so a bug in this path can never brick boot. */
+ * BoCreate (used by non-WDDM clients). A WDDM allocation failure is returned
+ * to Mesa; it must never silently create an escape-private BO because that BO
+ * would not exist in the dxgkrnl process page tables used for submission. */
 struct winmali_wddm_alloc_ops {
    void *cookie;
 

@@ -84,7 +84,8 @@ extern "C" {
 /* Bumped for additive changes. KMD returns -EOPNOTSUPP for unknown ops.       */
 /* 1: + WinMaliEscapeOp_DebugLog (UMD -> UART log mirroring)                    */
 /* 2: + asynchronous SyncObjTransfer (pending-fence propagation)                */
-#define WINMALI_ABI_MINOR       2
+/* 3: + diagnostic submission flight recorder and guarded replay                 */
+#define WINMALI_ABI_MINOR       3
 
 /* KMD pool tag. Appears as "WinM" in !pooltrack / Driver Verifier output.    */
 #define WINMALI_POOL_TAG        'MniW'
@@ -161,6 +162,7 @@ typedef enum _WINMALI_ESCAPE_OP {
      * without waiting for src.  Completion/failure is propagated by the KMD.
      * This is the WinMali equivalent of DRM_IOCTL_SYNCOBJ_TRANSFER. */
     WinMaliEscapeOp_SyncObjTransfer     = 0x93,
+    WinMaliEscapeOp_Diagnostic          = 0x94,
 } WINMALI_ESCAPE_OP;
 
 /* -------------------------------------------------------------------------- */

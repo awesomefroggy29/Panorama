@@ -426,9 +426,9 @@ WinMaliKmdUnmapProcessReservedGpuVa(
     return STATUS_SUCCESS;
 }
 
-/* Per-context state. Each context binds (lazily, via SetRootPageTable)
-   to a Mali AS slot. dxgk hands hContext back to us for every submit, so
-   the KMD_CONTEXT address must stay valid until DestroyContext. */
+/* Per-context state. SetRootPageTable records the VidMm-owned root here but
+   does not consume a hardware AS. The scheduler leases an AS only around
+   actual CSF execution and parks the CSG before releasing it. */
 typedef struct _WINMALI_KMD_CONTEXT {
     ULONG               Magic;
     PWINMALI_ADAPTER    Adapter;
@@ -439,7 +439,96 @@ typedef struct _WINMALI_KMD_CONTEXT {
     UINT                Flags;
     UINT64              SubmittedFence;
     UINT64              CompletedFence;
+    FAST_MUTEX          ResidencyLock;
+    UINT64              RootPtPa;
+    ULONG               AsSlot;
+    LONG                AsLeaseCount;
+    LONG                RefCount;
+    LONG                Destroying;
+    KEVENT              RefZeroEvent;
 } WINMALI_KMD_CONTEXT, *PWINMALI_KMD_CONTEXT;
+
+static VOID
+WinMaliContextPut_(_In_opt_ PWINMALI_KMD_CONTEXT ctx)
+{
+    if (ctx != NULL) {
+        LONG refs = InterlockedDecrement(&ctx->RefCount);
+        if (refs == 0) {
+            KeSetEvent(&ctx->RefZeroEvent, IO_NO_INCREMENT, FALSE);
+        } else if (refs < 0) {
+            WINMALI_ERROR("ContextPut: refcount underflow ctx=%p", ctx);
+        }
+    }
+}
+
+static BOOLEAN
+WinMaliContextGet_(_In_opt_ PWINMALI_KMD_CONTEXT ctx)
+{
+    if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC ||
+        InterlockedCompareExchange(&ctx->Destroying, 0, 0) != 0) {
+        return FALSE;
+    }
+    InterlockedIncrement(&ctx->RefCount);
+    if (InterlockedCompareExchange(&ctx->Destroying, 0, 0) != 0) {
+        WinMaliContextPut_(ctx);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static NTSTATUS
+WinMaliContextAcquireAs_(_Inout_ PWINMALI_KMD_CONTEXT ctx,
+                         _Out_ PULONG outAs)
+{
+    NTSTATUS status;
+
+    *outAs = WINMALI_AS_SLOT_MAX;
+    ExAcquireFastMutex(&ctx->ResidencyLock);
+    if (ctx->RootPtPa == 0) {
+        ExReleaseFastMutex(&ctx->ResidencyLock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (ctx->AsLeaseCount > 0 && ctx->AsSlot < WINMALI_AS_SLOT_MAX) {
+        ++ctx->AsLeaseCount;
+        *outAs = ctx->AsSlot;
+        ExReleaseFastMutex(&ctx->ResidencyLock);
+        return STATUS_SUCCESS;
+    }
+
+    status = WinMaliMmuBindContextRootPt(
+        ctx->Adapter, (HANDLE)ctx, ctx->RootPtPa, &ctx->AsSlot);
+    if (NT_SUCCESS(status)) {
+        ctx->AsLeaseCount = 1;
+        *outAs = ctx->AsSlot;
+        WINMALI_DIAG("CONTEXT RESIDENCY: acquire ctx=%p root=0x%llx AS%u inUse=0x%x",
+                     ctx, (ULONGLONG)ctx->RootPtPa, ctx->AsSlot,
+                     ctx->Adapter->AsSlotInUseMask);
+    }
+    ExReleaseFastMutex(&ctx->ResidencyLock);
+    return status;
+}
+
+static VOID
+WinMaliContextReleaseAs_(_Inout_ PWINMALI_KMD_CONTEXT ctx,
+                         _In_ ULONG asSlot)
+{
+    ExAcquireFastMutex(&ctx->ResidencyLock);
+    if (ctx->AsLeaseCount <= 0 || ctx->AsSlot != asSlot ||
+        asSlot >= WINMALI_AS_SLOT_MAX) {
+        WINMALI_WARN("ContextReleaseAs: mismatched lease ctx=%p requested=AS%u current=AS%u leases=%ld",
+                     ctx, asSlot, ctx->AsSlot, ctx->AsLeaseCount);
+        ExReleaseFastMutex(&ctx->ResidencyLock);
+        return;
+    }
+    --ctx->AsLeaseCount;
+    if (ctx->AsLeaseCount == 0) {
+        (VOID)WinMaliMmuUnbindContext(ctx->Adapter, (HANDLE)ctx);
+        ctx->AsSlot = WINMALI_AS_SLOT_MAX;
+        WINMALI_DIAG("CONTEXT RESIDENCY: release ctx=%p AS%u inUse=0x%x",
+                     ctx, asSlot, ctx->Adapter->AsSlotInUseMask);
+    }
+    ExReleaseFastMutex(&ctx->ResidencyLock);
+}
 
 /* Validate a dxgk-supplied device handle (e.g. DXGKARG_ESCAPE.hDevice)
    and return it as an opaque ownership token for the escape-created
@@ -685,15 +774,10 @@ WinMaliKmdCreateDevice(
         return STATUS_INVALID_HANDLE;
     }
 
-    /* Bring-up gate: DWM adopting the render-only adapter is pure churn
-       today (device/VM/BO create-teardown loops per composition probe).
-       Reject its device up front so it stays on the Basic Display adapter.
-       HISTORY: this gate was first added in v1.0.0.28 and reverted in v29
-       because the box bugchecked with it in - but that crash was the
-       DriverUnload-clobber 0x139 (dxgkrnl!DpiInitializeEx list corruption
-       on same-boot reinstall), fixed in v1.0.0.32; the gate itself was
-       innocent. Re-enabled in v1.0.0.35. Registry escape hatch (no
-       rebuild): Services\WinMaliKmd\Parameters\AllowDwm = 1 + reboot. */
+    /* DWM must be able to open this render-only adapter to consume and
+       composite application surfaces; this does not give WinMali physical
+       display ownership. Keep a registry-controlled recovery escape hatch:
+       Services\WinMaliKmd\Parameters\AllowDwm = 0 + reboot. */
     if (!g_WinMaliAllowDwm && WinMaliCallerIsDwm_()) {
         static LONG blocked = 0;
         if ((InterlockedIncrement(&blocked) & 0x3F) == 1) {
@@ -755,12 +839,10 @@ WinMaliKmdDestroyDevice(
         WINMALI_WARN("DestroyDevice: dev=%p leaks %ld contexts",
                      dev, dev->ContextCount);
     }
-    /* Run down every escape-created resource this device still owns. A UMD
-       that dies (or just never sends the destroy ops) must not leak: each
-       leaked VM pins a Mali AS slot and only 8 exist - six leaks and every
-       VmCreate adapter-wide fails -ENOMEM until reboot (seen live
-       2026-07-12: dwm/shell probes exhausted AS2..AS7, gl-smoke got 0
-       pixel formats). Order: groups reference VMs, BOs may be VM-bound, so
+    /* Run down every escape-created resource this device still owns. VM page
+       tables are non-resident until execution now, but abandoned groups, BOs,
+       sync objects and page tables still require deterministic cleanup.
+       Order: groups reference VMs, BOs may be VM-bound, so
        heaps -> groups -> remaining BOs -> syncobjs -> VMs.  Keep the process
        reference counted by this device until heap teardown has removed its
        process-private reserved mappings. */
@@ -842,6 +924,10 @@ WinMaliKmdCreateContext(
     ctx->NodeOrdinal    = pCreateContext->NodeOrdinal;
     ctx->EngineAffinity = pCreateContext->EngineAffinity;
     ctx->Flags          = pCreateContext->Flags.Value;
+    ExInitializeFastMutex(&ctx->ResidencyLock);
+    ctx->AsSlot         = WINMALI_AS_SLOT_MAX;
+    ctx->RefCount       = 1;
+    KeInitializeEvent(&ctx->RefZeroEvent, NotificationEvent, FALSE);
 
     InterlockedIncrement(&dev->ContextCount);
     pCreateContext->hContext                            = (HANDLE)ctx;
@@ -903,10 +989,21 @@ WinMaliKmdDestroyContext(
     if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC) {
         return STATUS_INVALID_HANDLE;
     }
-    /* Release the Mali AS slot bound to this context (if SetRootPageTable
-       ever ran). MMU unbind is idempotent / a no-op when nothing was bound. */
-    if (ctx->Adapter != NULL) {
+    InterlockedExchange(&ctx->Destroying, 1);
+    if (InterlockedDecrement(&ctx->RefCount) != 0) {
+        KeWaitForSingleObject(&ctx->RefZeroEvent, Executive, KernelMode,
+                              FALSE, NULL);
+    }
+    /* Normally no lease survives a completed worker packet. If firmware did
+       not acknowledge the safety park, reset/park before tearing down the
+       final binding rather than disabling an AS still named by CSG0. */
+    if (ctx->Adapter != NULL && ctx->AsSlot < WINMALI_AS_SLOT_MAX) {
+        if (ctx->AsLeaseCount > 0) {
+            (VOID)WinMaliCsfResetRenderEngine(ctx->Adapter);
+        }
         (VOID)WinMaliMmuUnbindContext(ctx->Adapter, (HANDLE)ctx);
+        ctx->AsSlot = WINMALI_AS_SLOT_MAX;
+        ctx->AsLeaseCount = 0;
     }
     if (ctx->OwnerDevice != NULL) {
         InterlockedDecrement(&ctx->OwnerDevice->ContextCount);
@@ -1045,8 +1142,7 @@ WinMaliKmdSetRootPageTable(
     IN_CONST_PDXGKARG_SETROOTPAGETABLE    pArgs)
 {
     PWINMALI_ADAPTER adapter;
-    ULONG            asSlot = 0;
-    NTSTATUS         bindSt;
+    PWINMALI_KMD_CONTEXT ctx;
     UINT64           rootPtPa = 0;
 
     WINMALI_TRACE("SetRootPageTableDiag: ENTER hAdapter=%p args=%p ctx=%p seg=%u off=0x%llx entries=%u",
@@ -1063,6 +1159,14 @@ WinMaliKmdSetRootPageTable(
     adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
     if (adapter == NULL) {
         WINMALI_WARN("SetRootPageTableDiag: EXIT invalid adapter=%p", hAdapter);
+        return;
+    }
+    ctx = (PWINMALI_KMD_CONTEXT)pArgs->hContext;
+    if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC ||
+        ctx->Adapter != adapter ||
+        InterlockedCompareExchange(&ctx->Destroying, 0, 0) != 0) {
+        WINMALI_WARN("SetRootPageTableDiag: EXIT invalid context=%p",
+                     pArgs->hContext);
         return;
     }
 
@@ -1099,19 +1203,28 @@ WinMaliKmdSetRootPageTable(
         return;
     }
 
-    bindSt = WinMaliMmuBindContextRootPt(adapter,
-                                         pArgs->hContext,
-                                         rootPtPa,
-                                         &asSlot);
-    WINMALI_TRACE("SetRootPageTable: ctx=%p seg=%u off=0x%llx pa=0x%llx entries=%u -> AS%u (0x%08x)",
+    if (rootPtPa != 0 && (rootPtPa & (PAGE_SIZE - 1ull)) != 0) {
+        WINMALI_WARN("SetRootPageTableDiag: unaligned root pa=0x%llx ctx=%p",
+                     (ULONGLONG)rootPtPa, ctx);
+        return;
+    }
+
+    ExAcquireFastMutex(&ctx->ResidencyLock);
+    if (ctx->AsLeaseCount != 0) {
+        WINMALI_WARN("SetRootPageTable: ctx=%p root update while resident AS%u leases=%ld ignored",
+                     ctx, ctx->AsSlot, ctx->AsLeaseCount);
+        ExReleaseFastMutex(&ctx->ResidencyLock);
+        return;
+    }
+    ctx->RootPtPa = rootPtPa;
+    ExReleaseFastMutex(&ctx->ResidencyLock);
+
+    WINMALI_DIAG("CONTEXT RESIDENCY: root recorded ctx=%p seg=%u off=0x%llx pa=0x%llx entries=%u (nonresident)",
                   pArgs->hContext,
                   pArgs->Address.SegmentId,
                   (ULONGLONG)pArgs->Address.SegmentOffset,
                   (ULONGLONG)rootPtPa,
-                   pArgs->NumEntries,
-                   asSlot, bindSt);
-    WINMALI_TRACE("SetRootPageTableDiag: EXIT ctx=%p status=0x%08x AS=%u",
-                  pArgs->hContext, bindSt, asSlot);
+                  pArgs->NumEntries);
 }
 
 /* Returns the root PT size in bytes and fills NumberOfPte with the root
@@ -1435,7 +1548,8 @@ static BOOLEAN
 WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
                       _In_ UINT node, _In_ UINT engine,
                       _In_opt_ const WINMALI_CS_SUBMIT_DESC* cs,
-                     _In_ ULONG asSlot)
+                      _In_ ULONG asSlot,
+                      _In_opt_ PWINMALI_KMD_CONTEXT context)
 {
     KIRQL   irql;
     ULONG   next;
@@ -1452,12 +1566,14 @@ WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
 
     KeAcquireSpinLock(&a->SubmitQueueLock, &irql);
     next = (a->SubmitQueueTail + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
-    if (next != a->SubmitQueueHead) {
+    if (next != a->SubmitQueueHead &&
+        (context == NULL || WinMaliContextGet_(context))) {
         a->SubmitQueue[a->SubmitQueueTail].FenceId       = fence;
         a->SubmitQueue[a->SubmitQueueTail].NodeOrdinal   = node;
         a->SubmitQueue[a->SubmitQueueTail].EngineOrdinal = engine;
         a->SubmitQueue[a->SubmitQueueTail].HasCs         = (cs != NULL) ? TRUE : FALSE;
         a->SubmitQueue[a->SubmitQueueTail].AsSlot        = asSlot;
+        a->SubmitQueue[a->SubmitQueueTail].Context       = context;
         a->SubmitQueue[a->SubmitQueueTail].ResetGeneration =
             InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0);
         if (cs != NULL) {
@@ -1489,6 +1605,9 @@ WinMaliSchedDrainNodeLocked_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT node)
     while (read != a->SubmitQueueTail) {
         ULONG next = (read + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
         if (a->SubmitQueue[read].NodeOrdinal == node) {
+            WinMaliContextPut_((PWINMALI_KMD_CONTEXT)
+                               a->SubmitQueue[read].Context);
+            a->SubmitQueue[read].Context = NULL;
             ++drained;
         } else {
             if (write != read) {
@@ -1574,6 +1693,7 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             UINT    fence = 0, node = 0, engine = 0;
             BOOLEAN hasCs = FALSE;
             ULONG   asSlot = WINMALI_AS_SLOT_MAX;
+            PWINMALI_KMD_CONTEXT submitContext = NULL;
             LONG    resetGeneration = 0;
             WINMALI_CS_SUBMIT_DESC cs;
 
@@ -1597,6 +1717,9 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                 engine    = a->SubmitQueue[a->SubmitQueueHead].EngineOrdinal;
                 hasCs     = a->SubmitQueue[a->SubmitQueueHead].HasCs;
                 asSlot    = a->SubmitQueue[a->SubmitQueueHead].AsSlot;
+                submitContext = (PWINMALI_KMD_CONTEXT)
+                    a->SubmitQueue[a->SubmitQueueHead].Context;
+                a->SubmitQueue[a->SubmitQueueHead].Context = NULL;
                 resetGeneration = a->SubmitQueue[a->SubmitQueueHead].ResetGeneration;
                 if (hasCs) {
                     RtlCopyMemory(&cs, &a->SubmitQueue[a->SubmitQueueHead].Cs,
@@ -1621,6 +1744,13 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             {
                 NTSTATUS st = STATUS_SUCCESS;
                 ULONG i;
+                PWINMALI_VM transientVm = NULL;
+                BOOLEAN transientLeased = FALSE;
+                BOOLEAN contextLeased = FALSE;
+                BOOLEAN transientParked = FALSE;
+                BOOLEAN executionGateHeld = FALSE;
+                BOOLEAN diagBegan = FALSE;
+                BOOLEAN preemptedBeforeExecution = FALSE;
                 ULONGLONG executeStart100ns = KeQueryInterruptTime();
 
                 WINMALI_DIAG("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
@@ -1651,6 +1781,25 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                                     &a->NodeSched[node].ResetGeneration, 0, 0) ||
                                 InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0 ||
                                 InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 0) != 0) {
+                                /* A pending preemption can cancel a packet
+                                   while it is still waiting on a dependency.
+                                   That packet never reached CSF and must not
+                                   be reported as completed.  Keep this fact
+                                   separate from the pending bit: a preemption
+                                   can also arrive while CSF is already running,
+                                   in which case the packet is allowed to finish
+                                   at our DMA-buffer preemption boundary. */
+                                if (resetGeneration ==
+                                        InterlockedCompareExchange(
+                                            &a->NodeSched[node].ResetGeneration,
+                                            0, 0) &&
+                                    InterlockedCompareExchange(
+                                        &a->SubmitWorkerStop, 0, 0) == 0 &&
+                                    InterlockedCompareExchange(
+                                        &a->NodeSched[node].PreemptPending,
+                                        0, 0) != 0) {
+                                    preemptedBeforeExecution = TRUE;
+                                }
                                 st = STATUS_CANCELLED;
                                 break;
                             }
@@ -1663,11 +1812,47 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                         }
                     }
                     if (NT_SUCCESS(st)) {
+                        st = WinMaliMmuEnterTransientExecution(a);
+                        executionGateHeld = NT_SUCCESS(st);
+                    }
+                    if (NT_SUCCESS(st)) {
+                        /* Both address models are non-resident while idle.
+                           A dxgk-addressed stream leases its recorded context
+                           root; an escape-addressed stream leases its VM root. */
+                        if (cs.Flags & WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) {
+                            if (submitContext == NULL) {
+                                st = STATUS_INVALID_HANDLE;
+                            } else {
+                                st = WinMaliContextAcquireAs_(submitContext,
+                                                             &asSlot);
+                                contextLeased = NT_SUCCESS(st);
+                            }
+                        } else {
+                            transientVm = WinMaliVmGet(a, cs.VmId);
+                            if (transientVm == NULL) {
+                                st = STATUS_INVALID_HANDLE;
+                            } else {
+                                st = WinMaliMmuVmAcquireAs(
+                                    a, &transientVm->Pt, &asSlot);
+                                transientLeased = NT_SUCCESS(st);
+                            }
+                        }
+                    }
+                    if (NT_SUCCESS(st)) {
+                        WinMaliDiagBeginSubmit(a, fence, cs.VmId, asSlot,
+                                               cs.StreamGpuVa, cs.StreamSize);
+                        diagBegan = TRUE;
                         WinMaliBoFlushVm(a, cs.VmId, TRUE);
-                        st = WinMaliCsfSubmitGroupStream(a, asSlot,
-                                                        cs.StreamGpuVa,
-                                                        cs.StreamSize,
-                                                        0u, 500u);
+                        if (transientVm != NULL || contextLeased) {
+                            st = WinMaliCsfSubmitTransientGroupStream(
+                                a, asSlot, cs.StreamGpuVa, cs.StreamSize,
+                                0u, 500u, &transientParked);
+                        } else {
+                            st = WinMaliCsfSubmitGroupStream(a, asSlot,
+                                                            cs.StreamGpuVa,
+                                                            cs.StreamSize,
+                                                            0u, 500u);
+                        }
                         WinMaliBoFlushVm(a, cs.VmId, FALSE);
                         WINMALI_DIAG("CSF WORKER EXECUTED: fence=%u vm=%u AS%u stream=0x%llx size=%u status=0x%08x elapsed100ns=%llu",
                                      fence, cs.VmId, asSlot,
@@ -1676,14 +1861,45 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                                      (ULONGLONG)(KeQueryInterruptTime() -
                                                  executeStart100ns));
                     }
+                    if (diagBegan) {
+                        WinMaliDiagCompleteSubmit(a, st);
+                    }
+                    if (transientVm != NULL) {
+                        if (transientLeased && transientParked) {
+                            WinMaliMmuVmReleaseAs(a, &transientVm->Pt, asSlot);
+                        } else if (transientLeased) {
+                            WINMALI_WARN("Sched: retaining transient AS%u vm=%u because CSG park was not acknowledged",
+                                         asSlot, cs.VmId);
+                        }
+                        WinMaliVmPut(transientVm);
+                    }
+                    if (contextLeased) {
+                        if (transientParked) {
+                            WinMaliContextReleaseAs_(submitContext, asSlot);
+                        } else {
+                            WINMALI_WARN("Sched: retaining transient AS%u ctx=%p because CSG park was not acknowledged",
+                                         asSlot, submitContext);
+                        }
+                    }
+                    if (executionGateHeld) {
+                        WinMaliMmuLeaveTransientExecution(a);
+                    }
                 }
                 if (resetGeneration !=
                     InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0) ||
-                    InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0 ||
-                    InterlockedCompareExchange(&a->NodeSched[node].PreemptPending, 0, 0) != 0) {
-                    WINMALI_WARN("Sched: dropping stale fence=%u generation=%ld after reset generation=%ld",
+                    InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) != 0) {
+                    WINMALI_WARN("Sched: dropping stale fence=%u generation=%ld currentGeneration=%ld stopping=%ld",
                                  fence, resetGeneration,
-                                 InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0));
+                                 InterlockedCompareExchange(
+                                     &a->NodeSched[node].ResetGeneration, 0, 0),
+                                 InterlockedCompareExchange(
+                                     &a->SubmitWorkerStop, 0, 0));
+                } else if (preemptedBeforeExecution) {
+                    /* The packet was removed from the software queue but was
+                       never submitted to CSF.  WinMaliSchedHandlePreempt_
+                       reports DMA_PREEMPTED and dxgkrnl can resubmit it. */
+                    WINMALI_DIAG("Sched: fence=%u canceled before CSF for pending preemption",
+                                 fence);
                 } else if (!NT_SUCCESS(st)) {
                     WinMaliSchedFinishSubmit_(a, &cs, fence, st);
                     ++a->CsfSubmitFailures;
@@ -1692,6 +1908,13 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                                   a->CsfSubmitFailures);
                     WinMaliSchedQueueTimeout_(a, fence, node, engine, st);
                 } else {
+                    /* Preemption is DMA-buffer-boundary based.  If CSF has
+                       already completed this packet, it is a real completion
+                       even when PreemptPending was raised while it ran.  Queue
+                       DMA_COMPLETED first and advance WorkerCompletedFence;
+                       the next worker iteration will then emit DMA_PREEMPTED
+                       with this fence as LastCompletedFenceId and drain only
+                       packets which never executed. */
                     WinMaliSchedFinishSubmit_(a, &cs, fence, STATUS_SUCCESS);
                     InterlockedExchange64(&a->NodeSched[node].WorkerCompletedFence,
                                           (LONG64)fence);
@@ -1715,6 +1938,7 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             WinMaliSchedUpdateIdleLocked_(a);
             KeReleaseSpinLock(&a->SubmitQueueLock, irql);
             WinMaliSchedRequestDpc_(a);
+            WinMaliContextPut_(submitContext);
 
             /* Do not execute later packets on a node while dxgkrnl is
                recovering the failed packet. */
@@ -1783,6 +2007,7 @@ VOID
 WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
 {
     PVOID th = Adapter->SubmitWorkerThread;
+    KIRQL irql;
     if (th == NULL) {
         return;
     }
@@ -1794,6 +2019,15 @@ WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
     KeWaitForSingleObject(th, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(th);
     Adapter->SubmitWorkerThread = NULL;
+    KeAcquireSpinLock(&Adapter->SubmitQueueLock, &irql);
+    while (Adapter->SubmitQueueHead != Adapter->SubmitQueueTail) {
+        WinMaliContextPut_((PWINMALI_KMD_CONTEXT)
+            Adapter->SubmitQueue[Adapter->SubmitQueueHead].Context);
+        Adapter->SubmitQueue[Adapter->SubmitQueueHead].Context = NULL;
+        Adapter->SubmitQueueHead =
+            (Adapter->SubmitQueueHead + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
+    }
+    KeReleaseSpinLock(&Adapter->SubmitQueueLock, irql);
     WINMALI_TRACE("SchedTeardown: async submit worker stopped");
 }
 
@@ -1856,7 +2090,7 @@ WinMaliKmdSubmitCommand(
                           (LONG64)pSubmit->SubmissionFenceId);
     if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
                                pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
-                               NULL, WINMALI_AS_SLOT_MAX)) {
+                               NULL, WINMALI_AS_SLOT_MAX, NULL)) {
         /* The packet was accepted by dxgkrnl but was not queued. Never claim
            completion for work that did not execute; enter the normal TDR
            recovery path instead. */
@@ -2001,6 +2235,8 @@ WinMaliKmdSubmitCommandVirtual(
     const WINMALI_CS_SUBMIT_DESC* queuedCs = NULL;
     ULONG asSlot = WINMALI_AS_SLOT_MAX;
     NTSTATUS csStatus = STATUS_SUCCESS;
+    BOOLEAN needsTransientVm = FALSE;
+    BOOLEAN needsTransientContext = FALSE;
 
     RtlZeroMemory(&csCopy, sizeof(csCopy));
 
@@ -2048,30 +2284,32 @@ WinMaliKmdSubmitCommandVirtual(
             (PWINMALI_CS_SUBMIT_DESC)pSubmit->pDmaBufferPrivateData;
         if (cs->Magic == WINMALI_CS_SUBMIT_DESC_MAGIC &&
             cs->StreamGpuVa != 0 && cs->StreamSize != 0) {
-            /* Phase 2 coupling: when the UMD marks this CS as dxgk-addressed
-               (WINMALI_DXGK_ADDR mapped its allocations via GpuMmu), the stream
-               references VAs in THIS dxgk context's page table - run against the
-               AS bound to it via SetRootPageTable. Otherwise (escape VmBind
-               baseline) use the escape VM's AS. Both resolve to a Mali AS slot
-               the CSG rebinds to before the CALL. The flag keeps the baseline
-               correct even if dxgk pre-binds an (empty) context AS. */
+            /* The descriptor records which page-table object the worker must
+               make resident. SetRootPageTable and VmCreate no longer reserve
+               AS slots while idle. */
             if (cs->Flags & WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) {
-                asSlot = WinMaliMmuGetContextAsSlot(adapter, pSubmit->hContext);
+                PWINMALI_KMD_CONTEXT ctx =
+                    (PWINMALI_KMD_CONTEXT)pSubmit->hContext;
+                if (ctx != NULL && ctx->Magic == WINMALI_KMD_CONTEXT_MAGIC &&
+                    ctx->Adapter == adapter && ctx->RootPtPa != 0 &&
+                    InterlockedCompareExchange(&ctx->Destroying, 0, 0) == 0) {
+                    needsTransientContext = TRUE;
+                }
             } else {
                 PWINMALI_VM vm = WinMaliVmGet(adapter, cs->VmId);
                 if (vm != NULL) {
-                    asSlot = vm->Pt.AsSlot;
+                    needsTransientVm = TRUE;
                     WinMaliVmPut(vm);
                 }
             }
             if (cs->SyncCount > WINMALI_CS_SUBMIT_MAX_SYNCS) {
                 WINMALI_ERROR("SubmitCommandVirtual: invalid sync count=%u", cs->SyncCount);
                 csStatus = STATUS_INVALID_PARAMETER;
-            } else if (asSlot < WINMALI_AS_SLOT_MAX) {
+            } else if (needsTransientContext || needsTransientVm) {
                 RtlCopyMemory(&csCopy, cs, sizeof(csCopy));
                 queuedCs = &csCopy;
             } else {
-                WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no AS slot",
+                WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no address space",
                              cs->VmId);
                 RtlCopyMemory(&csCopy, cs, sizeof(csCopy));
                 csStatus = STATUS_DEVICE_NOT_READY;
@@ -2096,7 +2334,8 @@ WinMaliKmdSubmitCommandVirtual(
     }
     if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
                                pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
-                               queuedCs, asSlot)) {
+                               queuedCs, asSlot,
+                               (PWINMALI_KMD_CONTEXT)pSubmit->hContext)) {
         NTSTATUS queueStatus = STATUS_DEVICE_BUSY;
         WinMaliSchedFinishSubmit_(adapter, queuedCs,
                                   pSubmit->SubmissionFenceId, queueStatus);

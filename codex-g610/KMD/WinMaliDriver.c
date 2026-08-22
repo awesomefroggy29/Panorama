@@ -40,10 +40,9 @@ WinMaliAdapterFromDxgkHandle(_In_opt_ const VOID* hAdapter)
 /* Entry points                                                            */
 /* ---------------------------------------------------------------------- */
 
-/* Bring-up policy toggle, see WinMaliKmd.h. DWM must remain blocked until
-   the UMD and Panfrost support the complete compositor state contract
-   (including multiple viewport/scissor slots). */
-ULONG g_WinMaliAllowDwm = 0;
+/* Compositor policy toggle, see WinMaliKmd.h. DWM is enabled by default so
+   it can consume surfaces produced by this render-only adapter. */
+ULONG g_WinMaliAllowDwm = 1;
 
 _Use_decl_annotations_
 NTSTATUS
@@ -59,7 +58,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DbgPrint("[WinMali] >> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR "\n",
              WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
 
-    (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowDwm", 0, &g_WinMaliAllowDwm);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowDwm", 1, &g_WinMaliAllowDwm);
     DbgPrint("[WinMali]    AllowDwm=%lu (%s)\n", g_WinMaliAllowDwm,
              g_WinMaliAllowDwm ? "dwm.exe may create devices"
                                : "dwm.exe CreateDevice -> ACCESS_DENIED");
@@ -136,6 +135,7 @@ WinMaliKmdAddDevice(
     WinMaliVmTableInit(&adapter->VmTable);
     WinMaliGroupTableInit(&adapter->GroupTable);
     WinMaliTilerHeapTableInit(adapter);
+    WinMaliDiagInit(&adapter->Diag);
 
     g_WinMaliAdapter       = adapter;
     *MiniportDeviceContext = adapter;

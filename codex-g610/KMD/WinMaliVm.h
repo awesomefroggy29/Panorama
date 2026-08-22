@@ -5,16 +5,17 @@
  * WinMaliEscape ops 1..4. This layer is fully wired (the header once said
  * "metadata-only / VmBind NOT YET WIRED" - that is stale):
  *
- *   VmCreate       allocates a VM id, picks/binds a Mali AS slot, builds the
- *                  L0 root page table (WinMaliMmuVmInit) and cross-maps the CSF
- *                  ring/sync/shader pages into the new AS
- *   VmDestroy      tears down the AS slot + page tables, releases the id
+ *   VmCreate       allocates a VM id and L0 root page table, then cross-maps
+ *                  the CSF ring/sync/shader pages. It does not consume one of
+ *                  the six user hardware AS slots.
+ *   VmDestroy      tears down the page tables and releases the id
  *   VmGetState     returns Usable / Unusable
  *   VmBind         maps/unmaps a BO's pages into the VM's per-VM LPAE page
  *                  table at the UMD-chosen VA (WinMaliMmuVmMap/VmUnmap)
  *
- * The CSG executes against these per-VM AS slots. (dxgk's SetRootPageTable
- * path binds a separate AS keyed on hContext and is largely unexercised.)
+ * At execution the VM leases an AS, the CSG runs against it, then is parked
+ * back on AS1 before the lease is returned. Dxgk-addressed streams use the
+ * AS associated with their WDDM context instead.
  */
 
 #pragma once
@@ -40,6 +41,7 @@ typedef struct _WINMALI_VM {
     UINT64                  UserVaBase;     /* GPU VA base for user mappings */
     UINT64                  UserVaSize;     /* in bytes */
     LONG                    RefCount;
+    KEVENT                  RefZeroEvent;
     /* Real per-VM PT - allocated by WinMaliMmuVmInit on VmCreate. */
     WINMALI_VM_PT           Pt;
     BOOLEAN                 PtInitialized;
@@ -50,8 +52,7 @@ typedef struct _WINMALI_VM {
     UINT64                  KmdVaNext;
     /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this VM.
        DestroyDevice runs down everything it owns - a UMD process that
-       dies without VmDestroy must not leak the AS slot (there are only
-       8; leaking 6 bricks VmCreate adapter-wide with -ENOMEM). */
+       dies without VmDestroy must not leak page tables or other resources. */
     PVOID                   OwnerDevice;
 } WINMALI_VM, *PWINMALI_VM;
 

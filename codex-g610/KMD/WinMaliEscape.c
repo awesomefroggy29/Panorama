@@ -1360,20 +1360,39 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
             NTSTATUS csfSt = STATUS_INVALID_PARAMETER;
             ULONG    asSlot = WINMALI_AS_SLOT_MAX;
             ULONG    vmId   = 0;
+            PWINMALI_VM vm  = NULL;
+            BOOLEAN parked  = FALSE;
+            BOOLEAN leased  = FALSE;
+            BOOLEAN gateHeld = FALSE;
 
-            if (WinMaliGroupGetVmId(adapter, args->GroupHandle, &vmId) == WMERR_OK) {
-                PWINMALI_VM vm = WinMaliVmGet(adapter, vmId);
+            csfSt = WinMaliMmuEnterTransientExecution(adapter);
+            gateHeld = NT_SUCCESS(csfSt);
+
+            if (gateHeld &&
+                WinMaliGroupGetVmId(adapter, args->GroupHandle, &vmId) == WMERR_OK) {
+                vm = WinMaliVmGet(adapter, vmId);
                 if (vm != NULL) {
-                    asSlot = vm->Pt.AsSlot;
-                    WinMaliVmPut(vm);
+                    csfSt = WinMaliMmuVmAcquireAs(adapter, &vm->Pt, &asSlot);
+                    leased = NT_SUCCESS(csfSt);
                 }
             }
 
-            if (asSlot >= WINMALI_AS_SLOT_MAX || qs->StreamAddr == 0 || qs->StreamSize == 0) {
+            if (!leased || asSlot >= WINMALI_AS_SLOT_MAX ||
+                qs->StreamAddr == 0 || qs->StreamSize == 0) {
                 WINMALI_WARN("GroupSubmit: group=%u queue=%u no runnable stream "
-                             "(as=%u stream_va=0x%llx size=%u)",
+                             "(as=%u stream_va=0x%llx size=%u lease_st=0x%08x)",
                              args->GroupHandle, qs->QueueIndex, asSlot,
-                             (ULONGLONG)qs->StreamAddr, qs->StreamSize);
+                             (ULONGLONG)qs->StreamAddr, qs->StreamSize, csfSt);
+                if (leased) {
+                    /* No CSG submission occurred, so the slot is not active. */
+                    WinMaliMmuVmReleaseAs(adapter, &vm->Pt, asSlot);
+                }
+                if (vm != NULL) {
+                    WinMaliVmPut(vm);
+                }
+                if (gateHeld) {
+                    WinMaliMmuLeaveTransientExecution(adapter);
+                }
                 err = WMERR_EINVAL;
                 break;
             }
@@ -1387,9 +1406,18 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                readback of the render target sees the GPU's output. */
             WinMaliBoFlushVm(adapter, vmId, TRUE /* clean CPU->DRAM */);
 
-            csfSt = WinMaliCsfSubmitGroupStream(adapter, asSlot, qs->StreamAddr,
-                                                qs->StreamSize, 0u, 500u);
+            csfSt = WinMaliCsfSubmitTransientGroupStream(
+                adapter, asSlot, qs->StreamAddr, qs->StreamSize,
+                0u, 500u, &parked);
             WinMaliBoFlushVm(adapter, vmId, FALSE /* invalidate DRAM->CPU */);
+            if (parked) {
+                WinMaliMmuVmReleaseAs(adapter, &vm->Pt, asSlot);
+            } else {
+                WINMALI_WARN("GroupSubmit: retaining transient AS%u vm=%u because CSG park was not acknowledged",
+                             asSlot, vmId);
+            }
+            WinMaliVmPut(vm);
+            WinMaliMmuLeaveTransientExecution(adapter);
             if (!NT_SUCCESS(csfSt)) {
                 WINMALI_WARN("GroupSubmit: group=%u queue=%u REAL stream failed 0x%08x "
                              "(as=%u stream_va=0x%llx size=%u)",
@@ -1548,6 +1576,16 @@ WinMaliKmdEscape(
     case WinMaliEscapeOp_SyncObjTransfer:
         hdr->Status = WinMaliEscapeSyncObjTransfer_(adapter, hdr, pEscape);
         break;
+    case WinMaliEscapeOp_Diagnostic: {
+        WINMALI_DIAG_CONTROL* args =
+            (WINMALI_DIAG_CONTROL*)WinMaliEscapeAt_(
+                pEscape, sizeof(*hdr), sizeof(*args));
+        hdr->Status = (args != NULL)
+            ? WinMaliDiagEscape(adapter, args,
+                                pEscape->PrivateDriverDataSize - sizeof(*hdr))
+            : WMERR_EINVAL;
+        break;
+    }
     case WinMaliEscapeOp_SyncObjWait:
         hdr->Status = WinMaliEscapeSyncObjWait_(adapter, hdr, pEscape);
         break;

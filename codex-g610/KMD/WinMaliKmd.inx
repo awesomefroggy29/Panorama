@@ -158,10 +158,10 @@ ServiceBinary  = %13%\WinMaliKmd.sys
 AddReg         = WinMaliKmd.Service.AddReg
 
 [WinMaliKmd.Service.AddReg]
-; Keep DWM on the Microsoft display path until WinMali's D3D UMD supports
-; the compositor's complete multi-viewport/scissor contract. Deliberately
-; overwrite an older experimental AllowDwm=1 during driver update.
-HKR, Parameters, AllowDwm, %REG_DWORD%, 0
+; DWM must be able to open the render-only adapter to consume/composite
+; surfaces presented by applications. Set this to 0 as a recovery escape
+; hatch if compositor device creation must be disabled for diagnosis.
+HKR, Parameters, AllowDwm, %REG_DWORD%, 1
 
 [WinMaliKmd.EventLog]
 AddReg = WinMaliKmd.EventLog.AddReg
@@ -220,9 +220,9 @@ HKR,, VgaCompatible,           %REG_DWORD%,    0
 ; D3D UMD registration. REQUIRED: without InstalledDisplayDrivers/
 ; UserModeDriverName dxgkrnl fails the adapter with Code 43 (a render-only
 ; WDDM adapter still needs a D3D UMD to start). So the UMD stays registered,
-; while Services\WinMaliKmd\Parameters\AllowDwm=0 prevents DWM from adopting
-; it until the compositor contract is complete. Explicit test applications
-; can still select the Mali adapter. GL and Vulkan registration remains active.
+; and DWM is allowed to open it for cross-adapter composition. Setting
+; Services\WinMaliKmd\Parameters\AllowDwm=0 remains the recovery escape hatch.
+; GL and Vulkan registration remains active.
 ;
 HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, WinMaliUmd, WinMaliUmd, WinMaliUmd, WinMaliUmd
 HKR,, UserModeDriverName,    %REG_MULTI_SZ%, <>, "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll"

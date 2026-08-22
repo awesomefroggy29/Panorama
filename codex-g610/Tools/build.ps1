@@ -214,7 +214,11 @@ function Invoke-MesaBuild([string]$mesaPlatform) {
         Platform = $mesaPlatform
         DriverLogProfile = $DriverLogProfile
     }
-    if ($Rebuild) { $mesaArgs.Reconfigure = $true } else { $mesaArgs.SkipIfPresent = $true }
+    # Always let Meson/Ninja perform its incremental dependency check. Merely
+    # finding old output DLLs does not mean they contain current sources; using
+    # SkipIfPresent here previously allowed a newly edited UMD to be packaged
+    # without compiling it. -Rebuild additionally recreates the Meson tree.
+    if ($Rebuild) { $mesaArgs.Reconfigure = $true }
     # Keep the function's return contract to one integer.  Otherwise every
     # line emitted by Meson becomes part of $code in the caller.
     & $mesaScript @mesaArgs | Out-Host
