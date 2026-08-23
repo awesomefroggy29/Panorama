@@ -1,3 +1,3 @@
-# rk3588-GPU
+# winmali for mali g610
 
-TODO ima just rewrite this when i add other models i guess.
+that one guy working on the mali g610
