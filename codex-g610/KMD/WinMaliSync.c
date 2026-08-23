@@ -560,7 +560,7 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
         WINMALI_ERROR("SyncObjWait: invalid args count=%u handles=%p", Count, Handles);
         return WMERR_EINVAL;
     }
-    WINMALI_DIAG("SyncObjWait: ENTER count=%u waitAll=%u timeoutNs=%lld handle0=%u point0=%llu",
+    WINMALI_ROUTINE("SyncObjWait: ENTER count=%u waitAll=%u timeoutNs=%lld handle0=%u point0=%llu",
                  Count, WaitAll, (long long)TimeoutNs, Handles[0],
                  (unsigned long long)(Points != NULL ? Points[0] : 0));
     pTimeout = WinMaliSyncObjMakeTimeout_(&timeout, TimeoutNs);
@@ -687,7 +687,7 @@ WinMaliSyncObjWait(_Inout_ PWINMALI_ADAPTER Adapter,
             failed = timeline ? singleSo->TimelineFailedValue
                               : singleSo->BinaryFailedValue;
             KeReleaseSpinLock(&singleSo->Lock, oldIrql);
-            WINMALI_DIAG("SyncObjWait: EXIT handle=%u point=%llu timeline=%u current=%llu failed=%llu err=%d",
+            WINMALI_ROUTINE("SyncObjWait: EXIT handle=%u point=%llu timeline=%u current=%llu failed=%llu err=%d",
                          Handles[0],
                          (unsigned long long)(Points != NULL ? Points[0] : 0),
                          timeline, (unsigned long long)current,

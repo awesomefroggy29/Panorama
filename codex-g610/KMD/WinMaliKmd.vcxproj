@@ -102,6 +102,7 @@
     <WinMaliKmdVersion>$(WinMaliVersionMajor).$(WinMaliVersionMinor).$(WinMaliVersionBuild).$(WinMaliVersionRevision)</WinMaliKmdVersion>
     <WinMaliLogProfile Condition="'$(WinMaliLogProfile)' == ''">Verbose</WinMaliLogProfile>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Focused'">WINMALI_LOG_FOCUSED=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Lifecycle'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
   </PropertyGroup>
 
   <ItemDefinitionGroup>

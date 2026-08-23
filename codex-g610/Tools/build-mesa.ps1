@@ -64,7 +64,9 @@ param(
     # Verbose retains the historical UMD diagnostics. Focused removes the
     # noisy adapter-enumeration dump while retaining failures and the render,
     # synchronization, and DXGI presentation breadcrumbs used for bring-up.
-    [ValidateSet("Verbose","Focused")]
+    # Lifecycle disables Mesa and UMD logging completely; only KMD lifecycle
+    # messages remain visible.
+    [ValidateSet("Verbose","Focused","Lifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
@@ -528,6 +530,10 @@ $env:CXXFLAGS = "$env:CXXFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILE
 if ($DriverLogProfile -eq "Focused") {
     $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_FOCUSED=1"
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "Lifecycle") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_LIFECYCLE=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_LIFECYCLE=1"
 }
 
 # MSYS2 flex emits POSIX names even for Windows scanners.  Force-include a

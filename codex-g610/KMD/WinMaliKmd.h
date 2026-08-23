@@ -19,16 +19,37 @@
 #include "WinMaliGroup.h"
 #include "WinMaliDiag.h"
 
-/* Driver-wide trace shim. Focused builds remove routine success chatter while
-   retaining warnings/errors and WINMALI_DIAG state-transition breadcrumbs. */
-#if defined(WINMALI_LOG_FOCUSED)
+/* Driver-wide trace shim. Lifecycle builds retain only the explicit lifecycle
+   channel below. Suppress raw DbgPrint and direct UART-mirror call sites too,
+   so an old diagnostic cannot accidentally become a high-frequency sink. */
+#if defined(WINMALI_LOG_LIFECYCLE)
+#undef DbgPrint
+#define DbgPrint(...)             (0UL)
+#define WinMaliLogPrint(...)      (0UL)
+#define WINMALI_TRACE(fmt, ...)   ((void)0)
+#define WINMALI_DIAG(fmt, ...)    ((void)0)
+#define WINMALI_ROUTINE(fmt, ...) ((void)0)
+#define WINMALI_WARN(fmt, ...)    ((void)0)
+#define WINMALI_ERROR(fmt, ...)   ((void)0)
+#define WINMALI_LIFECYCLE(fmt, ...) \
+    WinMaliLifecycleLogPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#elif defined(WINMALI_LOG_FOCUSED)
 #define WINMALI_TRACE(fmt, ...) ((void)0)
-#else
-#define WINMALI_TRACE(fmt, ...) DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
-#endif
 #define WINMALI_DIAG(fmt, ...)  DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_ROUTINE(fmt, ...) ((void)0)
 #define WINMALI_WARN(fmt, ...)  DbgPrint("[WinMali] WARN " fmt "\n", ##__VA_ARGS__)
 #define WINMALI_ERROR(fmt, ...) DbgPrint("[WinMali] ERR  " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_LIFECYCLE(fmt, ...) \
+    DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#else
+#define WINMALI_TRACE(fmt, ...) DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_DIAG(fmt, ...)  DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_ROUTINE(fmt, ...) DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_WARN(fmt, ...)  DbgPrint("[WinMali] WARN " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_ERROR(fmt, ...) DbgPrint("[WinMali] ERR  " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_LIFECYCLE(fmt, ...) \
+    DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 /*
  * Per-adapter context. dxgk hands MiniportDeviceContext back to us on
@@ -76,6 +97,19 @@ typedef struct _WINMALI_ADAPTER {
     LONG64              InterruptsTotal;
     LONG64              InterruptsHandled;
     LONG64              InterruptsSpurious;
+
+    /* CSF firmware GLOBAL_IF wake channel.  The ISR only records the edge
+       and queues the normal dxgk DPC; the DPC signals this event at
+       DISPATCH_LEVEL so PASSIVE_LEVEL firmware waits do not depend on the
+       coarse system timer tick.  Waiters always re-read the firmware ACK or
+       sync sequence -- an interrupt is a wake hint, never completion proof. */
+    KEVENT              CsfFirmwareEvent;
+    LONG                CsfFirmwareDpcPending;
+    LONG                CsfFirmwareIrqWaitEnabled;
+    LONG64              CsfFirmwareIrqEpoch;
+    LONG64              CsfFirmwareEventWakes;
+    LONG64              CsfFirmwareFastPollHits;
+    LONG64              CsfFirmwareWaitTimeouts;
 
     /* Contiguous non-cached heap: page tables, FW page tables, MMU scratch. */
     PVOID               MmuScratchHeapVa;
@@ -429,6 +463,10 @@ BOOLEAN APIENTRY WinMaliKmdInterruptRoutine(
 
 VOID APIENTRY WinMaliKmdDpcRoutine(
     _In_ CONST PVOID MiniportDeviceContext);
+
+/* Shared by the async scheduler and the hardware ISR.  The implementation
+   coalesces requests so at most one dxgk DPC is queued at a time. */
+VOID WinMaliSchedRequestDpc(_Inout_ PWINMALI_ADAPTER Adapter);
 
 NTSTATUS APIENTRY WinMaliKmdExchangePreStartInfo(
     _In_    CONST PVOID            MiniportDeviceContext,

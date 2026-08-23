@@ -55,8 +55,8 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
        when running with kernel debugging off (see WinMaliLog.h). */
     (VOID)WinMaliSerialInit();
 
-    DbgPrint("[WinMali] >> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR "\n",
-             WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
+    WINMALI_LIFECYCLE(">> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR,
+                      WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
 
     (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowDwm", 1, &g_WinMaliAllowDwm);
     DbgPrint("[WinMali]    AllowDwm=%lu (%s)\n", g_WinMaliAllowDwm,
@@ -75,7 +75,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     status = DxgkInitialize(DriverObject, RegistryPath, &init);
     DbgPrint("[WinMali]    DxgkInitialize returned 0x%08x\n", status);
     if (!NT_SUCCESS(status)) {
-        DbgPrint("[WinMali] << DriverEntry DxgkInitialize=0x%08x\n", status);
+        WINMALI_LIFECYCLE("<< DriverEntry DxgkInitialize=0x%08x", status);
         return status;
     }
 
@@ -88,7 +88,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
        2026-07-12, dxgkrnl!DpiInitializeEx+0x77c). */
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    DbgPrint("[WinMali] << DriverEntry STATUS_SUCCESS\n");
+    WINMALI_LIFECYCLE("<< DriverEntry STATUS_SUCCESS");
     return STATUS_SUCCESS;
 }
 
@@ -97,8 +97,8 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 VOID APIENTRY
 WinMaliKmdDxgkUnload(VOID)
 {
-    WM_TRACE_ENTER("DxgkUnload");
-    WM_TRACE_EXIT("DxgkUnload");
+    WINMALI_LIFECYCLE(">> DxgkUnload");
+    WINMALI_LIFECYCLE("<< DxgkUnload");
     WinMaliSerialTeardown();   /* after the last print */
 }
 
@@ -130,6 +130,8 @@ WinMaliKmdAddDevice(
     adapter->Magic                = WINMALI_ADAPTER_MAGIC;
     adapter->PhysicalDeviceObject = PhysicalDeviceObject;
     KeInitializeSpinLock(&adapter->FenceQueueLock);
+    KeInitializeEvent(&adapter->CsfFirmwareEvent,
+                      SynchronizationEvent, FALSE);
     WinMaliBoTableInit(&adapter->BoTable);
     WinMaliSyncObjTableInit(&adapter->SyncObjTable);
     WinMaliVmTableInit(&adapter->VmTable);
@@ -155,11 +157,11 @@ WinMaliKmdStartDevice(
 {
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
     NTSTATUS         status;
-    WM_TRACE_ENTER("StartDevice");
+    WINMALI_LIFECYCLE(">> StartDevice");
 
     if (adapter == NULL || DxgkStartInfo == NULL || DxgkInterface == NULL ||
         NumberOfVideoPresentSources == NULL || NumberOfChildren == NULL) {
-        WM_TRACE_EXIT_S("StartDevice", STATUS_INVALID_PARAMETER);
+        WINMALI_LIFECYCLE("<< StartDevice 0x%08x", STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -250,7 +252,7 @@ WinMaliKmdStartDevice(
                   (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_MMU_READY) ? 1 : 0,
                   (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_MCU_ALIVE) ? 1 : 0,
                   (adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) ? 1 : 0);
-    WM_TRACE_EXIT_S("StartDevice", STATUS_SUCCESS);
+    WINMALI_LIFECYCLE("<< StartDevice 0x%08x", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 
 StartFailed:
@@ -265,7 +267,7 @@ StartFailed:
     WinMaliTeardownHardware(adapter);
     adapter->Started = FALSE;
     WINMALI_ERROR("StartDevice failed 0x%08x; hardware fully unwound", status);
-    WM_TRACE_EXIT_S("StartDevice", status);
+    WINMALI_LIFECYCLE("<< StartDevice 0x%08x", status);
     return status;
 }
 
@@ -273,9 +275,9 @@ NTSTATUS APIENTRY
 WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
 {
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
-    WM_TRACE_ENTER("StopDevice");
+    WINMALI_LIFECYCLE(">> StopDevice");
     if (adapter == NULL) {
-        WM_TRACE_EXIT_S("StopDevice", STATUS_INVALID_PARAMETER);
+        WINMALI_LIFECYCLE("<< StopDevice 0x%08x", STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -291,7 +293,7 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
     RtlZeroMemory(&adapter->DxgkInterface, sizeof(adapter->DxgkInterface));
     adapter->DxgkHandle = NULL;
 
-    WM_TRACE_EXIT_S("StopDevice", STATUS_SUCCESS);
+    WINMALI_LIFECYCLE("<< StopDevice 0x%08x", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -299,9 +301,9 @@ NTSTATUS APIENTRY
 WinMaliKmdRemoveDevice(_In_ CONST PVOID MiniportDeviceContext)
 {
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
-    WM_TRACE_ENTER("RemoveDevice");
+    WINMALI_LIFECYCLE(">> RemoveDevice");
     if (adapter == NULL) {
-        WM_TRACE_EXIT_S("RemoveDevice", STATUS_INVALID_PARAMETER);
+        WINMALI_LIFECYCLE("<< RemoveDevice 0x%08x", STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -320,7 +322,7 @@ WinMaliKmdRemoveDevice(_In_ CONST PVOID MiniportDeviceContext)
     }
     adapter->Magic = 0;
     ExFreePoolWithTag(adapter, WINMALI_POOL_TAG);
-    WM_TRACE_EXIT_S("RemoveDevice", STATUS_SUCCESS);
+    WINMALI_LIFECYCLE("<< RemoveDevice 0x%08x", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -366,6 +368,18 @@ WinMaliKmdInterruptRoutine(
     gpuRaw = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_GPU_IRQ_RAWSTAT);
     jobRaw = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_JOB_INT_RAWSTAT);
     mmuRaw = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_MMU_INT_RAWSTAT);
+
+    /* GLOBAL_IF is the firmware's notification channel for interface ACKs
+       and CS activity.  Record the edge before acknowledging it, then wake
+       the PASSIVE_LEVEL waiter through our normal dxgk DPC.  KeSetEvent is
+       deliberately not called at DIRQL. */
+    if ((jobRaw & WINMALI_JOB_INT_GLOBAL_IF) != 0u &&
+        InterlockedCompareExchange(&adapter->CsfFirmwareIrqWaitEnabled,
+                                   0, 0) != 0) {
+        InterlockedIncrement64(&adapter->CsfFirmwareIrqEpoch);
+        InterlockedExchange(&adapter->CsfFirmwareDpcPending, 1);
+        WinMaliSchedRequestDpc(adapter);
+    }
 
     /* FAULT DECODE (fault-detection audit 2026-07-13). The ISR used to W1C-ack
        every bit and read no fault-status register, so a real GPU/MMU fault was
@@ -454,6 +468,15 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
        calling DxgkCbNotifyInterrupt(DMA_COMPLETED) for each pending entry. */
     if (adapter == NULL) {
         return;
+    }
+
+    /* Wake firmware waiters before touching the WDDM fence queue.  This also
+       works while firmware initialization is still in progress, before the
+       submit worker exists.  A SynchronizationEvent retains one wake if the
+       worker has not reached its wait yet; every waiter rechecks hardware. */
+    if (InterlockedExchange(&adapter->CsfFirmwareDpcPending, 0) != 0) {
+        InterlockedIncrement64(&adapter->CsfFirmwareEventWakes);
+        KeSetEvent(&adapter->CsfFirmwareEvent, IO_NO_INCREMENT, FALSE);
     }
 
     if (adapter->DxgkInterface.DxgkCbNotifyInterrupt == NULL ||
@@ -548,6 +571,11 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
         KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
         notified = (adapter->FenceQueueHead != adapter->FenceQueueTail);
         KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
+        if (InterlockedExchange(&adapter->CsfFirmwareDpcPending, 0) != 0) {
+            InterlockedIncrement64(&adapter->CsfFirmwareEventWakes);
+            KeSetEvent(&adapter->CsfFirmwareEvent, IO_NO_INCREMENT, FALSE);
+            notified = TRUE;
+        }
         if (!notified) {
             break;
         }

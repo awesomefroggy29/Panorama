@@ -40,6 +40,11 @@ VOID     WinMaliSerialWrite(_In_z_ const char* Text);
 /* printf-shim: formats once, forwards to real DbgPrint + the UART. */
 ULONG    WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...);
 
+/* Lifecycle-only output bypasses the compile-time suppression applied to all
+   ordinary DbgPrint/WinMaliLogPrint call sites in that profile. */
+ULONG    WinMaliLifecycleLogPrint(
+             _In_z_ _Printf_format_string_ const char* Format, ...);
+
 #if WINMALI_LOG_TO_UART && !defined(WINMALI_LOG_NO_REDIRECT)
 #undef  DbgPrint
 #define DbgPrint WinMaliLogPrint

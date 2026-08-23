@@ -616,7 +616,7 @@ WinMaliFwPtEnsureChild_(
         *OutChildPhys = childPa;
         *OutChildHost =
             (PUINT64)((PUCHAR)Fw->PtPoolVa + (SIZE_T)(childPa - Fw->PtPoolPa.QuadPart));
-        return STATUS_SUCCESS;
+            return STATUS_SUCCESS;
     }
     return WinMaliFwPtAllocPage_(Fw, OutChildPhys, (PVOID*)OutChildHost);
 }
@@ -1202,35 +1202,185 @@ WinMaliCsfCsUpdateReqs_(
 
 static NTSTATUS
 WinMaliFwCsgWaitReqAck_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
     _In_ WINMALI_FWCTX* Fw,
     _In_ ULONG          ReqMask,
     _In_ ULONG          TimeoutMs,
     _Out_opt_ ULONG*    AckedBits)
 {
-    ULONG   i;
-    ULONG   req0;
-    LARGE_INTEGER t;
+    ULONG         i;
+    ULONG         req0;
+    ULONGLONG     deadline;
+    LARGE_INTEGER timeout;
 
-    if (Fw->Csg0Input == NULL || Fw->Csg0Output == NULL) {
+    if (Adapter == NULL || Fw->Csg0Input == NULL || Fw->Csg0Output == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
     KeMemoryBarrier();
     req0 = Fw->Csg0Input->Req & ReqMask;
 
-    for (i = 0; i < TimeoutMs; ++i) {
+    /* Firmware bootstrap runs before GLOBAL_IF is unmasked.  Preserve the
+       proven polling behavior for that phase; runtime submissions switch to
+       the interrupt-assisted path immediately after the mask is armed. */
+    if (InterlockedCompareExchange(&Adapter->CsfFirmwareIrqWaitEnabled,
+                                   0, 0) == 0) {
+        for (i = 0; i < TimeoutMs; ++i) {
+            ULONG ack = Fw->Csg0Output->Ack & ReqMask;
+            if (ack == req0) {
+                if (AckedBits != NULL) {
+                    *AckedBits = ack;
+                }
+                return STATUS_SUCCESS;
+            }
+            timeout.QuadPart = -10000LL;
+            (VOID)KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        }
+        if (AckedBits != NULL) {
+            *AckedBits = Fw->Csg0Output->Ack & ReqMask;
+        }
+        return STATUS_IO_TIMEOUT;
+    }
+
+    /* Most interface handshakes complete in tens of microseconds.  A short
+       bounded poll avoids DPC scheduling overhead without burning a timer
+       tick or monopolising the CPU for the duration of a real GPU job. */
+    for (i = 0; i < 50u; ++i) { /* at most 250 us */
         ULONG ack = Fw->Csg0Output->Ack & ReqMask;
-        if (ack == (req0 & ReqMask)) {
+        if (ack == req0) {
+            if (AckedBits != NULL) {
+                *AckedBits = ack;
+            }
+            InterlockedIncrement64(&Adapter->CsfFirmwareFastPollHits);
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(5u);
+    }
+
+    deadline = KeQueryInterruptTime() + ((ULONGLONG)TimeoutMs * 10000ull);
+    for (;;) {
+        ULONGLONG now;
+        ULONG ack;
+
+        KeMemoryBarrier();
+        ack = Fw->Csg0Output->Ack & ReqMask;
+        if (ack == req0) {
             if (AckedBits != NULL) {
                 *AckedBits = ack;
             }
             return STATUS_SUCCESS;
         }
-        t.QuadPart = -10000LL;
-        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &t);
+
+        now = KeQueryInterruptTime();
+        if (now >= deadline) {
+            break;
+        }
+        /* One-millisecond fallback keeps progress if a firmware interrupt is
+           coalesced or lost.  On the normal path GLOBAL_IF wakes this event
+           immediately, before the coarse timer expires. */
+        {
+            ULONGLONG remaining = deadline - now;
+            ULONGLONG slice = (remaining < 10000ull) ? remaining : 10000ull;
+            timeout.QuadPart = -(LONGLONG)slice;
+        }
+        (VOID)KeWaitForSingleObject(&Adapter->CsfFirmwareEvent, Executive,
+                                    KernelMode, FALSE, &timeout);
+        /* The event is only a hint.  Loop and validate the exact ACK bits. */
     }
+
     if (AckedBits != NULL) {
         *AckedBits = Fw->Csg0Output->Ack & ReqMask;
     }
+    InterlockedIncrement64(&Adapter->CsfFirmwareWaitTimeouts);
+    return STATUS_IO_TIMEOUT;
+}
+
+static NTSTATUS
+WinMaliFwWaitSeqno_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ volatile WINMALI_PANTHOR_SYNCOBJ64* Sync,
+    _In_ UINT64 Target,
+    _In_ ULONG TimeoutMs,
+    _Out_opt_ PULONG Samples)
+{
+    ULONG         sampleCount = 0;
+    ULONGLONG     deadline;
+    LARGE_INTEGER timeout;
+
+    if (Adapter == NULL || Sync == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (InterlockedCompareExchange(&Adapter->CsfFirmwareIrqWaitEnabled,
+                                   0, 0) == 0) {
+        ULONG i;
+        for (i = 0; i < TimeoutMs; ++i) {
+            ++sampleCount;
+            KeMemoryBarrier();
+            if (Sync->Seqno >= Target) {
+                if (Samples != NULL) {
+                    *Samples = sampleCount;
+                }
+                return STATUS_SUCCESS;
+            }
+            timeout.QuadPart = -10000LL;
+            (VOID)KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+        }
+    } else {
+        ULONG i;
+
+        for (i = 0; i < 50u; ++i) { /* at most 250 us */
+            ++sampleCount;
+            KeMemoryBarrier();
+            if (Sync->Seqno >= Target) {
+                InterlockedIncrement64(&Adapter->CsfFirmwareFastPollHits);
+                if (Samples != NULL) {
+                    *Samples = sampleCount;
+                }
+                return STATUS_SUCCESS;
+            }
+            KeStallExecutionProcessor(5u);
+        }
+
+        deadline = KeQueryInterruptTime() + ((ULONGLONG)TimeoutMs * 10000ull);
+        for (;;) {
+            ULONGLONG now;
+
+            ++sampleCount;
+            KeMemoryBarrier();
+            if (Sync->Seqno >= Target) {
+                if (Samples != NULL) {
+                    *Samples = sampleCount;
+                }
+                return STATUS_SUCCESS;
+            }
+
+            now = KeQueryInterruptTime();
+            if (now >= deadline) {
+                break;
+            }
+            {
+                ULONGLONG remaining = deadline - now;
+                ULONGLONG slice = (remaining < 10000ull) ? remaining : 10000ull;
+                timeout.QuadPart = -(LONGLONG)slice;
+            }
+            (VOID)KeWaitForSingleObject(&Adapter->CsfFirmwareEvent, Executive,
+                                        KernelMode, FALSE, &timeout);
+        }
+    }
+
+    /* A completion racing the final timeout sample is still success. */
+    ++sampleCount;
+    KeMemoryBarrier();
+    if (Sync->Seqno >= Target) {
+        if (Samples != NULL) {
+            *Samples = sampleCount;
+        }
+        return STATUS_SUCCESS;
+    }
+    if (Samples != NULL) {
+        *Samples = sampleCount;
+    }
+    InterlockedIncrement64(&Adapter->CsfFirmwareWaitTimeouts);
     return STATUS_IO_TIMEOUT;
 }
 
@@ -1343,7 +1493,8 @@ WinMaliCsfProgramAndStartCsg_(_Inout_ PWINMALI_ADAPTER Adapter,
     WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
 
-    status = WinMaliFwCsgWaitReqAck_(Fw, WINMALI_CSG_REQ_MASK, 5000u, &acked);
+    status = WinMaliFwCsgWaitReqAck_(Adapter, Fw, WINMALI_CSG_REQ_MASK,
+                                     5000u, &acked);
     if (NT_SUCCESS(status)) {
         Fw->CurrentCsgAs = AsSlot;
         Fw->CsgStarted   = TRUE;
@@ -1531,7 +1682,8 @@ WinMaliCsfTerminateCsg_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX*
     WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
 
-    status = WinMaliFwCsgWaitReqAck_(Fw, WINMALI_CSG_STATE_MASK, 1000u, &acked);
+    status = WinMaliFwCsgWaitReqAck_(Adapter, Fw, WINMALI_CSG_STATE_MASK,
+                                     1000u, &acked);
     WINMALI_TRACE("CSF: TerminateCsg (was AS=%u) ack=0x%08x st=0x%08x",
                   Fw->CurrentCsgAs, acked, status);
     /* Whatever the ack, treat the slot as no longer started - the caller
@@ -1920,8 +2072,9 @@ WinMaliCsfWakeCsgIfIdle_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX
     WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
 
-    status = WinMaliFwCsgWaitReqAck_(Fw, WINMALI_CSG_REQ_MASK, 1000u, &acked);
-    WINMALI_DIAG(
+    status = WinMaliFwCsgWaitReqAck_(Adapter, Fw, WINMALI_CSG_REQ_MASK,
+                                     1000u, &acked);
+    WINMALI_ROUTINE(
         "CSF wake: state=0x%08x ep_cur=0x%08x evt=0x%08x req 0x%08x->0x%08x ack=0x%08x acked=0x%08x st=0x%08x",
         state, epCur, evtPending, reqOld, reqNew, ack, acked, status);
     return status;
@@ -1974,7 +2127,7 @@ WinMaliCsfRebindCsgAs_(_Inout_ PWINMALI_ADAPTER Adapter,
     }
 
     status = WinMaliCsfProgramAndStartCsg_(Adapter, Fw, AsSlot);
-    WINMALI_DIAG("CSF: bind CSG -> AS %u (start st=0x%08x)", AsSlot, status);
+    WINMALI_ROUTINE("CSF: bind CSG -> AS %u (start st=0x%08x)", AsSlot, status);
     return status;
 }
 
@@ -2046,7 +2199,6 @@ WinMaliCsfSubmitStreamCall_(
     UINT64             tagBefore;
     ULONG              sbWaitMask;
     ULONG              i;
-    LARGE_INTEGER      t;
     NTSTATUS           status = STATUS_SUCCESS;
 
     if (!Fw->CsfBootValid || Fw->HostRingVa == NULL || Fw->QRingIn == NULL || Fw->QRingOut == NULL
@@ -2217,9 +2369,8 @@ WinMaliCsfSubmitStreamCall_(
         }
     }
 
-    for (i = 0; i < TimeoutMs; ++i) {
-        KeMemoryBarrier();
-        if (sync->Seqno >= jobSeq) {
+    status = WinMaliFwWaitSeqno_(Adapter, sync, jobSeq, TimeoutMs, &i);
+    if (NT_SUCCESS(status)) {
             /* SUCCESS by seqno - but the seqno only proves the caller CS
                reached its post-WAIT SYNC_ADD. An ASYNC fault (shader core,
                a sibling CS, a speculative/parallel MMU access) can raise AND
@@ -2281,11 +2432,7 @@ WinMaliCsfSubmitStreamCall_(
                          CsgAsSlot, (ULONGLONG)StreamGpuVa, StreamSizeBytes,
                          (ULONGLONG)jobSeq, (ULONGLONG)sync->Seqno, i);
             return STATUS_SUCCESS;
-        }
-        t.QuadPart = -10000LL;
-        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &t);
     }
-    status = STATUS_IO_TIMEOUT;
     {
         /* Pinpoint the stall. The tag-slot delta says whether the callee CALL
            returned; the per-AS MMU fault registers say what VA the GPU choked
@@ -2438,6 +2585,12 @@ WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
     WINMALI_FWCTX* fw;
     NTSTATUS       st;
     NTSTATUS       parkSt = STATUS_SUCCESS;
+    ULONGLONG      begin100ns;
+    ULONGLONG      locked100ns;
+    ULONGLONG      submitDone100ns;
+    ULONGLONG      done100ns;
+    LONG64         irqEpochBefore;
+    LONG64         fastHitsBefore;
 
     if (OutParked != NULL) {
         *OutParked = FALSE;
@@ -2456,13 +2609,20 @@ WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
 
     /* One CSG slot + one ring, but concurrent escapes across processes.
        Serialize the entire bind/submit/wait so submits don't corrupt each
-       other. Runs at PASSIVE_LEVEL (the wait poll uses KeDelayExecutionThread),
-       so a KMUTEX keeps us at PASSIVE while other submitters block here. */
+       other. Runs at PASSIVE_LEVEL because runtime firmware waits block on
+       CsfFirmwareEvent, so a KMUTEX keeps other submitters asleep here. */
+    begin100ns = KeQueryInterruptTime();
+    irqEpochBefore = InterlockedCompareExchange64(
+        &Adapter->CsfFirmwareIrqEpoch, 0, 0);
+    fastHitsBefore = InterlockedCompareExchange64(
+        &Adapter->CsfFirmwareFastPollHits, 0, 0);
     KeWaitForSingleObject(&fw->SubmitLock, Executive, KernelMode, FALSE, NULL);
+    locked100ns = KeQueryInterruptTime();
 
     st = WinMaliCsfSubmitStreamCall_(
              Adapter, fw, StreamGpuVa, StreamSizeBytes, LatestFlush,
              GroupAsSlot, TimeoutMs);
+    submitDone100ns = KeQueryInterruptTime();
     if (!NT_SUCCESS(st)) {
         WINMALI_WARN("CSF: group stream submit failed 0x%08x (as=%u) - resetting "
                      "slot to bring-up AS; next submit retries", st, GroupAsSlot);
@@ -2477,11 +2637,24 @@ WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
             WINMALI_WARN("CSF: completed transient AS%u stream but parking failed 0x%08x",
                          GroupAsSlot, parkSt);
         } else if (ParkAfterSubmit && NT_SUCCESS(st)) {
-            WINMALI_DIAG("CSF: transient AS%u completed; CSG parked on AS%u",
+            WINMALI_ROUTINE("CSF: transient AS%u completed; CSG parked on AS%u",
                          GroupAsSlot, Adapter->GpuMmuBringupAs);
         }
     }
 
+    done100ns = KeQueryInterruptTime();
+    WINMALI_ROUTINE(
+        "CSF LATENCY: AS%u stream=0x%llx size=%u lock_us=%llu run_us=%llu park_us=%llu total_us=%llu irq=%lld fast=%lld st=0x%08x",
+        GroupAsSlot, (ULONGLONG)StreamGpuVa, StreamSizeBytes,
+        (ULONGLONG)((locked100ns - begin100ns) / 10ull),
+        (ULONGLONG)((submitDone100ns - locked100ns) / 10ull),
+        (ULONGLONG)((done100ns - submitDone100ns) / 10ull),
+        (ULONGLONG)((done100ns - begin100ns) / 10ull),
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareIrqEpoch, 0, 0) -
+            irqEpochBefore,
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareFastPollHits, 0, 0) -
+            fastHitsBefore,
+        st);
     KeReleaseMutex(&fw->SubmitLock, FALSE);
     return st;
 }
@@ -2891,6 +3064,14 @@ WinMaliFwInit(_Inout_ PWINMALI_ADAPTER Adapter)
         return STATUS_SUCCESS;
     }
 
+    InterlockedExchange(&Adapter->CsfFirmwareIrqWaitEnabled, 0);
+    InterlockedExchange(&Adapter->CsfFirmwareDpcPending, 0);
+    InterlockedExchange64(&Adapter->CsfFirmwareIrqEpoch, 0);
+    InterlockedExchange64(&Adapter->CsfFirmwareEventWakes, 0);
+    InterlockedExchange64(&Adapter->CsfFirmwareFastPollHits, 0);
+    InterlockedExchange64(&Adapter->CsfFirmwareWaitTimeouts, 0);
+    KeClearEvent(&Adapter->CsfFirmwareEvent);
+
     fw = (WINMALI_FWCTX*)ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*fw), WINMALI_POOL_TAG);  /* 1809 WDK */
     if (fw == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -3241,6 +3422,7 @@ WinMaliFwInit(_Inout_ PWINMALI_ADAPTER Adapter)
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_GPU_IRQ_MASK, 0x000000FFu);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_JOB_INT_MASK, WINMALI_JOB_INT_GLOBAL_IF);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_MMU_INT_MASK, 0x0000FFFFu);
+    InterlockedExchange(&Adapter->CsfFirmwareIrqWaitEnabled, 1);
     WINMALI_TRACE("IRQ masks armed: GPU=0x000000FF JOB=0x80000000 MMU=0x0000FFFF");
 
     /* One-shot NOP round-trip self-test. Bootstrap above only proves the
@@ -3298,6 +3480,15 @@ WinMaliFwTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
     if (Adapter == NULL) {
         return;
     }
+    WINMALI_DIAG(
+        "CSF WAIT SUMMARY: irqEpoch=%lld eventWakes=%lld fastPollHits=%lld timeouts=%lld",
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareIrqEpoch, 0, 0),
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareEventWakes, 0, 0),
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareFastPollHits, 0, 0),
+        InterlockedCompareExchange64(&Adapter->CsfFirmwareWaitTimeouts, 0, 0));
+    InterlockedExchange(&Adapter->CsfFirmwareIrqWaitEnabled, 0);
+    InterlockedExchange(&Adapter->CsfFirmwareDpcPending, 0);
+    KeSetEvent(&Adapter->CsfFirmwareEvent, IO_NO_INCREMENT, FALSE);
     fw = (WINMALI_FWCTX*)Adapter->FwCtx;
     if (fw == NULL) {
         return;

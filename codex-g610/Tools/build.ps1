@@ -13,6 +13,7 @@
         .\Tools\build.ps1 -Project Mesa            # Just the mesa ICD
         .\Tools\build.ps1 -SkipMesa                # KMD + UMD, no mesa
         .\Tools\build.ps1 -DriverLogProfile Focused # concise bring-up logs
+        .\Tools\build.ps1 -DriverLogProfile Lifecycle # load/start/stop only
         .\Tools\build.ps1 -Rebuild
 
     Exits non-zero if any step fails so CI can chain.
@@ -42,6 +43,8 @@
     Verbose keeps all historical trace output. Focused compiles out routine
     success-path chatter while retaining faults, warnings, lifecycle events,
     scheduler/fence transitions, synchronization, and DXGI presentation logs.
+    Lifecycle suppresses all KMD and Mesa/UMD output except KMD driver load,
+    StartDevice, StopDevice, RemoveDevice, and unload messages.
 
 .PARAMETER InfVerif
     Enable InfVerif. Off by default (frequent missing on dev boxes).
@@ -67,7 +70,7 @@ param(
     [ValidateSet("quiet","minimal","normal","detailed","diagnostic")]
     [string]$LogLevel = "minimal",
 
-    [ValidateSet("Verbose","Focused")]
+    [ValidateSet("Verbose","Focused","Lifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     [switch]$InfVerif,

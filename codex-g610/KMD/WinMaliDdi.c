@@ -500,7 +500,7 @@ WinMaliContextAcquireAs_(_Inout_ PWINMALI_KMD_CONTEXT ctx,
     if (NT_SUCCESS(status)) {
         ctx->AsLeaseCount = 1;
         *outAs = ctx->AsSlot;
-        WINMALI_DIAG("CONTEXT RESIDENCY: acquire ctx=%p root=0x%llx AS%u inUse=0x%x",
+        WINMALI_ROUTINE("CONTEXT RESIDENCY: acquire ctx=%p root=0x%llx AS%u inUse=0x%x",
                      ctx, (ULONGLONG)ctx->RootPtPa, ctx->AsSlot,
                      ctx->Adapter->AsSlotInUseMask);
     }
@@ -524,7 +524,7 @@ WinMaliContextReleaseAs_(_Inout_ PWINMALI_KMD_CONTEXT ctx,
     if (ctx->AsLeaseCount == 0) {
         (VOID)WinMaliMmuUnbindContext(ctx->Adapter, (HANDLE)ctx);
         ctx->AsSlot = WINMALI_AS_SLOT_MAX;
-        WINMALI_DIAG("CONTEXT RESIDENCY: release ctx=%p AS%u inUse=0x%x",
+        WINMALI_ROUTINE("CONTEXT RESIDENCY: release ctx=%p AS%u inUse=0x%x",
                      ctx, asSlot, ctx->Adapter->AsSlotInUseMask);
     }
     ExReleaseFastMutex(&ctx->ResidencyLock);
@@ -1410,14 +1410,15 @@ WinMaliSchedNodeValid_(_In_ UINT node, _In_ UINT engine)
 /* Queue exactly one DPC while work is pending. NotifyDpcPending remains set
    while the DPC is queued/running; the DPC clears it only after an empty
    observation and closes the producer/consumer lost-wakeup race. */
-static VOID
-WinMaliSchedRequestDpc_(_Inout_ PWINMALI_ADAPTER a)
+VOID
+WinMaliSchedRequestDpc(_Inout_ PWINMALI_ADAPTER a)
 {
     if (a->DxgkHandle != NULL && a->DxgkInterface.DxgkCbQueueDpc != NULL &&
         InterlockedCompareExchange(&a->NotifyDpcPending, 1, 0) == 0) {
-        if (!a->DxgkInterface.DxgkCbQueueDpc(a->DxgkHandle)) {
-            WINMALI_TRACE("Sched: DPC already queued/running");
-        }
+        /* FALSE means a DPC is already queued/running.  That is harmless:
+           NotifyDpcPending plus the consumer-side recheck closes the race.
+           Do not log here because the hardware ISR also calls this helper. */
+        (VOID)a->DxgkInterface.DxgkCbQueueDpc(a->DxgkHandle);
     }
 }
 
@@ -1504,7 +1505,7 @@ WinMaliSchedQueueTimeout_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
                       fence, node);
         return;
     }
-    WinMaliSchedRequestDpc_(a);
+    WinMaliSchedRequestDpc(a);
 }
 
 /* Retire Mesa's private timelines for a terminal submission. A failed CS is
@@ -1667,7 +1668,7 @@ WinMaliSchedHandlePreempt_(_Inout_ PWINMALI_ADAPTER a)
             KeReleaseSpinLock(&a->SubmitQueueLock, irql);
             if (WinMaliSchedPushFence_(a, preemptFence, node, 0, TRUE, last,
                                       STATUS_SUCCESS)) {
-                WinMaliSchedRequestDpc_(a);
+                WinMaliSchedRequestDpc(a);
             }
             WINMALI_TRACE("Sched: preempted node=%u fence=%u last=%u dropped=%u",
                           node, preemptFence, last, drained);
@@ -1756,7 +1757,7 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                 BOOLEAN preemptedBeforeExecution = FALSE;
                 ULONGLONG executeStart100ns = KeQueryInterruptTime();
 
-                WINMALI_DIAG("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
+                WINMALI_ROUTINE("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
                              fence, node, engine, hasCs, hasCs ? cs.VmId : 0,
                              asSlot, hasCs ? (ULONGLONG)cs.StreamGpuVa : 0,
                              hasCs ? cs.StreamSize : 0,
@@ -1940,7 +1941,7 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             KeAcquireSpinLock(&a->SubmitQueueLock, &irql);
             WinMaliSchedUpdateIdleLocked_(a);
             KeReleaseSpinLock(&a->SubmitQueueLock, irql);
-            WinMaliSchedRequestDpc_(a);
+            WinMaliSchedRequestDpc(a);
             WinMaliContextPut_(submitContext);
 
             /* Do not execute later packets on a node while dxgkrnl is

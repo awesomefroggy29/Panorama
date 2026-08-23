@@ -169,3 +169,21 @@ WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...)
     WinMaliSerialWrite(buf);  /* UART path when not */
     return 0;
 }
+
+ULONG
+WinMaliLifecycleLogPrint(
+    _In_z_ _Printf_format_string_ const char* Format, ...)
+{
+    char    buf[512];
+    va_list ap;
+
+    va_start(ap, Format);
+    if (!NT_SUCCESS(RtlStringCbVPrintfA(buf, sizeof(buf), Format, ap))) {
+        buf[sizeof(buf) - 1] = '\0';
+    }
+    va_end(ap);
+
+    DbgPrint("%s", buf);
+    WinMaliSerialWrite(buf);
+    return 0;
+}
