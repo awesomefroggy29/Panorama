@@ -253,15 +253,7 @@ struct Shader_xlate {
 static bool
 use_old_tex_ops(void)
 {
-#if defined(HAVE_WINMALI_WDDM_KMOD)
-   /* Panfrost consumes this frontend's TGSI through tgsi_to_nir(), which
-    * supports TEX/TXF/TXQ/TXL/TXB/TXD but not the SAMPLE family or
-    * SAMPLER_VIEW instruction sources.
-    */
-   return true;
-#else
    return (st_debug & ST_DEBUG_OLD_TEX_OPS) != 0;
-#endif
 }
 
 static struct ureg_src

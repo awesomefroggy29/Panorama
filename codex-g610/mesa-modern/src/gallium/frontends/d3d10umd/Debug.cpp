@@ -1,3 +1,4 @@
+#define WINMALI_DEBUG_IMPLEMENTATION 1
 #include "Debug.h"
 
 #include <stdarg.h>
@@ -27,6 +28,10 @@ st_debug_parse(void)
 void
 DebugPrintf(const char *format, ...)
 {
+#if defined(WINMALI_LOG_LIFECYCLE)
+    (void)format;
+    return;
+#endif
 #if defined(WINMALI_LOG_FOCUSED)
     /* Historical adapter/callback-table dumps are useful for ABI bring-up but
      * dominate routine captures. Keep all untagged failures and the explicit
@@ -35,6 +40,25 @@ DebugPrintf(const char *format, ...)
     if (format != NULL &&
         strncmp(format, noisy_tag, sizeof(noisy_tag) - 1) == 0)
         return;
+
+    /* These are per-call/per-draw chatter.  Submission outcomes, failures,
+     * DXGI boundaries, and untagged error messages remain visible. */
+    static const char *const noisy_flow[] = {
+       "[WinMaliFlow] D3D Flush ",
+       "[WinMaliFlow] D3D Draw ",
+       "[WinMaliFlow] DrawIndexed",
+       "[WinMaliFlow] CreateResource ",
+       "[WinMaliFlow] DestroyResource ",
+       "[WinMaliFlow] ClearRT ",
+       "[WinMaliFlow] ClearDS ",
+    };
+    if (format != NULL) {
+       for (unsigned i = 0; i < sizeof(noisy_flow) / sizeof(noisy_flow[0]); ++i) {
+          const size_t length = strlen(noisy_flow[i]);
+          if (strncmp(format, noisy_flow[i], length) == 0)
+             return;
+       }
+    }
 #endif
     char buf[4096];
 

@@ -200,6 +200,8 @@ struct Resource
    UINT MipLevels;
    UINT NumSubResources;
    bool buffer;
+   bool glyphDiagnostic;
+   UINT glyphUpdateCount;
    struct pipe_resource *resource;
    struct pipe_transfer **transfers;
    struct pipe_stream_output_target *so_target;
@@ -420,6 +422,10 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
 struct ShaderResourceView
 {
    struct pipe_sampler_view *handle;
+   DXGI_FORMAT dxgiFormat;
+   bool glyphDiagnostic;
+   bool glyphBindLogged;
+   bool textureBindLogged;
 };
 
 

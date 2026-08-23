@@ -197,6 +197,38 @@ subResourceBox(struct pipe_resource *resource, // IN
  * ----------------------------------------------------------------------
  */
 
+static bool
+WinMaliIsGlyphFormat(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_R8_UNORM;
+}
+
+/* Deliberately sample rather than scan the whole atlas.  This is diagnostic
+ * evidence that coverage bytes reached the UMD, not a content checksum. */
+static uint32_t
+WinMaliGlyphSampleHash(const void *data, unsigned rowPitch,
+                       unsigned width, unsigned height)
+{
+   if (!data || !width || !height)
+      return 0;
+
+   const uint8_t *bytes = (const uint8_t *)data;
+   uint32_t hash = 2166136261u;
+   const unsigned rows = MIN2(height, 16u);
+   const unsigned columns = MIN2(width, 64u);
+
+   for (unsigned y = 0; y < rows; ++y) {
+      const unsigned sourceY = (uint64_t)y * height / rows;
+      const uint8_t *row = bytes + (size_t)sourceY * rowPitch;
+      for (unsigned x = 0; x < columns; ++x) {
+         const unsigned sourceX = (uint64_t)x * width / columns;
+         hash = (hash ^ row[sourceX]) * 16777619u;
+      }
+   }
+
+   return hash;
+}
+
 void APIENTRY
 CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
                __in const D3D10DDIARG_CREATERESOURCE *pCreateResource,  // IN
@@ -301,6 +333,20 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    } else {
       BOOL bindDepthStencil = !!(pCreateResource->BindFlags & D3D10_DDI_BIND_DEPTH_STENCIL);
       templat.format = FormatTranslate(pCreateResource->Format, bindDepthStencil);
+   }
+
+   pResource->glyphDiagnostic = WinMaliIsGlyphFormat(templat.format);
+   if (pResource->glyphDiagnostic) {
+      DebugPrintf("[WinMaliGlyph] ResourceCreate drv=%p dxgi=%u pipe=%s size=%ux%u "
+                  "mips=%u array=%u usage=%u bind=0x%x map=0x%x initial=%u\n",
+                  hResource.pDrvPrivate, pCreateResource->Format,
+                  util_format_name(templat.format),
+                  pCreateResource->pMipInfoList[0].TexelWidth,
+                  pCreateResource->pMipInfoList[0].TexelHeight,
+                  pCreateResource->MipLevels, pCreateResource->ArraySize,
+                  pCreateResource->Usage, pCreateResource->BindFlags,
+                  pCreateResource->MapFlags,
+                  pCreateResource->pInitialDataUP ? 1u : 0u);
    }
 
    templat.width0     = pCreateResource->pMipInfoList[0].TexelWidth;
@@ -601,6 +647,18 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
             unsigned level;
             struct pipe_box box;
             subResourceBox(pResource->resource, SubResource, &level, &box);
+
+            if (pResource->glyphDiagnostic) {
+               DebugPrintf("[WinMaliGlyph] InitialUpload drv=%p sub=%u level=%u "
+                           "box=%dx%dx%d rowPitch=%u slicePitch=%u hash=0x%08x\n",
+                           hResource.pDrvPrivate, SubResource, level,
+                           box.width, box.height, box.depth,
+                           pInitialDataUP->SysMemPitch,
+                           pInitialDataUP->SysMemSlicePitch,
+                           WinMaliGlyphSampleHash(pInitialDataUP->pSysMem,
+                              pInitialDataUP->SysMemPitch,
+                              box.width, box.height));
+            }
 
             struct pipe_transfer *transfer;
             void *map;
@@ -1463,6 +1521,19 @@ ResourceUpdateSubResourceUP(D3D10DDI_HDEVICE hDevice,                // IN
       box.depth  = pDstBox->back   - pDstBox->front;
    } else {
       subResourceBox(dst_resource, DstSubResource, &level, &box);
+   }
+
+   if (pDstResource->glyphDiagnostic) {
+      const UINT update = ++pDstResource->glyphUpdateCount;
+      if (update <= 16 || (update & (update - 1)) == 0) {
+         DebugPrintf("[WinMaliGlyph] Update drv=%p pipe=%p n=%u sub=%u level=%u "
+                     "box=%d,%d,%d %dx%dx%d rowPitch=%u depthPitch=%u hash=0x%08x\n",
+                     hDstResource.pDrvPrivate, dst_resource, update,
+                     DstSubResource, level, box.x, box.y, box.z,
+                     box.width, box.height, box.depth, RowPitch, DepthPitch,
+                     WinMaliGlyphSampleHash(pSysMemUP, RowPitch,
+                                            box.width, box.height));
+      }
    }
 
    struct pipe_transfer *transfer;

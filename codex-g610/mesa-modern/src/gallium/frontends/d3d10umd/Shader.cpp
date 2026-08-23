@@ -237,8 +237,43 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
 
    struct pipe_sampler_view **sampler_views = pDevice->sampler_views[shader_type];
    for (UINT i = 0; i < NumViews; i++) {
-      struct pipe_sampler_view *sampler_view =
-            CastPipeShaderResourceView(phShaderResourceViews[i]);
+      ShaderResourceView *view =
+            CastShaderResourceView(phShaderResourceViews[i]);
+      struct pipe_sampler_view *sampler_view = view ? view->handle : NULL;
+      if (shader_type == MESA_SHADER_FRAGMENT && view && sampler_view &&
+          !view->textureBindLogged) {
+         view->textureBindLogged = true;
+         const struct pipe_resource *texture = sampler_view->texture;
+         DebugPrintf("[WinMaliTexture] FirstPsBind slot=%u view=%p pipeView=%p "
+                     "dxgi=%u viewPipe=%s resource=%p resourcePipe=%s "
+                     "target=%u size=%ux%ux%u array=%u levels=%u samples=%u "
+                     "bind=0x%x usage=%u swizzle=%u,%u,%u,%u\n",
+                     Offset + i, view, sampler_view, view->dxgiFormat,
+                     util_format_name(sampler_view->format), texture,
+                     texture ? util_format_name(texture->format) : "null",
+                     texture ? texture->target : 0,
+                     texture ? texture->width0 : 0,
+                     texture ? texture->height0 : 0,
+                     texture ? texture->depth0 : 0,
+                     texture ? texture->array_size : 0,
+                     texture ? texture->last_level + 1 : 0,
+                     texture ? texture->nr_samples : 0,
+                     texture ? texture->bind : 0,
+                     texture ? texture->usage : 0,
+                     sampler_view->swizzle_r, sampler_view->swizzle_g,
+                     sampler_view->swizzle_b, sampler_view->swizzle_a);
+      }
+      if (shader_type == MESA_SHADER_FRAGMENT && view &&
+          view->glyphDiagnostic && !view->glyphBindLogged) {
+         view->glyphBindLogged = true;
+         DebugPrintf("[WinMaliGlyph] FirstPsBind slot=%u view=%p pipeView=%p "
+                     "dxgi=%u pipe=%s texture=%p resourcePipe=%s\n",
+                     Offset + i, view, sampler_view, view->dxgiFormat,
+                     sampler_view ? util_format_name(sampler_view->format) : "null",
+                     sampler_view ? sampler_view->texture : NULL,
+                     sampler_view && sampler_view->texture
+                        ? util_format_name(sampler_view->texture->format) : "null");
+      }
       if (Offset + i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
          sampler_views[Offset + i] = sampler_view;
       } else {
@@ -1338,6 +1373,22 @@ CreateShaderResourceView(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->dxgiFormat = pCreateSRView->Format;
+   pSRView->glyphDiagnostic =
+      format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_R8_UNORM;
+   pSRView->glyphBindLogged = false;
+   pSRView->textureBindLogged = false;
+   if (pSRView->glyphDiagnostic) {
+      DebugPrintf("[WinMaliGlyph] ViewCreate view=%p pipeView=%p dxgi=%u "
+                  "pipe=%s resource=%p resourcePipe=%s swizzle=%u,%u,%u,%u "
+                  "levels=%u..%u layers=%u..%u\n",
+                  pSRView, pSRView->handle, pCreateSRView->Format,
+                  util_format_name(format), resource,
+                  resource ? util_format_name(resource->format) : "null",
+                  desc.swizzle_r, desc.swizzle_g, desc.swizzle_b, desc.swizzle_a,
+                  desc.u.tex.first_level, desc.u.tex.last_level,
+                  desc.u.tex.first_layer, desc.u.tex.last_layer);
+   }
 }
 
 
@@ -1420,6 +1471,22 @@ CreateShaderResourceView1(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->dxgiFormat = pCreateSRView->Format;
+   pSRView->glyphDiagnostic =
+      format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_R8_UNORM;
+   pSRView->glyphBindLogged = false;
+   pSRView->textureBindLogged = false;
+   if (pSRView->glyphDiagnostic) {
+      DebugPrintf("[WinMaliGlyph] ViewCreate1 view=%p pipeView=%p dxgi=%u "
+                  "pipe=%s resource=%p resourcePipe=%s swizzle=%u,%u,%u,%u "
+                  "levels=%u..%u layers=%u..%u\n",
+                  pSRView, pSRView->handle, pCreateSRView->Format,
+                  util_format_name(format), resource,
+                  resource ? util_format_name(resource->format) : "null",
+                  desc.swizzle_r, desc.swizzle_g, desc.swizzle_b, desc.swizzle_a,
+                  desc.u.tex.first_level, desc.u.tex.last_level,
+                  desc.u.tex.first_layer, desc.u.tex.last_layer);
+   }
 }
 
 

@@ -33,8 +33,12 @@ void st_debug_parse(void);
 #endif
 
 
+#if defined(WINMALI_LOG_LIFECYCLE) && !defined(WINMALI_DEBUG_IMPLEMENTATION)
+#define DebugPrintf(...) ((void)0)
+#else
 void
 DebugPrintf(const char *format, ...);
+#endif
 
 
 void
@@ -75,4 +79,3 @@ AssertFail(const char *expr, const char *file, unsigned line, const char *functi
 #ifdef __cplusplus
 }
 #endif
-

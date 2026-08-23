@@ -27,6 +27,7 @@
 #include <string.h>
 #include "c11/threads.h"
 #include "util/detect_os.h"
+#define MESA_LOG_IMPLEMENTATION 1
 #include "util/log.h"
 #include "util/ralloc.h"
 #include "util/u_debug.h"
@@ -454,8 +455,32 @@ mesa_log(enum mesa_log_level level, const char *tag, const char *format, ...)
 
 void
 mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
-            va_list va)
+             va_list va)
 {
+#if defined(WINMALI_LOG_LIFECYCLE)
+   (void)level;
+   (void)tag;
+   (void)format;
+   (void)va;
+   return;
+#else
+#if defined(WINMALI_LOG_FOCUSED)
+   /* Successful-path diagnostics that overwhelm DbgView under DWM load.
+    * Warnings, errors, CSF submit results, and sync failures are retained. */
+   static const char *const winmali_noisy_info[] = {
+      "[WinMaliPhase]",
+      "[WinMaliTilerDiag]",
+      "[WinMaliTgsiDiag]",
+      "[WinMaliShader]",
+   };
+   if (level == MESA_LOG_INFO && format != NULL) {
+      for (unsigned i = 0; i < ARRAY_SIZE(winmali_noisy_info); ++i) {
+         const size_t length = strlen(winmali_noisy_info[i]);
+         if (strncmp(format, winmali_noisy_info[i], length) == 0)
+            return;
+      }
+   }
+#endif
    static const struct {
       enum mesa_log_control bit;
       void (*log)(enum mesa_log_level level,
@@ -506,6 +531,7 @@ mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
       if (msg != local_msg)
          free(msg);
    }
+#endif
 }
 
 void

@@ -81,6 +81,15 @@ _mesa_log_direct(const char *string);
 void
 mesa_log_if_debug(enum mesa_log_level level, const char *outputString);
 
+#if defined(WINMALI_LOG_LIFECYCLE) && !defined(MESA_LOG_IMPLEMENTATION)
+/* The lifecycle performance profile intentionally has no Mesa user-mode log
+ * channel. Compile calls out at their source so formatting arguments and
+ * diagnostic dump loops carry no runtime cost. The implementation TU keeps
+ * the real symbols for ABI/link compatibility. */
+#define mesa_log(...)   ((void)0)
+#define mesa_log_v(...) ((void)0)
+#endif
+
 #define mesa_loge(fmt, ...) mesa_log(MESA_LOG_ERROR, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__)
 #define mesa_logw(fmt, ...) mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__)
 #define mesa_logi(fmt, ...) mesa_log(MESA_LOG_INFO, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__)

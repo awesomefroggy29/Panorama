@@ -3417,7 +3417,7 @@ panfrost_update_active_prim(struct panfrost_context *ctx,
 
    ctx->active_prim = info->mode;
 
-   if ((ctx->dirty & PAN_DIRTY_RASTERIZER) ||
+   if ((ctx->dirty & (PAN_DIRTY_RASTERIZER | PAN_DIRTY_BLEND)) ||
        (prev_prim != new_prim)) {
       panfrost_update_shader_variant(ctx, MESA_SHADER_FRAGMENT);
    }
@@ -4311,6 +4311,22 @@ panfrost_create_sampler_view(struct pipe_context *pctx,
    so->base.context = pctx;
 
    panfrost_create_sampler_view_bo(so, pctx, texture);
+
+   if (template->format == PIPE_FORMAT_A8_UNORM ||
+       template->format == PIPE_FORMAT_R8_UNORM) {
+      mesa_logi("[WinMaliGlyph] PanView view=%p format=%s resourceFormat=%s "
+                "target=%u size=%ux%u base=0x%" PRIx64 " bytes=%" PRIu64
+                " modifier=0x%" PRIx64 " swizzle=%u,%u,%u,%u descGpu=0x%" PRIx64,
+                so, util_format_name(template->format),
+                util_format_name(texture->format), texture->target,
+                texture->width0, texture->height0,
+                (uint64_t)ptexture->plane.base,
+                (uint64_t)ptexture->plane.layout.data_size_B,
+                (uint64_t)ptexture->modifier,
+                template->swizzle_r, template->swizzle_g,
+                template->swizzle_b, template->swizzle_a,
+                (uint64_t)so->state.gpu);
+   }
 
    return (struct pipe_sampler_view *)so;
 }

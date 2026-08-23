@@ -349,6 +349,12 @@ struct panfrost_fs_key {
 
    bool line_smooth;
 
+   /* TGSI COLOR[1] is ambiguous: it is MRT1 normally, but becomes the
+    * secondary colour for dual-source blending when the bound blend state
+    * uses SRC1 factors.  Keep that draw-time interpretation in the shader
+    * key so both forms get distinct, correct variants. */
+   bool dual_source_blend;
+
    /* The VS varying layout determines how the FS is compiled (LD_VAR vs
     * LD_VAR_BUF and byte offsets). Include the full layout in the key so
     * the disk cache and in-memory variant cache correctly distinguish FS

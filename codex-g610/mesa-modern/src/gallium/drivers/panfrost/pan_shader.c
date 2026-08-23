@@ -11,6 +11,7 @@
 #include "nir/tgsi_to_nir.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
+#include "util/u_dual_blend.h"
 #include "util/log.h"
 #include "nir_builder.h"
 #include "nir_serialize.h"
@@ -96,6 +97,33 @@ lower_sample_mask_writes(nir_builder *b, nir_intrinsic_instr *intrin,
    return true;
 }
 
+static bool
+lower_tgsi_dual_source_output(nir_builder *b,
+                              nir_intrinsic_instr *intrin,
+                              void *data)
+{
+   (void)b;
+   (void)data;
+
+   if (intrin->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
+
+   /* The D3D10 frontend represents o1 as TGSI COLOR[1].  tgsi_to_nir has
+    * to preserve that as MRT1 because shader creation has no blend state.
+    * Once a dual-source blend variant is selected, reinterpret precisely
+    * that output as the secondary source for RT0. */
+   if (semantics.location != FRAG_RESULT_DATA1 ||
+       semantics.dual_source_blend_index != 0)
+      return false;
+
+   semantics.location = FRAG_RESULT_DATA0;
+   semantics.dual_source_blend_index = 1;
+   nir_intrinsic_set_io_semantics(intrin, semantics);
+   return true;
+}
+
 static void
 panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
                         struct util_debug_callback *dbg,
@@ -142,6 +170,18 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    inputs.varying_layout = varying_layout;
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
+      if (key->fs.dual_source_blend) {
+         bool lowered_dual_source = false;
+         NIR_PASS(lowered_dual_source, s, nir_shader_intrinsics_pass,
+                  lower_tgsi_dual_source_output,
+                  nir_metadata_control_flow, NULL);
+         nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+         mesa_logi("[WinMaliFlow] DualSourceVariant shader=%p lowered=%u outputs=0x%llx dual=%u",
+                   ir, lowered_dual_source,
+                   (unsigned long long)s->info.outputs_written,
+                   s->info.fs.color_is_dual_source);
+      }
+
       if (key->fs.nr_cbufs_for_fragcolor) {
          NIR_PASS(_, s, panfrost_nir_remove_fragcolor_stores,
                   key->fs.nr_cbufs_for_fragcolor);
@@ -369,6 +409,10 @@ panfrost_build_fs_key(struct panfrost_context *ctx,
    }
 
    key->vs_varying_layout = uncompiled->vs_varying_layout;
+
+   key->dual_source_blend =
+      ctx->blend && ctx->blend->base.rt[0].blend_enable &&
+      util_blend_state_is_dual(&ctx->blend->base, 0);
 
    if (dev->arch <= 5) {
       u_foreach_bit(i, (nir->info.outputs_read >> FRAG_RESULT_DATA0)) {

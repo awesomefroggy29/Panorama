@@ -85,6 +85,10 @@
 void
 os_log_message(const char *message)
 {
+#if defined(WINMALI_LOG_LIFECYCLE)
+   (void)message;
+   return;
+#else
    /* If the GALLIUM_LOG_FILE environment variable is set to a valid filename,
     * write all messages to that file.
     */
@@ -134,6 +138,7 @@ os_log_message(const char *message)
 #  if DETECT_OS_ANDROID
    __android_log_write(ANDROID_LOG_ERROR, LOG_TAG, message);
 #  endif
+#endif
 #endif
 }
 

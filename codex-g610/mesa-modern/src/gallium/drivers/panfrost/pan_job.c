@@ -686,6 +686,22 @@ panfrost_batch_submit(struct panfrost_context *ctx,
    int ret;
    uint64_t phase_start_ns;
 
+   /* Nothing to do! */
+   if (!has_frag && batch->compute_count == 0 && !batch->has_time_query) {
+#if !defined(WINMALI_LOG_FOCUSED) && !defined(WINMALI_LOG_LIFECYCLE)
+      mesa_logi("[WinMaliFlow] BatchSubmit ENTER ctx=%p batch=%p seq=%u fb=%ux%u cbufs=%u cbuf0=%p zs=%p draws=%u compute=%u clear=0x%x fragment=%u timeQuery=%u",
+                ctx, batch, batch->seqnum, batch->key.width, batch->key.height,
+                batch->key.nr_cbufs,
+                batch->key.nr_cbufs ? batch->key.cbufs[0].texture : NULL,
+                batch->key.zsbuf.texture, batch->draw_count,
+                batch->compute_count, batch->clear, has_frag ? 1u : 0u,
+                batch->has_time_query ? 1u : 0u);
+      mesa_logi("[WinMaliFlow] BatchSubmit EXIT ctx=%p batch=%p seq=%u skipped=empty",
+                ctx, batch, batch->seqnum);
+#endif
+      goto out;
+   }
+
    mesa_logi("[WinMaliFlow] BatchSubmit ENTER ctx=%p batch=%p seq=%u fb=%ux%u cbufs=%u cbuf0=%p zs=%p draws=%u compute=%u clear=0x%x fragment=%u timeQuery=%u",
              ctx, batch, batch->seqnum, batch->key.width, batch->key.height,
              batch->key.nr_cbufs,
@@ -693,13 +709,6 @@ panfrost_batch_submit(struct panfrost_context *ctx,
              batch->key.zsbuf.texture, batch->draw_count,
              batch->compute_count, batch->clear, has_frag ? 1u : 0u,
              batch->has_time_query ? 1u : 0u);
-
-   /* Nothing to do! */
-   if (!has_frag && batch->compute_count == 0 && !batch->has_time_query) {
-      mesa_logi("[WinMaliFlow] BatchSubmit EXIT ctx=%p batch=%p seq=%u skipped=empty",
-                ctx, batch, batch->seqnum);
-      goto out;
-   }
 
    if (batch->key.zsbuf.texture && has_frag) {
       struct pipe_surface *surf = &batch->key.zsbuf;
