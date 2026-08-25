@@ -1080,7 +1080,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                  &g_WinMaliKnobFuse);
     /* Marker string so the PACKAGED binary can be proved to contain this change.
        â›” Never verify a deploy by hash - signing changes it. Grep for a string. */
-    DbgPrint("[WinMali]    BAKED DEFAULTS v36 REVERT: dod=%u ovl=%u xform=%u mon=%u "
+    DbgPrint("[WinMali]    BAKED DEFAULTS v40 KNOWNGOOD: dod=%u ovl=%u xform=%u mon=%u "
              "uv=%u hz=%u cfg=%u src=%u\n",
              (unsigned)WINMALI_DEF_DODMODE, (unsigned)WINMALI_DEF_OVLFLIP,
              (unsigned)WINMALI_DEF_PATHXFORM, (unsigned)WINMALI_DEF_MONMODEADD,
