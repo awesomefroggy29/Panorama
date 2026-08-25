@@ -49,6 +49,20 @@
  * OUTPUT rather than treating them as knobs. */
 ULONG g_WinMaliQaiFlipCapsValue = 0;
 ULONG g_WinMaliQaiFlipCapsOff   = 0;
+ULONG g_WinMaliQaiMpoCaps       = 0;
+/* ⛔★★★★★ SEPARATE THE TWO CLAIMS.
+ * QaiMpoCaps made TWO independent claims at once: it filled the five MPO DDI
+ * slots AND set DXGK_DRIVERCAPS.SupportMultiPlaneOverlay. When the adapter then
+ * refused to start, no boot could say WHICH claim dxgk rejected - the table or
+ * the cap. Parameters\QaiMpoWire fills the slots WITHOUT claiming the cap, so
+ * the two are finally testable apart. The cap can still never be claimed with
+ * NULL slots behind it (see WinMaliDxgkStubsWire.h). */
+ULONG g_WinMaliQaiMpoWire       = 0;
+/* What MaxQueuedFlipOnVSync actually ended up as in the struct dxgk read. A knob
+   proves intent; this proves the write landed. */
+LONG  g_WinMaliQaiFlipQueueDepth = 0;
+ULONG g_WinMaliQaiMpoOff        = 0;
+ULONG g_WinMaliQaiMpoPlanesOff  = 0;
 ULONG g_WinMaliQaiOutSize       = 0;
 ULONG g_WinMaliQaiCapsSizeof    = 0;
 /* The segment flags we actually handed dxgk. Same discipline as the caps above:
@@ -74,9 +88,53 @@ WinMaliKmdQueryAdapterInfo(
        be too. */
     if (pQueryAdapterInfo->Type != DXGKQAITYPE_NODEPERFDATA &&
         pQueryAdapterInfo->Type != DXGKQAITYPE_ADAPTERPERFDATA) {
+        if (g_WinMaliDodMode != 0) {
+            if (g_WinMaliDodStage < 5) { WinMaliDodStage(5); }
+            /* ⛔ NAME THE TYPE, not just the stage. The trace ring is unreadable
+               in display-only mode (the worker publishes it and never runs), so
+               without this a refusal here is anonymous and costs a whole cycle
+               to guess at. Flushed: it must survive the adapter failing. */
+            if (g_WinMaliRegPath.Length != 0) {
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"StatDodLastQai",
+                        0x8000u | ((ULONG)pQueryAdapterInfo->Type & 0xFFu));
+            }
+        }
         DbgPrint("[WinMali]    QAI[%u] enter outsz=%u\n",
                  (unsigned)pQueryAdapterInfo->Type,
                  (unsigned)pQueryAdapterInfo->OutputDataSize);
+    }
+
+    /* ===================================================================
+     * DISPLAY-ONLY: REFUSE THE RENDER-ONLY QUERIES.
+     *
+     * A display-only miniport has no memory segments, no GPU MMU, no page
+     * tables and no history buffer. Answering these with render numbers
+     * advertises hardware we do not have in this mode - and the adapter now
+     * dies exactly here (StatDodStage=0x8005). STATUS_NOT_SUPPORTED is the
+     * honest answer, and dxgk does not expect to be asking a DOD for them.
+     *
+     * ⛔ DRIVERCAPS is NOT in this list: dxgk requires it from every adapter,
+     * display-only included. If the refusal turns out to be DRIVERCAPS itself,
+     * StatDodLastQai will say so and the fix is to trim its contents, not to
+     * refuse the query.
+     * =================================================================== */
+    if (g_WinMaliDodMode != 0) {
+        switch (pQueryAdapterInfo->Type) {
+        case DXGKQAITYPE_QUERYSEGMENT:
+        case DXGKQAITYPE_QUERYSEGMENT3:
+        case DXGKQAITYPE_QUERYSEGMENT4:
+        case DXGKQAITYPE_GPUMMUCAPS:
+        case DXGKQAITYPE_PAGETABLELEVELDESC:
+        case DXGKQAITYPE_HISTORYBUFFERPRECISION:
+        case DXGKQAITYPE_NUMPOWERCOMPONENTS:
+            DbgPrint("[WinMali]    QAI[%u] REFUSED in display-only mode "
+                     "(render-only capability)\n",
+                     (unsigned)pQueryAdapterInfo->Type);
+            return STATUS_NOT_SUPPORTED;
+        default:
+            break;
+        }
     }
 
     switch (pQueryAdapterInfo->Type) {
@@ -122,7 +180,35 @@ WinMaliKmdQueryAdapterInfo(
            STATUS_REVISION_MISMATCH). Must match init.Version in
            WinMaliDxgkInitFill.c (WDDM 3.2 on the 26100 WDK) and the
            WDDMDEVICECAPS echo below. */
-        WM_SET(WDDMVersion, DXGKDDI_WDDMv3_2);
+        /* â›”â˜…â˜…â˜…â˜…â˜… DISPLAY-ONLY MUST NOT CLAIM WDDM 2.1+.
+           KMDDOD_INITIALIZATION_DATA has NO version block above
+           DXGKDDI_INTERFACE_VERSION_WDDM2_0, so it has no slot for
+           DxgkDdiUpdateMonitorLinkInfo - a WDDM2_1 member that exists only in
+           DRIVER_INITIALIZATION_DATA. dxgk has a dedicated adapter-start
+           failure reason for that pointer being NULL
+           (StartAdapter_DxgkDdiUpdateMonitorLinkInfoIsNull = 19), evaluated in
+           the monitor/GDI-view cluster (16..21) that runs immediately after
+           DpiFdoEnumChildDevices (15). StatPostOwned=1 clears 15, so 19 is the
+           next wall - exactly where StatDodStage stops, with StatDodDdiMask
+           ABSENT because dxgk fails us inside its OWN start logic and therefore
+           never calls another DDI. See WinMaliVidPn.h:180-183, where this
+           driver predicted this wall in so many words. */
+        /* 🎯 dxgkrnl 0x140009ED8: `cmp WDDMVersion,#0x2300 / bge -> teardown`.
+           At or above DXGKDDI_WDDMv2_3 a lost VidPn source is DEMOLISHED
+           (DisableAllPlanes, plane off, vsync off, allocations evicted) and
+           never restored; below it the source is merely PAUSED and comes back
+           ~4 ms later. Display-only reports 0x2000 and recovers; render reports
+           0x3200 and does not. The knob exists to test exactly that. */
+        WM_SET(WDDMVersion,
+               (g_WinMaliQaiWddmVer != 0) ? (DXGK_WDDMVERSION)g_WinMaliQaiWddmVer
+                                          : ((g_WinMaliDodMode != 0) ? DXGKDDI_WDDMv2
+                                                                     : DXGKDDI_WDDMv3_2));
+        /* â›” PROVE THE BYTES, NOT THE INTENT - flushed, so the next boot shows
+           what dxgk actually read rather than what this code meant to say. */
+        if (g_WinMaliDodMode != 0 && g_WinMaliRegPath.Length != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                    L"StatDodWddmVer", (ULONG)DXGKDDI_WDDMv2);
+        }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, HighestAcceptableAddress) +
             sizeof(caps->HighestAcceptableAddress) <= lim) {
             caps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
@@ -258,7 +344,56 @@ WinMaliKmdQueryAdapterInfo(
                  * ORACLE: StatPresentFlips > 0, or StatPresentLastFlags bit2
                  * (Flip, 0x4). If those stay 0/1 the cap is not what chooses the
                  * model, and this must be reverted rather than left claimed. */
-                /* ⛔⛔ REVERTED - THESE TWO WRITES BROKE DRIVER ENTRY.
+                /* ⛔★★★★★ RESTORED 1.1.9.88 - THE STATED CAUSE OF THE REVERSION
+                 * IS REFUTED BY MEASUREMENT.
+                 *
+                 * The reversion below blamed FIELD_OFFSET skew: "computed from OUR
+                 * DXGK_DRIVERCAPS does not necessarily address the same field in
+                 * the OS's struct". MEASURED 2026-08-23 on the running driver:
+                 *     QueryCapsOutSz  = 592   (what dxgk asked for)
+                 *     QueryCapsSizeof = 592   (our sizeof(DXGK_DRIVERCAPS))
+                 * They are EQUAL, so the two layouts agree and no field can land
+                 * anywhere but where the header says. The skew theory is dead.
+                 *
+                 * The other half of the reversion is self-refuting: it records
+                 * that both writes were knob-gated and defaulted to 0, then that
+                 * the fault "did NOT clear when the knobs were set back to 0". A
+                 * write that never executes cannot cause a fault that persists -
+                 * that is the signature of a deploy that did not take (stale .sys,
+                 * unrebound devnode, uncommitted registry - all three documented
+                 * traps in this project), not of these lines.
+                 *
+                 * WHY IT MATTERS NOW. We claim FlipCaps=0xA (measured
+                 * QueryFlipCaps=10) i.e. "I flip on vsync", while
+                 * MaxQueuedFlipOnVSync ships as 0 from RtlZeroMemory - a flip
+                 * queue of depth ZERO. dxgk echoes exactly that back in its own
+                 * VSyncDPCMultiPlane payload: FlipQueues=0, FlipEntryCount=0,
+                 * hFlipDevice=0. Nothing can ever queue a flip, so the source sits
+                 * idle and dxgk hides it 1.4 s after making it visible.
+                 *
+                 * Still knob-gated and still default OFF, so with no knob set this
+                 * binary behaves EXACTLY as before. Clearing the knob genuinely
+                 * disables the write: g_WinMaliQaiMaxQueuedFlip is read in
+                 * DriverEntry (WinMaliDriver.c:441), long before QueryAdapterInfo.
+                 * ORACLE: StatPresentFlips > 0, or StatPresentLastFlags bit2
+                 * (Flip, 0x4). If those stay 0/1 the cap is not what chooses the
+                 * model and this must be reverted, not left claimed. */
+                if (g_WinMaliQaiMaxQueuedFlip != 0 &&
+                    FIELD_OFFSET(DXGK_DRIVERCAPS, MaxQueuedFlipOnVSync) +
+                    sizeof(caps->MaxQueuedFlipOnVSync) <= lim) {
+                    caps->MaxQueuedFlipOnVSync = g_WinMaliQaiMaxQueuedFlip;
+                }
+                if (g_WinMaliQaiDirectFlip != 0 &&
+                    FIELD_OFFSET(DXGK_DRIVERCAPS, SupportDirectFlip) +
+                    sizeof(caps->SupportDirectFlip) <= lim) {
+                    caps->SupportDirectFlip = 1;
+                }
+                /* Publish what actually reached the struct, so a boot can prove
+                   the write happened rather than inferring it from behaviour. */
+                (VOID)InterlockedExchange(&g_WinMaliQaiFlipQueueDepth,
+                                          (LONG)caps->MaxQueuedFlipOnVSync);
+
+                /* ⛔⛔ HISTORICAL - THESE TWO WRITES ONCE BROKE DRIVER ENTRY.
                  * Setting SupportDirectFlip / MaxQueuedFlipOnVSync here produced
                  * DEVICE PROBLEM 37 (CM_PROB_FAILED_DRIVER_ENTRY) and it did NOT
                  * clear when the knobs were set back to 0 - the fault is the
@@ -325,11 +460,67 @@ WinMaliKmdQueryAdapterInfo(
             g_WinMaliQaiFlipCapsOff   = (ULONG)FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps);
             g_WinMaliQaiOutSize       = (ULONG)pQueryAdapterInfo->OutputDataSize;
             g_WinMaliQaiCapsSizeof    = (ULONG)sizeof(DXGK_DRIVERCAPS);
+            /* ⛔★★★ PUBLISH FROM THE DDI, NOT FROM THE WORKER. The worker never
+               runs on a failed start, so the old value could only ever describe
+               the previous boot. DXGKDDI_QUERYADAPTERINFO is PASSIVE_LEVEL by
+               contract; the guard is belt-and-braces. */
+            if (KeGetCurrentIrql() == PASSIVE_LEVEL && g_WinMaliRegPath.Length != 0) {
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryCapsOutSz",  g_WinMaliQaiOutSize);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QueryCapsSizeof", g_WinMaliQaiCapsSizeof);
+            }
             DbgPrint("[WinMali]    QAI[DRIVERCAPS] FlipCaps=0x%08x @off=%u outsz=%u sizeof(caps)=%u\n",
                      (unsigned)caps->FlipCaps.Value,
                      (unsigned)FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps),
                      (unsigned)pQueryAdapterInfo->OutputDataSize,
                      (unsigned)sizeof(DXGK_DRIVERCAPS));
+        }
+
+        /* ★★★ MULTIPLANE OVERLAY - the one channel by which the OS hands a
+         * miniport SEPARATE LAYERS instead of a pre-composed frame.
+         *
+         * This driver already holds dwm's 2944x1840 desktop and the 2944x144
+         * taskbar strip as distinct BOs and already composites two layers per
+         * sweep, so MPO fits what we can genuinely do - unlike a scanout engine,
+         * which we do not have.
+         *
+         * ⚠ GATED ON Parameters\QaiMpoCaps, and DELIBERATELY LAST in the caps
+         * fill. SupportMultiPlaneOverlay sits immediately beside
+         * SupportDirectFlip, and setting THAT produced device PROBLEM 37 - a
+         * failure we never explained. A knob means recovery is "delete a value,
+         * power cycle" rather than an offline hive edit from the spare install.
+         *
+         * ⛔ ORDER MATTERS: the three MPO DDIs are wired in
+         * WinMaliDxgkStubsWire.h BEFORE this cap is claimed. Claiming a cap is
+         * what makes dxgk CALL them, so a cap without a DDI is how a claim turns
+         * into a dead device. Never claim first.
+         *
+         * ★ If PROBLEM 37 reproduces here, the offsets published beside it are
+         * the data that finally explains it: outSz == sizeof(DXGK_DRIVERCAPS)
+         * refutes the layout-skew theory, a mismatch confirms it and names the
+         * interface arm the OS actually compiled against. */
+        if (g_WinMaliQaiMpoCaps != 0) {
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, SupportMultiPlaneOverlay) +
+                sizeof(caps->SupportMultiPlaneOverlay) <= lim) {
+                caps->SupportMultiPlaneOverlay = TRUE;
+                g_WinMaliQaiMpoOff = (ULONG)FIELD_OFFSET(DXGK_DRIVERCAPS,
+                                                         SupportMultiPlaneOverlay);
+            }
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, MaxOverlayPlanes) +
+                sizeof(caps->MaxOverlayPlanes) <= lim) {
+                /* TWO: the desktop plane plus one strip. Not a guess - it is the
+                   most the present worker can honestly composite at 1:1. */
+                caps->MaxOverlayPlanes = 2;
+                g_WinMaliQaiMpoPlanesOff = (ULONG)FIELD_OFFSET(DXGK_DRIVERCAPS,
+                                                               MaxOverlayPlanes);
+            }
+            DbgPrint("[WinMali]    QAI[DRIVERCAPS] MPO claimed: Support=%u planes=%u "
+                     "@off=%u/%u (QaiMpoCaps=%u)\n",
+                     (unsigned)caps->SupportMultiPlaneOverlay,
+                     (unsigned)caps->MaxOverlayPlanes,
+                     g_WinMaliQaiMpoOff, g_WinMaliQaiMpoPlanesOff,
+                     (unsigned)g_WinMaliQaiMpoCaps);
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, SchedulingCaps) +
             sizeof(caps->SchedulingCaps) <= lim) {
@@ -467,6 +658,75 @@ WinMaliKmdQueryAdapterInfo(
 #endif
         }
 #endif
+        /* =============== DISPLAY-ONLY: RETRACT THE RENDER CLAIMS ===========
+         * Applied LAST so it overrides every field set above regardless of the
+         * knobs that produced them. The measured teardown happens in dxgk's
+         * SECOND read of this very struct, immediately after child enumeration
+         * - see the block comment on this change for the trace. */
+        if (g_WinMaliDodMode != 0) {
+            /* No flip path exists: SetVidPnSourceAddress has no KMDDOD slot. */
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps) +
+                sizeof(caps->FlipCaps) <= lim) {
+                caps->FlipCaps.Value = 0;
+            }
+            WM_SET(MaxQueuedFlipOnVSync, 0);
+            WM_SET(SupportDirectFlip, 0);
+            WM_SET(SupportMultiPlaneOverlay, FALSE);
+            WM_SET(MaxOverlayPlanes, 0);
+
+            /* No engines, so no engine topology and no scheduler. */
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, GpuEngineTopology) +
+                sizeof(caps->GpuEngineTopology) <= lim) {
+                caps->GpuEngineTopology.NbAsymetricProcessingNodes = 0;
+            }
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, SchedulingCaps) +
+                sizeof(caps->SchedulingCaps) <= lim) {
+                RtlZeroMemory(&caps->SchedulingCaps, sizeof(caps->SchedulingCaps));
+                /* ⛔★★★★★ THE ONE BIT dxgk WILL NOT LET A WDDMv2 DRIVER OMIT.
+                 * dxgkrnl 10.0.26100.9168 DXGADAPTER::Initialize RVA 0xE97E4:
+                 *     ldr  w8,[x19,#0xA18]     ; caps+0x40 = SchedulingCaps
+                 *     tbnz w8,#0,0x1400E9604   ; bit0 = MultiEngineAware
+                 * falling through emits seq 7501 "Adapter 0x%I64x:
+                 * SchedulingCaps.MultiEngineAware is not set by WDDMv2 driver"
+                 * and branches to the common 0xC000000D exit -> reason 3
+                 * StartAdapter_AddAdapterFailed. Zeroing the whole struct in
+                 * 1.1.12.8 opened exactly this wall while closing the
+                 * SupportPerEngineTDR one (seq 7845) that 1.1.12.7 died on.
+                 *
+                 * It is a topology STATEMENT, not a DDI promise: with
+                 * NbAsymetricProcessingNodes=0 and NumExecutionNodes=0 there is
+                 * nothing to schedule, so it costs and promises nothing.
+                 * ⛔ Every other bit stays 0 - bit 11 NativeGpuFence would open
+                 * a fresh check at 0xEA6D4. */
+                caps->SchedulingCaps.MultiEngineAware = 1;
+            }
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, PreemptionCaps) +
+                sizeof(caps->PreemptionCaps) <= lim) {
+                RtlZeroMemory(&caps->PreemptionCaps, sizeof(caps->PreemptionCaps));
+            }
+            WM_SET(SupportPerEngineTDR, 0);
+
+            /* FIELD BY FIELD, NOT RtlZeroMemory. CrossAdapterResource,
+             * ...Texture and ...Scanout must SURVIVE - they are what lets the
+             * render half live on another adapter (WARP) and hand us a surface,
+             * which is exactly the shape we are building. Only the claims about
+             * OUR OWN nonexistent GPU memory manager are withdrawn. */
+            if (FIELD_OFFSET(DXGK_DRIVERCAPS, MemoryManagementCaps) +
+                sizeof(caps->MemoryManagementCaps) <= lim) {
+                caps->MemoryManagementCaps.VirtualAddressingSupported = 0;
+                caps->MemoryManagementCaps.GpuMmuSupported            = 0;
+                caps->MemoryManagementCaps.IoMmuSupported             = 0;
+                caps->MemoryManagementCaps.OutOfOrderLock             = 0;
+                caps->MemoryManagementCaps.NonCpuVisiblePrimary       = 0;
+                caps->MemoryManagementCaps.PagingNode                 = 0;
+            }
+            WM_SET(InternalGpuVirtualAddressRangeStart, 0);
+            WM_SET(InternalGpuVirtualAddressRangeEnd,   0);
+
+            DbgPrint("[WinMali]    QAI[DRIVERCAPS] display-only: FlipCaps=0 "
+                     "nodes=0 no GpuMmu/scheduler/preemption "
+                     "(CrossAdapterResource preserved)\n");
+        }
 #undef WM_SET
         WM_QAI_OK("DRIVERCAPS");
         return STATUS_SUCCESS;
@@ -504,14 +764,33 @@ WinMaliKmdQueryAdapterInfo(
            scheduled). So node 1 is a real declared copy engine; GetNodeMetadata
            reports it, CreateContext accepts it, and its paging buffers are
            serviced CPU-side (BuildPagingBuffer). */
+        if (g_WinMaliDodMode != 0) {
+            /* ⛔ DISPLAY-ONLY: NO EXECUTION NODES, NO PAGING NODE.
+             * dxgk builds per-node scheduler state from these. A display-only
+             * adapter drives no engines, so claiming any is a promise nothing
+             * will honour - and this query (type 15) is exactly where the
+             * adapter was dying (StatDodLastQai=0x800F). */
+            phys.NumExecutionNodes         = 0;
+            phys.PagingNodeIndex           = 0;
+            phys.DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
+            DbgPrint("[WinMali]    QAI[PHYSICALADAPTERCAPS] display-only: "
+                     "0 execution nodes\n");
+        } else {
         phys.NumExecutionNodes         = 2;
         phys.PagingNodeIndex           = 1;   /* the real copy node */
         phys.DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
+        }
         phys.Flags.Value               = 0;
-        phys.Flags.GpuMmuSupported     = 1;
+        if (g_WinMaliDodMode == 0) {
+            phys.Flags.GpuMmuSupported = 1;
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
-        phys.VPRPagingNode             = 1;   /* no VPR; keep off the phantom */
+            phys.VPRPagingNode         = 1;   /* no VPR; keep off the phantom */
 #endif
+        }
+        /* DISPLAY-ONLY leaves both at 0. These two lines sat AFTER the DodMode
+           arm closed, so 1.1.12.5 zeroed NumExecutionNodes while still claiming
+           a GPU MMU and naming paging node 1 - out of range for an adapter with
+           zero nodes. Three independent auditors caught it. */
 
         RtlZeroMemory(pQueryAdapterInfo->pOutputData, outSz);
         copyLen = (outSz < sizeof(phys)) ? outSz : sizeof(phys);
@@ -542,8 +821,13 @@ WinMaliKmdQueryAdapterInfo(
             return STATUS_BUFFER_TOO_SMALL;
         }
         RtlZeroMemory(dc, outSz);
-        dc->WDDMVersion = DXGKDDI_WDDMv3_2;
-        WM_QAI_OK("WDDMDEVICECAPS=WDDMv3_2");
+        /* Same override as DRIVERCAPS - the two must agree or dxgk sees a
+           driver that claims two different interface versions. */
+        dc->WDDMVersion = (g_WinMaliQaiWddmVer != 0)
+                              ? (DXGK_WDDMVERSION)g_WinMaliQaiWddmVer
+                              : ((g_WinMaliDodMode != 0) ? DXGKDDI_WDDMv2
+                                                         : DXGKDDI_WDDMv3_2);
+        WM_QAI_OK("WDDMDEVICECAPS");
         return STATUS_SUCCESS;
     }
 

@@ -16,6 +16,12 @@
 #include "WinMaliAlloc.h"
 
 #define WINMALI_ALLOC_PRIV_MAGIC     'PaWM'
+
+LONG g_WinMaliStatStdAllocPrimary = 0;
+LONG g_WinMaliStatStdAllocShadow  = 0;
+LONG g_WinMaliStatStdAllocStaging = 0;
+LONG g_WinMaliStatStdAllocGdi     = 0;
+LONG g_WinMaliStatStdAllocOther   = 0;
 #define WINMALI_ALLOC_PRIV_VERSION   1u
 
 /* Default pitch alignment for linear surfaces. Mali utiles want 64-byte
@@ -208,17 +214,20 @@ WinMaliKmdCreateAllocation(
             ka->Width  = bbPriv->Width;
             ka->Height = bbPriv->Height;
             ka->Pitch  = pitch;
-            ka->Format = bbPriv->Format;   /* DXGI_FORMAT (informational) */
+            ka->Format       = bbPriv->Format;   /* a DXGI_FORMAT */
+            ka->FormatIsDxgi = TRUE;             /* see WinMaliAlloc.h */
             ka->Usage  = WINMALI_ALLOC_USAGE_RENDER_TARGET;
         } else if (priv != NULL && priv->Magic == WINMALI_ALLOC_PRIV_MAGIC) {
             ka->Width  = priv->Width;
             ka->Height = priv->Height;
             ka->Pitch  = pitch;
-            ka->Format = priv->Format;
+            ka->Format       = priv->Format;     /* already a D3DDDIFORMAT */
+            ka->FormatIsDxgi = FALSE;
             ka->Usage  = priv->Usage;
         } else {
             ka->Width = ka->Height = ka->Pitch = 0;
-            ka->Format = D3DDDIFMT_UNKNOWN;
+            ka->Format       = D3DDDIFMT_UNKNOWN;
+            ka->FormatIsDxgi = FALSE;
             ka->Usage = 0;
         }
 
@@ -299,6 +308,27 @@ WinMaliKmdCreateAllocation(
             ka->AllocIdHi = WINMALI_ALLOC_PRIV_MAGIC;
             WinMaliAllocRegisterById(adapter, ka);
             (VOID)InterlockedIncrement(&g_WinMaliStatPawmRegistered);
+        }
+
+        /* ★★★ COUNT PANEL-SIZED ALLOCATIONS THE KERNEL SEES.
+         *
+         * The UMD's 0x93 candidate table holds exactly ONE full-screen buffer
+         * (dwm's logon composition), and dwm creates only TWO full-screen
+         * surfaces through CreateResource before switching to a path we never
+         * see. But dxgk routes EVERY allocation through here, including ones
+         * the UMD never touches - so if dwm's live composition surface exists
+         * as a kernel allocation at all, it is visible at THIS call and nowhere
+         * else we have looked.
+         *
+         * The trace ring cannot answer this: it is fill-once and was already
+         * full at "MMU AS0 enabled", i.e. before any allocation traffic. A
+         * counter survives that. If FbAllocs climbs well past 2, the live
+         * composition target IS reachable from the kernel side. */
+        if (ka->Size >= (SIZE_T)20u * 1024u * 1024u) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatFbAllocs);
+            (VOID)InterlockedExchange(&g_WinMaliStatFbAllocLastW, (LONG)ka->Width);
+            (VOID)InterlockedExchange(&g_WinMaliStatFbAllocLastH, (LONG)ka->Height);
+            (VOID)InterlockedExchange(&g_WinMaliStatFbAllocLastPitch, (LONG)ka->Pitch);
         }
 
         /* pdSize + pdMagic + bbPriv are printed because the id arrives ZERO
@@ -422,6 +452,26 @@ WinMaliKmdDestroyAllocation(
                          i, ka, ka->OpenCount);
         }
         WINMALI_TRACE("DestroyAllocation[%u]: ka=%p sz=0x%Ix", i, ka, ka->Size);
+        /* ⛔★★★ TIMESTAMP THE PANEL-RT TEARDOWN. See WINMALI_VPC_FBALLOC_KILL.
+           >= 16 MB catches the 21,667,840 B panel target (and anything of that
+           class) while ignoring the atlases and window surfaces dwm destroys by
+           the hundred. Size is logged in 64 KB units so it fits the 24-bit
+           payload: 21,667,840 / 65536 = 330. */
+        /* ⛔ THIS INSTRUMENT NOW DROWNS THE ONE IT SHARES A RING WITH.
+           When it was written, dwm destroyed a panel-sized RT a handful of times
+           per boot. Since DXGI started handing DWM a primary it destroys one
+           **12 times a second**, so this saturates the 512-entry VpLog by ~27 s
+           and nothing later is observable. The window that matters is 0-2 s, so
+           cap it: the first 16 are the teardown we care about, the rest are the
+           steady-state churn we already understand.
+           ★ AN INSTRUMENT THAT FILLS THE LOG DESTROYS THE EVIDENCE IT SHARES. */
+        if (ka->Size >= (16u * 1024u * 1024u)) {
+            static LONG s_fbKillN = 0;
+            if (InterlockedIncrement(&s_fbKillN) <= 16) {
+                WinMaliVpLogOnly_(WINMALI_VPC_FBALLOC_KILL |
+                                  (ULONG)((ka->Size >> 16) & 0x00FFFFFFu));
+            }
+        }
         /* Unlink BEFORE freeing, or a later OpenAllocation would resolve this
            id to freed pool - the id table must never outlive its entries. */
         if (ka->Adapter != NULL && (ka->AllocId != 0 || ka->AllocIdHi != 0)) {
@@ -727,6 +777,34 @@ WinMaliKmdCloseAllocation(
 /* DxgkDdiDescribeAllocation                                                 */
 /* ------------------------------------------------------------------------ */
 
+/* DXGI_FORMAT -> D3DDDIFORMAT, for allocations whose Format came from the UMD.
+ *
+ * ⛔ ONLY for ka->FormatIsDxgi. The two enums OVERLAP: 21/22/32 are valid in
+ * both and mean different things, so translating a D3DDDIFORMAT "just in case"
+ * corrupts the standard-allocation path that currently works.
+ * The mapping covers what a compositor can actually ask for; anything else is
+ * passed through so an unexpected value stays visible in WMDESC1 rather than
+ * being silently rewritten into something plausible. */
+static D3DDDIFORMAT
+WinMaliDdiFormatFromAlloc_(_In_ PWINMALI_KMD_ALLOCATION Alloc)
+{
+    if (Alloc == NULL) {
+        return D3DDDIFMT_UNKNOWN;
+    }
+    if (!Alloc->FormatIsDxgi) {
+        return (D3DDDIFORMAT)Alloc->Format;
+    }
+    switch (Alloc->Format) {
+    case 87: return D3DDDIFMT_A8R8G8B8;   /* DXGI_FORMAT_B8G8R8A8_UNORM      */
+    case 88: return D3DDDIFMT_X8R8G8B8;   /* DXGI_FORMAT_B8G8R8X8_UNORM      */
+    case 28: return D3DDDIFMT_A8B8G8R8;   /* DXGI_FORMAT_R8G8B8A8_UNORM      */
+    case 24: return D3DDDIFMT_A2B10G10R10;/* DXGI_FORMAT_R10G10B10A2_UNORM   */
+    case 85: return D3DDDIFMT_R5G6B5;     /* DXGI_FORMAT_B5G6R5_UNORM        */
+    case 10: return D3DDDIFMT_A16B16G16R16F; /* DXGI_FORMAT_R16G16B16A16_FLOAT */
+    default: return (D3DDDIFORMAT)Alloc->Format;
+    }
+}
+
 _Function_class_(DXGKDDI_DESCRIBEALLOCATION)
 NTSTATUS
 APIENTRY
@@ -745,13 +823,46 @@ WinMaliKmdDescribeAllocation(
         return STATUS_INVALID_HANDLE;
     }
 
+    /* ⛔ THIS DDI WAS COMPLETELY DARK - no counter, no DbgPrint - which is why
+       nobody looked at it for weeks. dxgk learns scanout geometry HERE. */
+    {
+        static LONG s_descN = 0;
+        LONG n = InterlockedIncrement(&s_descN);
+        if (n <= 8 || (n % 512) == 0) {
+            /* ⛔ This used to print only what we were ASKED. A wrong ANSWER was
+               therefore invisible - and the answer is what dxgk rejects. Print
+               both, plus the CheckDisplayMode flag that says this is the mode
+               validation path rather than an ordinary describe. */
+            DbgPrint("[WinMali] WMDESC1 #%ld DescribeAllocation %ux%u pitch=%u "
+                     "fmt=%u isDxgi=%u -> d3dddi=%u usage=%u | ANSWER rr=%u/%u "
+                     "samples=%u/%u\n",
+                     n, ka->Width, ka->Height, ka->Pitch,
+                     (unsigned)ka->Format, (unsigned)ka->FormatIsDxgi,
+                     (unsigned)WinMaliDdiFormatFromAlloc_(ka), (unsigned)ka->Usage,
+                     (unsigned)WINMALI_VSYNC_NUM, (unsigned)WINMALI_VSYNC_DEN,
+                     1u, 1u);
+        }
+        if (g_WinMaliRegPath.Length != 0) {
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                          L"StatDescribeAlloc", (ULONG)n);
+        }
+    }
+
     pDescribeAllocation->Width  = ka->Width;
     pDescribeAllocation->Height = ka->Height;
-    pDescribeAllocation->Format = (D3DDDIFORMAT)ka->Format;
+    pDescribeAllocation->Format = WinMaliDdiFormatFromAlloc_(ka);
+    /* ⛔ MATCH THE OS's MODE FIELD-FOR-FIELD, NOT VALUE-FOR-VALUE.
+     * dxgk's SetDisplayMode payload states NumSamples=1, NumQualityLevels=1 and
+     * RefreshRate 60/1. We were answering NumQualityLevels=0 and 60000/1000 -
+     * arithmetically the same rate, but this stack compares these as FRACTIONS,
+     * and a value-equal fraction with different fields is a mismatch. That is the
+     * same class of bug as the EDID DTD disagreeing with the signal info by
+     * 2,400 Hz, so take the numbers from the SAME constants the VidPn target mode
+     * publishes and they can never drift apart. */
     pDescribeAllocation->MultisampleMethod.NumSamples = 1;
-    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
-    pDescribeAllocation->RefreshRate.Numerator   = 60000;
-    pDescribeAllocation->RefreshRate.Denominator = 1000;
+    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 1;
+    pDescribeAllocation->RefreshRate.Numerator   = WINMALI_VSYNC_NUM;
+    pDescribeAllocation->RefreshRate.Denominator = WINMALI_VSYNC_DEN;
     pDescribeAllocation->PrivateDriverFormatAttribute = 0;
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
     pDescribeAllocation->Flags.Value = 0;
@@ -891,6 +1002,23 @@ WinMaliKmdGetStandardAllocationDriverData(
 #endif
     default:
         break;
+    }
+
+    /* See the note in WinMaliKmd.h: this DDI had a trace and no counter, so a
+       ring that had already wrapped was the only record it ever ran. */
+    switch (pArgs->StandardAllocationType) {
+    case D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE:
+        (VOID)InterlockedIncrement(&g_WinMaliStatStdAllocPrimary); break;
+    case D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE:
+        (VOID)InterlockedIncrement(&g_WinMaliStatStdAllocShadow);  break;
+    case D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE:
+        (VOID)InterlockedIncrement(&g_WinMaliStatStdAllocStaging); break;
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN7)
+    case D3DKMDT_STANDARDALLOCATION_GDISURFACE:
+        (VOID)InterlockedIncrement(&g_WinMaliStatStdAllocGdi);     break;
+#endif
+    default:
+        (VOID)InterlockedIncrement(&g_WinMaliStatStdAllocOther);   break;
     }
 
     WINMALI_TRACE("GetStdAllocDriverData: type=%d wh=%ux%u fmt=%u pitch=%u sz=0x%Ix",

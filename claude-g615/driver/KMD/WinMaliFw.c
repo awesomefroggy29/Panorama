@@ -945,6 +945,87 @@ WinMaliFwGpuL2PowerOn_(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ UINT64* OutMask)
     }
     return status;
 }
+/* ⛔★★★★★ EXPLICIT SHADER-CORE POWER-ON - OPT-IN RECOVERY, NOT THE NORM.
+ *
+ * MEASURED 2026-08-22 from the first-timeout trap: SHADER_READY(any)=0x0 while
+ * SHADER_PRESENT=0x130012, with L2_READY=1 and TILER_READY=1. Three tiler-only
+ * submits succeeded and the FIRST REAL DRAW parked forever - CMD_PTR=0,
+ * BLOCKED_REASON=0, and every fault bank (MMU, GPU, CS_FAULT, CS_FATAL) zero.
+ * A hang with NO fault bits is a POWER problem, not a command-stream problem;
+ * every previous theory here treated the CS as misprogrammed.
+ *
+ * On CSF the MCU owns core power and normally powers them on demand, so this is
+ * DISABLED unless Parameters\ShaderPwrOn is set: writing PWRON behind the
+ * firmware's back races it for a domain it believes it owns, which is its own
+ * class of bug. Use it to confirm the diagnosis and to recover a GPU whose cores
+ * never came up (seen after a hot rebind), not as standing behaviour.
+ *
+ * Mirrors WinMaliFwGpuL2PowerOn_ exactly: wait for any in-flight transition to
+ * settle, write PWRON, then POLL READY - never assume the write took. */
+static NTSTATUS
+WinMaliFwShaderPowerOn_(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    UINT64   present;
+    ULONG    readyLo = 0, i;
+    NTSTATUS status;
+
+    if (g_WinMaliShaderPwrOn == 0) {
+        return STATUS_SUCCESS;   /* not armed - leave the MCU alone */
+    }
+
+    present = ((UINT64)WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_GPU_SHADER_PRESENT_HI) << 32)
+            |  (UINT64)WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_GPU_SHADER_PRESENT_LO);
+    if (present == 0) {
+        WINMALI_WARN("SHADER PWRON: SHADER_PRESENT is 0 - no cores to power");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_SHADER_READY_LO) != 0) {
+        return STATUS_SUCCESS;   /* already up - do not disturb the MCU */
+    }
+
+    WINMALI_TRACE("SHADER PWRON: present=0x%llx ready=0 - powering cores explicitly",
+                  present);
+
+    status = WinMaliFwPollPwrTransClear_(&Adapter->Hw, WINMALI_REG_SHADER_PWRTRANS_LO,
+                                         present, 20000);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_WARN("SHADER PWRON: PWRTRANS never cleared (%08x) - not writing PWRON",
+                     WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_SHADER_PWRTRANS_LO));
+        return status;
+    }
+
+    if ((present & 0xffffffffull) != 0) {
+        WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_SHADER_PWRON_LO,
+                         (ULONG)(present & 0xffffffffull));
+    }
+    if ((present >> 32) != 0) {
+        WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_SHADER_PWRON_HI,
+                         (ULONG)(present >> 32));
+    }
+
+    /* Poll READY rather than trusting the write: the whole point is that the
+       cores were not coming up, so fire-and-forget would prove nothing. */
+    for (i = 0; i < 20000u; ++i) {
+        readyLo = WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_SHADER_READY_LO);
+        if (readyLo != 0) {
+            break;
+        }
+        KeStallExecutionProcessor(1);
+    }
+
+    (VOID)InterlockedExchange(&g_WinMaliStatShaderPwrOn, (LONG)readyLo);
+    if (readyLo == 0) {
+        WINMALI_WARN("SHADER PWRON: *** READY still 0 after explicit PWRON *** "
+                     "present=0x%llx pwrtrans=%08x - the cores refuse to come up",
+                     present,
+                     WinMaliHwRead32(&Adapter->Hw, WINMALI_REG_SHADER_PWRTRANS_LO));
+        return STATUS_IO_TIMEOUT;
+    }
+    WINMALI_TRACE("SHADER PWRON: cores UP, READY=0x%08x after %u polls", readyLo, i);
+    return STATUS_SUCCESS;
+}
+
 
 static NTSTATUS
 WinMaliFwGpuL2PowerOff_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ UINT64 Mask)
@@ -2468,6 +2549,14 @@ WinMaliCsfSubmitStreamCall_(
     (VOID)WinMaliCsfWakeCsgIfIdle_(Adapter, Fw);
     WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(1), 1u);
 
+    /* RECOVERY HOOK: if the cores are down, bring them up BEFORE the draw. The
+       probe below is read-only and was only ever a diagnostic; this acts on
+       what it found. No-op unless Parameters\ShaderPwrOn is set, and a no-op
+       too when the cores are already READY - we never fight the MCU for a
+       domain that is working. */
+    if (StreamSizeBytes > 64u) {
+        (VOID)WinMaliFwShaderPowerOn_(Adapter);
+    }
     /* SHADER-CORE POWER PROBE (diagnostic 2026-07-13). "clear works, shaded
        draw is black, no fault" points at the shader cores never executing. On
        CSF the MCU powers cores on demand; if it never does, the CS completes
@@ -3813,4 +3902,68 @@ WinMaliFwTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
 
     WinMaliFwReleaseResources_(fw);
     ExFreePoolWithTag(fw, WINMALI_POOL_TAG);
+}
+
+/* ---------------------------------------------------------------------------
+   AS-slot scheduling serialization.
+
+   ⛔ THE ORIGINAL EVICTION CODE ASSERTED AN INVARIANT IT DID NOT ENFORCE. It
+   claimed "the driver binds a single CSG slot to one AS at a time, so no other
+   VM can have work in flight", and evicted on that basis. But EnsureAs ran
+   OUTSIDE fw->SubmitLock, so a second thread could be anywhere in a submit
+   while the first reprogrammed its address space - and DestroyDevice could free
+   the victim VM entirely while the evictor still held a raw pointer to it.
+   An audit of the eviction path found six critical defects, all rooted in that
+   one unenforced sentence.
+
+   The invariant is now real: AS-slot ownership changes and submissions take the
+   SAME lock. fw->SubmitLock is a KMUTEX and KMUTEX acquisition is recursive per
+   thread, so a caller may hold it across EnsureAs and then call
+   WinMaliCsfSubmitGroupStream, which takes it again - that nests correctly and
+   is why no separate lock is introduced here.
+
+   ★ A claimed invariant is worth exactly as much as the lock that enforces it.
+   --------------------------------------------------------------------------- */
+
+NTSTATUS
+WinMaliCsfAcquireSchedLock(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    if (Adapter == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* ⛔ A REAL DEADLINE, NOT NULL. WinMaliWaitObjectAbortable takes the slice
+       length as its third argument, NOT a timeout - passing NULL for Timeout
+       means wait FOREVER in 1s slices. An unbounded wait here would park the
+       dxgk scheduler thread exactly the way the present worker's infinite wait
+       once froze the whole desktop. 2s is far longer than any legitimate
+       submit (those bound themselves at 500ms) and short enough that a wedged
+       GPU cannot hold the system. */
+    {
+        LARGE_INTEGER deadline;
+        deadline.QuadPart = -20000000LL;    /* 2000 ms, relative */
+        return WinMaliWaitObjectAbortable(&Adapter->AsSchedLock, &deadline, 100);
+    }
+}
+
+VOID
+WinMaliCsfReleaseSchedLock(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    if (Adapter == NULL) {
+        return;
+    }
+    (VOID)KeReleaseMutex(&Adapter->AsSchedLock, FALSE);
+}
+
+/* The AS the MCU's CSG is currently bound to, or WINMALI_AS_SLOT_MAX if none.
+   Never evict this one: the firmware may still page-walk through it even with
+   no submit of ours outstanding. */
+ULONG
+WinMaliCsfCurrentAs(_In_ PWINMALI_ADAPTER Adapter)
+{
+    WINMALI_FWCTX *fw;
+    if (Adapter == NULL || Adapter->FwCtx == NULL) {
+        return WINMALI_AS_SLOT_MAX;
+    }
+    fw = (WINMALI_FWCTX*)Adapter->FwCtx;
+    return fw->CsgStarted ? fw->CurrentCsgAs : WINMALI_AS_SLOT_MAX;
 }

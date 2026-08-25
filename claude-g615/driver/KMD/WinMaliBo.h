@@ -40,6 +40,15 @@ typedef struct _WINMALI_BO {
                                             free the MDL shell only, never the pages */
     PVOID               UserVa;          /* set by BoMapCpu; NULL otherwise */
     PEPROCESS           UserVaProcess;   /* process the UserVa belongs to */
+    /* ⛔ DEDICATED TO UvPush. DO NOT REUSE UserVa/UserVaProcess FOR THIS:
+       BoFree_ (WinMaliBo.c:119) calls MmUnmapLockedPages(UserVa, Mdl) whenever
+       UserVa is non-NULL, because UserVa means "a mapping BoMapCpu created and
+       BoFree_ must tear down". A 0x93 import is the producer's OWN address,
+       mapped by the producer - unmapping it hangs the box on the first destroy.
+       That is exactly how 1.1.11.0 black-screened, and it was UNGATED. */
+    PVOID               PushVa;          /* producer's own VA, 0x93 import only */
+    PEPROCESS           PushProcess;     /* process PushVa belongs to           */
+    ULONG               UserPitch;       /* 0x93 SrcPitch, 0 = unknown          */
     /* Set only by BoCreateFromUserVa: the MmProbeAndLockPages MDL that pins the
        user pages this BO wraps. Held for the BO's whole life - dropping it early
        would let the pages move out from under a live GPU mapping. Freed with
@@ -158,6 +167,13 @@ VOID  WinMaliUvSrcRelease(VOID);
    escape path). See the long note on the definition. */
 BOOLEAN WinMaliUvSrcStillValid(_In_ ULONG Handle);
 
+/* Acquire the tallest full-width PARTIAL-height layer (the taskbar strip) so the
+   worker can composite it over the desktop. Use-ref taken; drop with EndUse. */
+PVOID WinMaliUvSrcAcquireStrip(_In_ ULONG Stride,
+                               _In_ ULONG PanelHeight,
+                               _Out_ ULONG* OutHandle,
+                               _Out_ ULONG* OutRows);
+
 /* Re-resolve a LATCHED candidate's system VA without re-running the selection.
    A wake copies only a slice of the frame, so re-selecting every wake splices
    strips from different surfaces into one scanout ("lines changing places on
@@ -170,6 +186,14 @@ PVOID WinMaliUvSrcReacquireVa(_In_ ULONG Handle, _Out_opt_ ULONG* OutPitch,
    successful acquisition: WinMaliUvSrcRevoke blocks (bounded) on that count, so
    a leaked ref stalls every BO teardown for its full timeout. */
 VOID WinMaliUvSrcEndUse(_In_ ULONG Handle);
+
+/* ---- UvPush: push the finished frame from the DESTROY path.
+   Holds NOTHING across a call - no MDL, no page reference, no lock, no EPROCESS
+   reference, no lifetime that outlives the caller's stack frame. See the block
+   comment on WinMaliUvPushFrame for why the call SITE answers every lifetime
+   question that a latch-and-hold design would have to answer with a protocol. */
+VOID WinMaliUvPushFrame(_Inout_ PWINMALI_ADAPTER Adapter, _In_ PWINMALI_BO Bo);
+VOID WinMaliUvPushDrain(VOID);
 
 /* Destroy every BO owned by OwnerDevice (device rundown). Returns the
    number destroyed. */

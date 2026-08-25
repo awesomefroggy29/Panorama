@@ -91,6 +91,13 @@ typedef struct _WINMALI_ADAPTER {
     /* AS-slot allocator. AS0 is the CSF MCU; AS1 is the kernel bring-up
        address space. AS2..AS(N-1) are leased per dxgk context. */
     KSPIN_LOCK          AsSlotLock;
+    /* ⛔ SERIALIZES AS-SLOT OWNERSHIP CHANGES AGAINST SUBMISSION, and it lives on
+       the ADAPTER, not in the CSF firmware context. The first version borrowed
+       fw->SubmitLock, which silently degraded to "no lock at all" whenever
+       Adapter->FwCtx was NULL - before firmware boot and after FW shutdown -
+       even though AS scheduling needs only GpuRegsMapped and both submit paths
+       call EnsureAs before any CSF call. KMUTEX, so nesting is safe. */
+    KMUTEX              AsSchedLock;
     ULONG               AsSlotInUseMask;     /* bit i set => AS i programmed */
     ULONG               AsSlotPresentMask;   /* mirror of GPU_AS_PRESENT */
 #define WINMALI_AS_SLOT_MAX  16u
@@ -98,6 +105,11 @@ typedef struct _WINMALI_ADAPTER {
         HANDLE  hContext;        /* dxgk-owned, opaque to us */
         UINT64  RootPtPa;        /* last programmed root-PT phys addr */
         BOOLEAN Bound;
+        /* Back-pointer to the VM leasing this slot, or NULL for the MCU/
+           bringup/dxgk-context slots. Eviction keys off this: a slot with a
+           NULL VmOwner is never a candidate, which is what keeps AS0 and AS1
+           out of the victim pool without a special case. */
+        struct _WINMALI_VM_PT* VmOwner;
     } AsBindings[WINMALI_AS_SLOT_MAX];
 
     /* CSF firmware image + MCU AS0 binding. */
@@ -384,6 +396,24 @@ NTSTATUS WinMaliWriteParamsBinary(_In_ PUNICODE_STRING RegistryPath,
    it to persist what dxgk asked for. Captured once at DriverEntry. */
 extern UNICODE_STRING g_WinMaliRegPath;
 
+/* MT6897 display-overlay flip. Defined in WinMaliDriver.c, used from the
+   display-only present path in WinMaliVidPn.c.
+   ⛔ g_WinMaliOvlRegsVa is mapped ONCE at StartDevice (MmMapIoSpaceEx is
+   PASSIVE_LEVEL) and must never be re-mapped from the present path. */
+extern ULONG  g_WinMaliQaiWddmVer;       /* 0 = compiled default; else reported verbatim */
+extern ULONG  g_WinMaliOvlFlip;          /* 0=off 1=no-op writeback 2=inert */
+extern PVOID  g_WinMaliOvlRegsVa;        /* OVL0 register block, or NULL */
+extern LONG64 g_WinMaliOvlFrontPa;
+extern PVOID  g_WinMaliOvlBackVa;        /* not wired yet - see apply141 note */
+extern LONG64 g_WinMaliOvlBackPa;
+extern LONG   g_WinMaliStatOvlFlipN;
+extern LONG   g_WinMaliStatOvlFlipRej;
+extern LONG   g_WinMaliStatOvlFlipBack;
+extern PVOID  g_WinMaliOvl4RegsVa;       /* right-half overlay registers */
+extern LONG   g_WinMaliStatOvlFlip2N;
+extern LONG   g_WinMaliStatOvlFlip2Rej;
+extern LONG   g_WinMaliStatOvlFlipRight;
+
 /* Monotonic UMD-error counters (defined in WinMaliEscape.c), published to
    Parameters the moment they change. The 256 KB log ring wraps in ~2 minutes,
    so counting log lines is NOT a sound before/after oracle - two consecutive
@@ -426,6 +456,255 @@ extern LONG  g_WinMaliStat0x93Calls;
 extern LONG  g_WinMaliStat0x93Ok;
 extern LONG  g_WinMaliStat0x93Fail;
 extern LONG  g_WinMaliStatUvSrcBo;
+extern LONG  g_WinMaliStatStripBo;
+extern LONG  g_WinMaliStatStripRows;
+extern LONG  g_WinMaliStatStripBlits;
+extern LONG  g_WinMaliStatStripNB;
+extern LONG  g_WinMaliStatFbAllocs;
+extern LONG  g_WinMaliStatFbAllocLastW;
+extern LONG  g_WinMaliStatFbAllocLastH;
+extern LONG  g_WinMaliStatFbAllocLastPitch;
+extern LONG  g_WinMaliStatMpoCapsCalls;
+extern LONG  g_WinMaliStatMpoCapsSrc;
+extern LONG  g_WinMaliStatMpoCheckCalls;
+extern LONG  g_WinMaliStatMpoCheckPlanes;
+extern LONG  g_WinMaliStatMpoCheckPostComp;
+extern LONG  g_WinMaliStatMpoCheckSrc;
+extern LONG  g_WinMaliStatMpoSetCalls;
+extern LONG  g_WinMaliStatMpoSetPlanes;
+extern LONG  g_WinMaliStatPresentMpoFlag;
+extern LONG  g_WinMaliStatPresentRedirected;
+extern LONG  g_WinMaliStatMpoPostCompCaps;
+extern LONG  g_WinMaliStatMpoPostPresent;
+extern LONG  g_WinMaliStatMpoPostLayer;
+extern ULONG g_WinMaliShaderPwrOn;
+extern LONG  g_WinMaliStatShaderPwrOn;
+extern LONG  g_WinMaliStatPresAl0Hi;
+extern LONG  g_WinMaliStatPresAl0Lo;
+extern LONG  g_WinMaliStatPresAl1Lo;
+extern LONG  g_WinMaliStatPresAl0NonNull;
+extern LONG  g_WinMaliStatPresAl1NonNull;
+extern LONG  g_WinMaliStatVmCreates;
+extern LONG  g_WinMaliStatVmDestroys;
+extern LONG  g_WinMaliStatVmLive;
+extern LONG  g_WinMaliStatVmCreateFail;
+extern LONG  g_WinMaliStatDevCreates;
+extern LONG  g_WinMaliStatDevDestroys;
+extern LONG  g_WinMaliStatDevDestroyBadHandle;
+extern LONG  g_WinMaliStatVmOwnerNull;
+extern LONG  g_WinMaliStatVmDeferredBind;
+extern LONG  g_WinMaliStatAsEvictions;
+extern LONG  g_WinMaliStatAsLateBinds;
+extern LONG  g_WinMaliStatAsEnsureFail;
+extern LONG  g_WinMaliStatVpTrail;
+
+/* Timestamped, fill-once companion to the nibble trail. Defined in
+   WinMaliVidPn.c; see the long comment there for the code legend and for why it
+   is fill-once rather than a ring. */
+/* 512 entries x 8 B = 4 KB. The window that matters is the ~1.8 s between
+   StartDevice and the OS switching our source off, and DDIs like IsSupportedVidPn
+   fire fast enough that 128 slots would fill before the interesting events
+   happen. Fill-once still, so the boot sequence survives an hour of idling. */
+/* MEASURED 2026-08-23: VpLogN = 1298 against a cap of 512. The log went blind at
+   t=65.3 s - AFTER the boot window, so the 0-3 s conclusions survive, but it also
+   revealed that THE OS NEVER STOPS RETRYING: bursts of modality enumeration at
+   7.8 s, 8.6 s and 65.3 s, none of which converge. 2048 x 8 B = 16 KB, which the
+   fill-once publisher already handles unchanged. */
+#define WINMALI_VPLOG_MAX 2048u
+typedef struct _WINMALI_VPLOG_ENT {
+    ULONG Code;
+    ULONG Ms;
+} WINMALI_VPLOG_ENT;
+extern WINMALI_VPLOG_ENT g_WinMaliVpLog[WINMALI_VPLOG_MAX];
+extern LONG              g_WinMaliVpLogN;
+
+/* Codes 0-15 go through WinMaliVpTrail_ and ALSO land in the 4-bit nibble trail.
+   Codes >= 16 must use WinMaliVpLogOnly_: they would alias in the nibble trail
+   (Code & 0xF) and corrupt the one instrument that has been reliable all along. */
+VOID WinMaliVpLogOnly_(_In_ ULONG Code);
+#define WINMALI_VPC_SRCADDR      16u
+#define WINMALI_VPC_ISSUPPORTED  18u
+#define WINMALI_VPC_COFUNC       19u
+#define WINMALI_VPC_HWCAPS       20u
+#define WINMALI_VPC_RECOMMEND    21u
+#define WINMALI_VPC_VSYNC_ON     22u
+#define WINMALI_VPC_VSYNC_OFF    23u
+#define WINMALI_VPC_POWER        24u
+#define WINMALI_VPC_VSYNC_FIRE   25u
+/* ⛔★★★★★ COMMIT/COFUNC/VISIBILITY DETAIL - THE INSTRUMENT WAS BLIND.
+ *
+ * WinMaliKmdCommitVidPn logs ONLY on its two success paths, so
+ * StatVpCommit="real 1 / empty 0" means "succeeded once", NOT "called once".
+ * Five failure returns log nothing and count nothing - a commit that FAILED at
+ * 1.65s is exactly as invisible as a commit that never happened, and a failed
+ * commit aborts the whole OS mode-set transaction, leaving the source off
+ * forever. That is the symptom we are chasing, and we could not see it.
+ *
+ * Same hole in EnumVidPnCofuncModality: "all 48 succeeded" rests on trail 0xC
+ * never appearing, but 0xC is only reachable via the Done: label - several
+ * early returns bypass it entirely.
+ *
+ * These are >= 0x2600 so they can never alias the 4-bit nibble trail, and the
+ * low byte carries a SITE ID so the log names the exact failing line rather
+ * than merely "it failed". With one reboot per experiment that is worth it. */
+#define WINMALI_VPC_COMMIT_ENTER 0x2600u  /* | AffectedVidPnSourceId & 0xFF */
+#define WINMALI_VPC_COMMIT_FAIL  0x2700u  /* | site id 1..4                 */
+#define WINMALI_VPC_COFUNC_FAIL  0x2900u  /* | site id 1..5                 */
+#define WINMALI_VPC_VIS_ID       0x2A00u  /* | VidPnSourceId & 0xFF         */
+/* ⛔★★★★★ WHAT MODE IS dxgk ACTUALLY COMMITTING?
+ *
+ * IsSupportedVidPn validates the TOPOLOGY SHAPE ONLY - exactly one path,
+ * source0 -> target0 - and never looks at the pinned MODES. CommitVidPn then
+ * succeeds unconditionally, because with a fixed already-lit framebuffer there
+ * is no hardware to program. Net effect: we answer "supported" and "committed"
+ * for a VidPn at ANY resolution or refresh rate.
+ *
+ * If dxgk pins a mode that is not the panel's, we agree to it, and the OS then
+ * finds the display unusable - which is exactly the observed end state
+ * (Win32_VideoController reports a live 2944x1840@60 mode while
+ * Win32_DesktopMonitor reports availability 8 = OFF LINE).
+ *
+ * These carry the geometry in the code word itself so it lands in the VpLog
+ * timeline with a timestamp, costing no registry names and no registry I/O
+ * inside a mode-set DDI. 2944 = 0xB80 and 1840 = 0x730 both fit in 12 bits. */
+#define WINMALI_VPC_MODE_SRC     0x30000000u  /* | (cx << 12) | cy */
+#define WINMALI_VPC_MODE_TGT     0x31000000u  /* | (cx << 12) | cy */
+#define WINMALI_VPC_MODE_HZ      0x32000000u  /* | vsync Hz        */
+#define WINMALI_VPC_MODE_NOPIN   0x33000000u  /* | 1=src 2=tgt (nothing pinned) */
+/* ⛔★★★★★ THE COLD BOOT BRINGS THE SOURCE UP **TWICE**; A REBIND ONCE.
+ *
+ * MEASURED A/B, same driver, same log:
+ *   rebind    : Commit, SetVidPnSourceAddress, Visibility TRUE   -> STAYS UP
+ *   cold boot : Commit, SrcAddr, VisTRUE, then a SECOND SrcAddr + VisTRUE 30 ms
+ *               later, then both torn down 1.46 s after that.
+ * The second activation is the one that dies, and we cannot currently tell what
+ * it is: SetVidPnSourceAddress logs no payload at all. These carry it.
+ *
+ * SRCADDR2: low 24 bits of the PrimaryAddress being latched. Two DIFFERENT
+ * addresses would mean two different surfaces are being scanned out - i.e. the
+ * second activation targets something else entirely.
+ * SRCADDR_ID: VidPnSourceId | (Flags.Value << 8). The flags say whether dxgk
+ * asked for ModeChange / FlipImmediate / FlipOnNextVSync, which distinguishes a
+ * mode-set latch from a real flip. */
+#define WINMALI_VPC_SRCADDR2     0x35000000u  /* | PrimaryAddress & 0xFFFFFF */
+#define WINMALI_VPC_SRCADDR_ID   0x36000000u  /* | srcId | (Flags << 8)      */
+#define WINMALI_VPC_COMMIT_VIDPN 0x37000000u  /* | low 24 bits of hFunctionalVidPn */
+#define WINMALI_VPC_ISSUP_VIDPN  0x38000000u  /* | low 24 bits of hDesiredVidPn    */
+/* ⛔★★★★★ WHAT IS IN THE **NEW** VidPns THAT WE CANNOT SATISFY?
+ *
+ * MEASURED: ~1.8 s after StartDevice the OS builds a brand-new set of VidPn
+ * objects (handles jump from the 0xD2xxxx boot range to 0xC3xxxx), probes them,
+ * commits NONE, and hides our source 0.35 s later. We answer IsSupportedVidPn
+ * YES to all 49 and EnumVidPnCofuncModality succeeds every time - so from our
+ * side nothing is refused, yet nothing is applied.
+ *
+ * EnumVidPnCofuncModality deliberately TOUCHES NOTHING when a mode is already
+ * PINNED. If the OS pins something in the new VidPn that differs from the single
+ * mode we publish, we would leave it alone, report success, and the topology
+ * would never be committable - invisibly. These codes make the pinned state and
+ * the pivot visible for every call. */
+#define WINMALI_VPC_COFUNC_VIDPN 0x39000000u  /* | low 24 bits of hConstrainingVidPn */
+#define WINMALI_VPC_COFUNC_PIVOT 0x3A000000u  /* | EnumPivotType | (srcId<<8) | (tgtId<<16) */
+#define WINMALI_VPC_COFUNC_PINSRC 0x3B000000u /* | (cx<<12) | cy   (0xFFFFFF = none pinned) */
+#define WINMALI_VPC_COFUNC_PINTGT 0x3C000000u
+/* WARNING: EVERY MODE AND TIMING LENS IS NOW ELIMINATED BY MEASUREMENT.
+ *
+ * The monitor source mode set Windows derived from our EDID matches the target
+ * mode we publish FIELD FOR FIELD, as fractions: 2944+56 = HTotal 3000,
+ * 1840+10 = VTotal 1850, PixelClockRate 333,000,000, VSync 60/1,
+ * HSync 111000/1, progressive. There is exactly ONE display adapter, our path
+ * is present in every VidPn the OS builds (zero COFUNC_FAIL|4), and the pinned
+ * modes it hands back are our own 2944x1840. And still nothing is committed.
+ *
+ * So the incompatibility is NOT in the mode. What is left unwritten is the rest
+ * of the two structs the OS must complete before a path can be driven:
+ *
+ *  - D3DKMDT_VIDPN_TARGET_MODE's wire-format union. We write 2 bits of 32
+ *    (Preference) and leave Rgb/YCbCr444/YCbCr422/YCbCr420/Intensity all ZERO,
+ *    i.e. "this target can carry no wire format at all". The OS is required to
+ *    select exactly one bit across those five fields.
+ *  - The path's ContentTransformation SUPPORT masks. We advertise Identity
+ *    only, while the persisted CCD configuration for this very monitor set
+ *    (GraphicsDrivers\Configuration\LNV56550_01_07EA_B2) asks for Scaling=4,
+ *    DISPLAYCONFIG_SCALING_ASPECTRATIOCENTEREDMAX.
+ *
+ * Both are "we declared less than the OS needs", and both are invisible in
+ * every counter because nothing FAILS -- the path simply can never be
+ * completed. TGTWIRE_IN is the free falsifier for the first: if dxgk
+ * pre-populates the union in pfnCreateNewModeInfo it reads non-zero and that
+ * theory dies on the same boot, with no rebuild. */
+#define WINMALI_VPC_ISSUP_EMPTY   0x28000000u  /* IsSupportedVidPn saw numPaths==0  */
+#define WINMALI_VPC_RECTOPO       0x2B000000u  /* RecommendVidPnTopology was called */
+#define WINMALI_VPC_COFUNC_XFORM  0x3D000000u  /* | Scaling | (Rotation<<8) | (updOk<<16) */
+#define WINMALI_VPC_TGTWIRE_IN    0x3E000000u  /* wire union AS HANDED TO US (low 24) */ /* | (cx<<12) | cy   (0xFFFFFF = none pinned) */
+/* ⛔★★★★★ WHICH CAME FIRST: dwm DROPPING ITS PANEL RTs, OR THE OS HIDING US?
+ *
+ * The whole causal story rests on this and it has never been measured. The UMD
+ * log proves dwm creates two 2944x1840 render targets and destroys both a few
+ * calls after the taskbar strip is opened - but that log carries no timestamps,
+ * only line order, so it cannot be lined up against
+ * SetVidPnSourceVisibility(FALSE) at 1.68 s.
+ *
+ * Two readings fit every measurement taken so far and they demand opposite fixes:
+ *   destroy BEFORE 1.68 s -> dwm gave up first, and the OS hid an unused source
+ *   destroy AFTER  1.68 s -> the OS hid us first, and dwm moved off a dead adapter
+ *
+ * DxgkDdiDestroyAllocation runs in the KMD, so putting it on the VpLog timeline
+ * settles it in ONE boot. Only FRAMEBUFFER-SIZED allocations are logged - the
+ * panel is 2944*1840*4 = 21,667,840 B and dwm churns hundreds of small surfaces,
+ * which would fill a 512-entry fill-once log before anything interesting. */
+#define WINMALI_VPC_FBALLOC_KILL 0x34000000u  /* | size in 64KB units          */
+/* ⛔★★★★★ THE ONE HALF OF THE SCALING TRANSACTION NEVER MEASURED.
+ *
+ * PROVEN on 1.1.10.1: a VidPn that arrives with Scaling = IDENTITY commits; one
+ * that arrives UNPINNED is driven through pivot=SCALING / pivot=ROTATION and is
+ * then ABANDONED, and 0.35 s later dxgk blanks the source it had already blanked
+ * ahead of that mode set - and never un-blanks, because the transaction never
+ * completes.
+ *
+ * We call pfnUpdatePathSupportInfo and log its RETURN STATUS, and we log the
+ * Scaling the OS put on the path. We have NEVER logged the SUPPORT MASK the path
+ * carries on entry - which, on call N+1, is exactly what call N wrote. So
+ * "the OS ignores our support mask" and "our write never landed" have been
+ * indistinguishable all along.
+ *
+ * Header note at d3dkmddi.h:7148 is explicit: pfnUpdatePathSupportInfo "updates
+ * what the path SUPPORTS for transformations" - the OS owns the pinning. If the
+ * mask reads back as we wrote it and the OS still refuses to pin, then the
+ * support mask is exonerated and the fault is in what the OS needs BEFORE it will
+ * pin at all.
+ *   payload: ScalingSupport bits | RotationSupport bits << 8 | (weWrote << 16) */
+#define WINMALI_VPC_COFUNC_SUPPORT 0x2C000000u
+
+/* RecommendMonitorModes census. 0xFFFFFF = no interface, 0xFFFE = GetNumModes
+   failed; otherwise low 16 = mode count, bits 16-23 = VideoPresentTargetId. */
+#define WINMALI_VPC_RECMON       0x3F000000u
+/* | (cx<<12) | cy ; bit23 set = a mode from the WALK, clear = the PREFERRED one */
+#define WINMALI_VPC_RECMON_MODE  0x40000000u
+/* bit23 set -> | (Origin<<8) | Preference   (a walked mode)
+   bit22 set -> | AddMode status & 0xFFFF
+   neither   -> 0 = NO_PREFERRED_MODE, 1 = has one, 2 = query failed */
+#define WINMALI_VPC_RECMON_INFO  0x41000000u
+/* Hot re-plug. | (phase << 16) | (status & 0xFFFF); phase 1=disconnect 2=connect */
+#define WINMALI_VPC_REPLUG       0x42000000u
+
+/* What the OS is actually PROPOSING in IsSupportedVidPn. The 39 candidate
+   VidPns are the whole remaining mystery: we approve them all on topology and
+   never look at the modes. 0x46..0x48 verified unused in the tree. */
+#define WINMALI_VPC_ISSUP_SRC    0x46000000u  /* | (cx << 12) | cy, 0xFFFFFF = nothing pinned */
+#define WINMALI_VPC_ISSUP_TGT    0x47000000u  /* | (cx << 12) | cy, 0xFFFFFF = nothing pinned */
+#define WINMALI_VPC_ISSUP_XFORM  0x48000000u  /* | Scaling | (Rotation << 8)                  */
+VOID WinMaliVpTrail_(_In_ ULONG Code);
+extern LONG  g_WinMaliStatVpIsSupYes;
+extern LONG  g_WinMaliStatVpIsSupNo;
+extern LONG  g_WinMaliStatVpCommitPath;
+extern LONG  g_WinMaliStatVpCommitEmpty;
+extern LONG  g_WinMaliStatVpVisOn;
+extern LONG  g_WinMaliStatVpVisOff;
+extern LONG  g_WinMaliStatVpVisOnMs;
+extern LONG  g_WinMaliStatVpVisOffMs;
+extern ULONG64 g_WinMaliAdapterStartTick;
+ULONG WinMaliMsSinceAdapterStart_(VOID);
 extern LONG  g_WinMaliStatUvSrcHits;
 /* asked/cands/tooSmall exist so a `uvBo=0` can be TOLD APART: never asked vs
    nothing published vs all too small vs big enough but unpainted. */
@@ -464,6 +743,24 @@ extern LONG  g_WinMaliStatBoDeref;
 extern ULONG g_WinMaliUvBoDedup;
 extern ULONG g_WinMaliQaiDirectFlip;
 extern ULONG g_WinMaliQaiMaxQueuedFlip;
+extern ULONG g_WinMaliSrcModeFormat;
+extern LONG  g_WinMaliQaiFlipQueueDepth;
+/* ⛔★★★★★ DOES dxgk EVER ASK US FOR A SHARED PRIMARY SURFACE?
+ *
+ * In the blt model the DESTINATION of a desktop present is the shared primary.
+ * WinMaliKmdGetStandardAllocationDriverData handles
+ * D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE correctly - but nothing has
+ * ever COUNTED it, only a WINMALI_TRACE into a ring that wraps long before
+ * anyone reads it. So "dxgk never asked for a primary" and "it asked and we
+ * answered" are currently indistinguishable, and if it never asks then
+ * NumDstAllocations=0 and a NULL dst cookie are mechanically forced and every
+ * theory about cookie binding is chasing a surface that was never created.
+ * One counter per type, so the answer is a registry read forever after. */
+extern LONG  g_WinMaliStatStdAllocPrimary;
+extern LONG  g_WinMaliStatStdAllocShadow;
+extern LONG  g_WinMaliStatStdAllocStaging;
+extern LONG  g_WinMaliStatStdAllocGdi;
+extern LONG  g_WinMaliStatStdAllocOther;
 extern PUCHAR g_WinMaliRevokeSnap;
 extern ULONG  g_WinMaliRevokeSnapLen;
 extern LONG  g_WinMaliStatUvRevokeAny;
@@ -552,11 +849,17 @@ extern ULONG g_WinMaliSegmentShape;
 extern ULONG g_WinMaliQaiFlipCapsValue;
 extern ULONG g_WinMaliQaiFlipCapsOff;
 extern ULONG g_WinMaliQaiOutSize;
+extern ULONG g_WinMaliQaiMpoCaps;
+extern ULONG g_WinMaliQaiMpoWire;
+extern ULONG g_WinMaliQaiMpoOff;
+extern ULONG g_WinMaliQaiMpoPlanesOff;
 extern ULONG g_WinMaliQaiCapsSizeof;
 extern ULONG g_WinMaliQaiSegFlags;   /* DXGK_SEGMENTFLAGS we sent; DirectFlip=0x400 */
 
 
-extern LONG  g_WinMaliScanoutWc;      /* 1 = write-combined, 0 = UNCACHED (~1000x) */
+extern LONG  g_WinMaliScanoutWc;      /* 1=WC(Ex) 2=WC(legacy) 3=NOCACHE 4=default */
+extern LONG  g_WinMaliScanoutWcOff;   /* Parameters\ScanoutWcOff: skip probe+WC entirely */
+extern LONG  g_WinMaliScanoutAttr;    /* MmGetCacheAttribute of the winning mapping */
 extern LONG  g_WinMaliFlipHasMdl;
 extern LONG  g_WinMaliFlipMdlPages;
 extern LONG  g_WinMaliFlipAllocOk;
@@ -610,6 +913,89 @@ extern ULONG g_WinMaliFeatureIface;
 extern ULONG g_WinMaliVidPnSources;
 extern ULONG g_WinMaliHybridRole;
 extern ULONG g_WinMaliChildCfg;
+extern ULONG g_WinMaliTgtWireFmt;   /* target-mode wire format / MinimumVSyncFreq */
+extern ULONG g_WinMaliPathXform;    /* breadth of the path transformation support */
+extern ULONG g_WinMaliMonModeAdd;   /* add a driver-origin monitor source mode */
+extern ULONG g_WinMaliUvPush;       /* push the finished frame from BO destroy */
+extern ULONG g_WinMaliDodMode;      /* 1 = initialise as a display-only miniport */
+extern ULONG g_WinMaliDodStage;     /* how far the display-only start got */
+extern VOID  WinMaliDodStage(_In_ ULONG Stage);
+
+/* ⛔ StatDodStage is a LADDER and can only name the furthest DDI reached. dxgk
+   does not call the start DDIs in one fixed order, so the ladder hides most of
+   what happened. This bitmask names EVERY display-only DDI that ran. */
+#define WINMALI_DOD_DDI_CHILDSTATUS    0x00000001u
+#define WINMALI_DOD_DDI_DEVICEDESC     0x00000002u
+#define WINMALI_DOD_DDI_CONTAINERID    0x00000004u
+#define WINMALI_DOD_DDI_ISSUPPORTED    0x00000008u
+#define WINMALI_DOD_DDI_RECOMMENDVIDPN 0x00000010u
+#define WINMALI_DOD_DDI_COFUNCMODALITY 0x00000020u
+#define WINMALI_DOD_DDI_COMMITVIDPN    0x00000040u
+#define WINMALI_DOD_DDI_UPDATEPATH     0x00000080u
+#define WINMALI_DOD_DDI_SRCVISIBILITY  0x00000100u
+#define WINMALI_DOD_DDI_MONITORMODES   0x00000200u
+#define WINMALI_DOD_DDI_HWCAPABILITY   0x00000400u
+#define WINMALI_DOD_DDI_PRESENTDISPONLY 0x00000800u
+#define WINMALI_DOD_DDI_SETPOWERSTATE  0x00001000u
+/* ★ THE MOST INFORMATIVE BIT: dxgk calls StopDevice when it GIVES UP on the
+   adapter. Set = we returned cleanly and were rejected anyway; clear = we never
+   came back out of a DDI. ProblemCode=43 cannot tell those two apart. */
+#define WINMALI_DOD_DDI_STOPDEVICE     0x00002000u
+/* â˜…â˜… THE ONE THAT WAS MISSING. An adapter that holds POST display ownership
+   (StatPostOwned=1 - that is us) is torn down through THIS, not StopDevice. */
+#define WINMALI_DOD_DDI_STOPANDRELEASE 0x00004000u
+#define WINMALI_DOD_DDI_REMOVEDEVICE   0x00008000u
+#define WINMALI_DOD_DDI_NOTIFYACPI     0x00010000u
+#define WINMALI_DOD_DDI_RESETDEVICE    0x00020000u
+#define WINMALI_DOD_DDI_SYSDISPENABLE  0x00040000u
+#define WINMALI_DOD_DDI_QUERYINTERFACE 0x00080000u
+/* Why did PresentDisplayOnly decline a frame? 1=no adapter 2=no args
+   3=pSource NULL 4=no framebuffer 5=unsupported format/pitch. */
+#define WINMALI_DODPRES_NOADAPTER  1u
+#define WINMALI_DODPRES_NOARGS     2u
+#define WINMALI_DODPRES_NOSOURCE   3u
+#define WINMALI_DODPRES_NOFB       4u
+#define WINMALI_DODPRES_BADFMT     5u
+extern VOID  WinMaliDodPresentWhy(_In_ ULONG Code);
+extern VOID  WinMaliDodPresentProof(_In_ ULONG Count, _In_ ULONG SrcPix, _In_ ULONG DstPix);
+extern VOID  WinMaliDodPresentContent(_In_ ULONG GridN, _In_ ULONG SrcNZ, _In_ ULONG SrcOr,
+                                      _In_ ULONG DstNZ, _In_ ULONG DstOr);
+extern VOID  WinMaliDodPresentRect(_In_ ULONG RectN, _In_ ULONG SrcNZ, _In_ ULONG DstNZ,
+                                   _In_ ULONG FullUs);
+/* Parameters\DodFirstFull: 1 = copy the WHOLE frame once before honouring dirty
+   rects. Windows only reports what CHANGED and assumes the rest of our scanout
+   already matches its surface - it does not, it holds BasicDisplay's pixels. */
+extern ULONG g_WinMaliDodFirstFull;
+extern ULONG g_WinMaliDodDdiMask;
+extern VOID  WinMaliDodDdi(_In_ ULONG Bit);
+extern LONG  g_WinMaliStatDodPresent;
+extern LONG  g_WinMaliStatDodFull;
+extern LONG  g_WinMaliStatDodDirty;
+extern LONG  g_WinMaliStatDodNoFb;
+extern LONG  g_WinMaliStatDodBadFmt;
+extern LONG  g_WinMaliStatDodExc;
+extern LONG  g_WinMaliUvPushBusy;
+extern LONG64 g_WinMaliUvPushTick;
+extern LONG  g_WinMaliStatUvPush;
+extern LONG  g_WinMaliStatUvPushRefG;
+extern LONG  g_WinMaliStatUvPushRefP;
+extern LONG  g_WinMaliStatUvPushRefD;
+extern LONG  g_WinMaliStatUvPushExc;
+extern LONG  g_WinMaliStatUvPushNB;
+extern ULONG g_WinMaliHotReplugMs;  /* ms after StartDevice to fake a monitor re-plug */
+extern ULONG g_WinMaliHpdMode;      /* 1 = force HpdAwarenessInterruptible */
+/* WHO called SetVidPnSourceVisibility. MEASURED from ETW: the ON at 0.206 s comes
+   from pid 872 and the OFF at 1.647 s from pid 1248 - two DIFFERENT processes, and
+   1248 has exited by the time WinRM is reachable, so it cannot be named from user
+   mode. The DDI runs at PASSIVE_LEVEL in the CALLER's context, so the driver can
+   name it directly. 16 bytes: PsGetProcessImageFileName returns 15 chars + NUL. */
+extern LONG  g_WinMaliVisOnPid;
+extern LONG  g_WinMaliVisOffPid;
+extern UCHAR g_WinMaliVisOnName[16];
+extern UCHAR g_WinMaliVisOffName[16];
+extern ULONG g_WinMaliVpLogVsync;   /* log vsync arm/disarm into VpLog (ring hog)  */
+extern ULONG g_WinMaliKnobFuse;     /* clear experimental levers after ONE boot    */
+extern ULONG g_WinMaliWorkerVisGate;/* worker blits only while the source is shown */
 
 /* Non-zero once teardown has begun (StopDevice/RemoveDevice). */
 extern volatile LONG g_WinMaliStopping;
@@ -623,6 +1009,7 @@ extern ULONG g_WinMaliFlipSrcFromVidMm;
    FlipSrcFromVidMm - it was simply never gated, and was mislabelled in the
    source as a 0x93 read. Leave 0; 0x93 (srcPath 3) is the only safe source. */
 extern ULONG g_WinMaliFlipSrcFromAperture;
+extern ULONG g_WinMaliFlipSrcPreferAperture;
 extern ULONG g_WinMaliPresentCopyBudgetKB; /* 0 = whole frame per wake */
 extern LONG  g_WinMaliStatSkipNoSrc;
 extern ULONG g_WinMaliPresentMarker;
@@ -713,6 +1100,9 @@ NTSTATUS WinMaliTilerHeapGrow(_Inout_ PWINMALI_ADAPTER Adapter,
                               _Out_   UINT64*          OutChunkVa,
                               _Out_   ULONG*           OutChunkSize);
 
+NTSTATUS WinMaliCsfAcquireSchedLock(_Inout_ PWINMALI_ADAPTER Adapter);
+VOID     WinMaliCsfReleaseSchedLock(_Inout_ PWINMALI_ADAPTER Adapter);
+ULONG    WinMaliCsfCurrentAs(_In_ PWINMALI_ADAPTER Adapter);
 NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
                                      _In_ UINT64  StreamGpuVa,

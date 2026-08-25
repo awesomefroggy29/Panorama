@@ -21,6 +21,35 @@
 #define WINMALI_FB_BPP          32u
 #define WINMALI_FB_SCANOUT_PA   0xFD619400ULL   /* live buffer, LK-STAGE path */
 
+/* The EDK2 framebuffer carveout holds THREE contiguous frames. Confirmed by
+   arithmetic against tb375fcPkg/tb375fc.dsc: fb_base 0xFC16F000, one frame is
+   2944*1840*4 = 0x14AA400, frame0+frame == 0xFD619400 (the address the OVL was
+   measured to hold), and frame2+frame == 0xFFF6DC00 which is precisely the
+   "frame2 ends 0xFFF6DC00" that file states. Contiguous and reserved, so they
+   can be handed to the overlay directly - no IOMMU, no page lists. */
+/* ⛔ TWO DIFFERENT NUMBERS - DO NOT COLLAPSE THEM.
+   PAYLOAD = 2944*1840*4 = 0x14AA000, what one frame actually occupies.
+   STRIDE  = 0x14AA400,   frame-to-frame spacing in the carveout (measured:
+   frame1 - frame0 = 0xFD619400 - 0xFC16F000). The 0x400 difference is the same
+   1 KB by which the scanout PA sits inside its own resource.
+   Use STRIDE to compute the next frame base; use PAYLOAD as a copy length.
+   Swapping them over-copies 1 KB into the next frame, or lands 1 KB short. */
+#define WINMALI_FB_FRAME_STRIDE  0x14AA400ULL
+#define WINMALI_FB_FRAME_PAYLOAD 0x14AA000ULL
+#define WINMALI_FB_FRAME0_PA    0xFC16F000ULL
+#define WINMALI_FB_FRAME1_PA    0xFD619400ULL   /* == WINMALI_FB_SCANOUT_PA */
+#define WINMALI_FB_FRAME2_PA    0xFEAC3800ULL
+
+/* MT6897 display overlay 0 - the one measured to be scanning this panel.
+   Offsets from MTK's own mediatek_v2/mtk_disp_ovl.c for mt6897_ovl_driver_data. */
+/* disp1-ovl0: the RIGHT half of this dual-pipe panel. Measured 2026-08-25 -
+   it scans the same framebuffer starting at column 1461 (1461*4 = 5844 bytes). */
+#define WINMALI_OVL4_PA         0x14602000ULL
+#define WINMALI_OVL_RIGHT_OFF   5844u
+#define WINMALI_OVL0_PA         0x14402000ULL
+#define WINMALI_OVL0_L0_ADDR    0x0F40u         /* data->addr + 0x20*0  */
+#define WINMALI_OVL0_L0_ADDR_MSB 0x0F4Cu        /* 0x0f4c    + 0x20*0   */
+
 /* How long the present worker sits idle after starting, before it copies anything.
    Armed BOOTS hang at the logon spinner (partial top-band paint, then dead) while
    runtime arming survives 100 s windows. The difference is that at boot we start
@@ -150,6 +179,12 @@ NTSTATUS APIENTRY WinMaliKmdSetVidPnSourceAddress(_In_ CONST HANDLE hAdapter,
     _In_ CONST DXGKARG_SETVIDPNSOURCEADDRESS *pArgs);
 NTSTATUS APIENTRY WinMaliKmdQueryVidPnHWCapability(_In_ CONST HANDLE hAdapter,
     _Inout_ DXGKARG_QUERYVIDPNHWCAPABILITY *pArgs);
+/* The one DDI a display-only miniport adds. dxgk hands us the composed desktop
+   as a CPU pointer; we copy it to the firmware framebuffer. */
+NTSTATUS APIENTRY WinMaliKmdPresentDisplayOnly(
+    _In_ CONST HANDLE hAdapter,
+    _In_ CONST DXGKARG_PRESENT_DISPLAYONLY *pPresentDisplayOnly);
+
 NTSTATUS APIENTRY WinMaliKmdRecommendMonitorModes(_In_ CONST HANDLE hAdapter,
     _In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pArgs);
 
@@ -191,6 +226,7 @@ NTSTATUS APIENTRY WinMaliKmdGetChildContainerId(_In_ PVOID MiniportDeviceContext
    (0xC01E0401), which is what STATUS_MONITOR_NO_DESCRIPTOR was causing. */
 VOID WinMaliEdidInit(VOID);
 NTSTATUS WinMaliEdidCopy(_In_ ULONG Offset, _In_ ULONG Length,
-                         _Out_writes_bytes_(Length) PVOID Buffer);
+                         _Out_writes_bytes_(Length) PVOID Buffer,
+                         _Out_ ULONG *pSupplied);
 
 

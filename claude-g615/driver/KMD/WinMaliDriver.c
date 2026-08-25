@@ -87,6 +87,49 @@ ULONG g_WinMaliFlipSrcFromVidMm = 0;
    It was mislabelled in the source as "srcPath = 2, 0x93 probe-locked BO",
    which is why it read as safe. It is not a 0x93 read; 0x93 is srcPath 3. */
 ULONG g_WinMaliFlipSrcFromAperture = 0;
+/* ★ Opt-in: read the ACTUAL primary (its aperture MDL) in preference to the 0x93
+   candidate scan. Default 0 = today's behaviour exactly. See the long note at the
+   use site. Settable by an offline hive edit, so a bad result costs a reboot. */
+ULONG g_WinMaliFlipSrcPreferAperture = 0;
+
+/* ============================================================================
+ * THE ONE BOUND ON THE PRESENT SOURCE - `srcReadable`.
+ *
+ * 1.1.9.79 wedged the box because the aperture branch adopted a source and
+ * then EVERY reader walked it with PANEL constants (WINMALI_FB_HEIGHT /
+ * WINMALI_FB_STRIDE) or with `bytes`, which is the DESTINATION size. The copy
+ * clamp was `max(srcBytes, bytes)` - a MAX, so a source SMALLER than the panel
+ * could never lower the row count. That is the 1.1.9.69 defect exactly: a loop
+ * bounded on the destination and never on the real mapped extent.
+ *
+ * From now on there is ONE number: srcReadable, the bytes readable FROM srcVa,
+ * i.e. AFTER any `off` already folded into it. It is written at every site that
+ * assigns srcVa and nowhere else. From it the worker derives, ONCE:
+ *      srcRowPitch  - the SOURCE's row stride
+ *      srcRowBytes  - bytes valid within each row (min of source and panel)
+ *      srcMaxRows   - rows fully readable, also capped by the panel height
+ * and the invariant every reader must obey is exactly:
+ *      for r < srcMaxRows, [srcVa + r*srcRowPitch, + srcRowBytes) is mapped.
+ *
+ * NO READER MAY COMPUTE A SOURCE ADDRESS BY HAND. Go through WinMaliSrcRow_():
+ * it returns NULL for any row outside the bound, so a reader that forgets to
+ * check faults on a NULL page - an instant, attributable bugcheck at a known
+ * line - instead of reading an unmapped kernel VA, which on this box is an
+ * unrecoverable hang with no dump. If you add a reader of srcVa and it does not
+ * call WinMaliSrcRow_(), it is wrong; grep this file for `srcVa +` and there
+ * must be no hits outside this helper.
+ * ========================================================================== */
+static FORCEINLINE PUCHAR
+WinMaliSrcRow_(_In_opt_ PUCHAR SrcVa,
+               _In_ ULONG MaxRows,
+               _In_ ULONG RowPitch,
+               _In_ ULONG Row)
+{
+    if (SrcVa == NULL || RowPitch == 0 || Row >= MaxRows) {
+        return NULL;               /* FAIL CLOSED - never a partial answer */
+    }
+    return SrcVa + (SIZE_T)Row * RowPitch;
+}
 
 /* Parameters\PresentCopyBudgetKB - bytes copied per worker wake, in KB.
    0/absent = the WHOLE frame in one wake (default). 2048 restores the old 2 MB
@@ -170,6 +213,13 @@ ULONG g_WinMaliFailOnGpuFault = 0;
    1.1.9.18 behaviour without a rebuild. */
 ULONG g_WinMaliTilerOomCtxSplice = 0;
 
+/* ParametersShaderPwrOn (DEFAULT 0 - OFF). 1 = write SHADER_PWRON explicitly
+   when the cores are not READY before a submit. See WinMaliFwShaderPowerOn_:
+   the MCU owns core power on CSF, so this races it and is a recovery tool, not
+   standing behaviour. */
+ULONG g_WinMaliShaderPwrOn = 0;
+LONG  g_WinMaliStatShaderPwrOn = 0;
+
 /* ParametersPresentSettleMs: how long the present worker sleeps before it starts
    scanning for a candidate. Default = WINMALI_PRESENT_SETTLE_MS (25000).
 
@@ -186,6 +236,37 @@ ULONG g_WinMaliTilerOomCtxSplice = 0;
    Knob so the window can be tuned without a rebuild - each rebuild costs a deploy
    and a human power-cycling the tablet. */
 ULONG g_WinMaliPresentSettleMs = WINMALI_PRESENT_SETTLE_MS;
+
+/* Parameters\PresentTickMs (DEFAULT 33 - a ~30 Hz SELF-TICK). 0 = the old
+   behaviour, an INFINITE wait on PresentWake.
+
+   ⛔★★★★★ THE WORKER MUST NOT DEPEND ON BEING WOKEN.
+   The wait below used a NULL timeout, so the worker only ever ran when
+   WinMaliVsyncDpc signalled PresentWake - and that signal is gated on
+   FlipLatchCount != 0, i.e. on dxgk having LATCHED A FLIP. This OS presents in
+   the BLT model (StatPresentLastFlags bit0=1, StatPresentFlips=0): there is no
+   flip chain, so in the steady state nothing ever wakes the worker again. It
+   parks forever on the first wait, and because the worker is ALSO the process
+   that publishes every Stat and Live counter, all of them freeze at their last
+   written value. MEASURED 2026-08-21: TraceTailBytes, StatUvSrcAsked (120) and
+   LiveVsyncNotify (89) all frozen across 20 s, StatSweeps=0, the PresentMarker
+   square frozen on the panel - one parked thread, presenting as a dozen
+   separate "dead counter" mysteries.
+
+   ⇒ In the 0x93-candidate scanout model the worker is a POLLER, not a flip
+   responder. A timeout makes it self-tick, so it scans candidates and keeps
+   publishing whether or not anything flips. PresentWake still short-circuits
+   the wait, so a real flip is serviced immediately rather than up to one tick
+   late. Set 0 to restore the old wait and re-test this deliberately. */
+ULONG g_WinMaliPresentTickMs = 33;
+
+/* Monotonic worker heartbeat + the last stage it reached, published from the
+   worker's own periodic block. StatWorkerTicks CLIMBING is the proof the thread
+   is alive; StatWorkerStage says where it got to on the last tick, which is the
+   one thing a frozen counter could never distinguish (parked vs exited vs
+   looping through an early-out). */
+LONG  g_WinMaliStatWorkerTicks = 0;
+LONG  g_WinMaliStatWorkerStage = 0;
 
 /* Parameters\QaiFlipCaps: OVERRIDE DXGK_DRIVERCAPS.FlipCaps. 0 = compiled default
    (FlipOnVSyncMmIo|FlipImmediateMmIo = 0xA).
@@ -208,9 +289,295 @@ ULONG g_WinMaliPresentSettleMs = WINMALI_PRESENT_SETTLE_MS;
    makes dxgk issue flips we mishandle, set back to 0 - one reboot, no rebuild. */
 ULONG g_WinMaliQaiFlipCaps = 0;
 ULONG g_WinMaliUvSrcInvalidate = 1;
+
+/* Record how far the display-only start got. No-op unless DodMode is set, so the
+   render path pays nothing. Flushed: the whole point is to survive a failed
+   adapter start and a possible PnP retry. */
+VOID
+WinMaliDodStage(_In_ ULONG Stage)
+{
+    if (g_WinMaliDodMode == 0) { return; }
+    g_WinMaliDodStage = Stage;
+    if (g_WinMaliRegPath.Length != 0) {
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodStage",
+                                             0x8000u | (Stage & 0xFFu));
+    }
+    DbgPrint("[WinMali] ===== DOD STAGE %lu =====\n", (unsigned long)Stage);
+}
+
+/* Which display-only DDIs has dxgk actually called this boot? See the bit names
+   in WinMaliKmd.h. Written FLUSHED, and only when the bit is NEW, so a DDI that
+   is called hundreds of times costs exactly one registry write. */
+ULONG g_WinMaliDodDdiMask = 0;
+
+/* ⛔ THE FIRST reason PresentDisplayOnly declined a frame, flushed so it
+   survives the adapter being torn down straight afterwards. FIRST only: this
+   can be called at 60 Hz and a flushed registry write per frame would be a
+   self-inflicted performance bug. 0x8000 sentinel so ABSENT can never read as
+   code 0. */
+VOID
+WinMaliDodPresentWhy(_In_ ULONG Code)
+{
+    static LONG s_latched = 0;
+
+    if (g_WinMaliDodMode == 0) { return; }
+    if (InterlockedCompareExchange(&s_latched, 1, 0) != 0) { return; }
+    if (g_WinMaliRegPath.Length != 0) {
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                             L"StatDodPresentWhy",
+                                             0x8000u | (Code & 0xFFu));
+    }
+    DbgPrint("[WinMali] ===== DOD PRESENT declined, reason %lu =====\n",
+             (unsigned long)Code);
+}
+
+/* Publish the present state, flushed, so it survives the adapter teardown that
+   has followed every present so far. SrcPix/DstPix are the SAME pixel sampled
+   before and after the copy: equal and non-zero proves the composed desktop
+   physically reached the firmware framebuffer. */
+/* How much of the frame is actually painted? Publishes the BEST frame seen so
+   far - an early black frame must never hide a later good one. */
+/* How long ONE full-frame copy actually costs, and how much of the DIRTY RECT
+   is painted. The rect is where the content is - the whole-frame grid cannot
+   see a 76x79 box. */
+VOID
+WinMaliDodPresentRect(_In_ ULONG RectN, _In_ ULONG SrcNZ, _In_ ULONG DstNZ,
+                      _In_ ULONG FullUs)
+{
+    if (g_WinMaliDodMode == 0 || g_WinMaliRegPath.Length == 0) { return; }
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodRectN",     RectN);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodRectSrcNZ", SrcNZ);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodRectDstNZ", DstNZ);
+    if (FullUs != 0) {
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodFullUs", FullUs);
+    }
+    /* ⛔ THE FLIP COUNTERS MUST BE PUBLISHED FROM HERE, NOT FROM THE WORKER.
+       In display-only mode the present worker never runs, and the worker is what
+       publishes every other counter - which is precisely why the trace ring reads
+       empty in DOD. This callback is already bounded (1st and every 128th
+       present), so three more flushed writes are affordable here and nowhere
+       else. StatOvlFlipBack is the READBACK of the register AFTER the write:
+       equal to what we wrote proves the write actually reached hardware. */
+    if (g_WinMaliOvlFlip != 0) {
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlipN",
+                                             (ULONG)g_WinMaliStatOvlFlipN);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlipRej",
+                                             (ULONG)g_WinMaliStatOvlFlipRej);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlipBack",
+                                             (ULONG)g_WinMaliStatOvlFlipBack);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlip2N",
+                                             (ULONG)g_WinMaliStatOvlFlip2N);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlip2Rej",
+                                             (ULONG)g_WinMaliStatOvlFlip2Rej);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlFlipRight",
+                                             (ULONG)g_WinMaliStatOvlFlipRight);
+    }
+    DbgPrint("[WinMali] ===== DOD RECT  src %lu/%lu  dst %lu/%lu   fullCopy=%lu us =====\n",
+             (unsigned long)SrcNZ, (unsigned long)RectN,
+             (unsigned long)DstNZ, (unsigned long)RectN, (unsigned long)FullUs);
+}
+
+VOID
+WinMaliDodPresentContent(_In_ ULONG GridN, _In_ ULONG SrcNZ, _In_ ULONG SrcOr,
+                         _In_ ULONG DstNZ, _In_ ULONG DstOr)
+{
+    static ULONG s_bestNZ = 0;
+
+    if (g_WinMaliDodMode == 0 || g_WinMaliRegPath.Length == 0) { return; }
+    if (SrcNZ < s_bestNZ) { return; }        /* keep the richest frame */
+    s_bestNZ = SrcNZ;
+
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodGridN",  GridN);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodSrcNZ",  SrcNZ);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodSrcOr",  SrcOr);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodDstNZ",  DstNZ);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodDstOr",  DstOr);
+    DbgPrint("[WinMali] ===== DOD CONTENT  src %lu/%lu or=0x%08lX   "
+             "dst %lu/%lu or=0x%08lX =====\n",
+             (unsigned long)SrcNZ, (unsigned long)GridN, (unsigned long)SrcOr,
+             (unsigned long)DstNZ, (unsigned long)GridN, (unsigned long)DstOr);
+}
+
+VOID
+WinMaliDodPresentProof(_In_ ULONG Count, _In_ ULONG SrcPix, _In_ ULONG DstPix)
+{
+    if (g_WinMaliDodMode == 0 || g_WinMaliRegPath.Length == 0) { return; }
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodPresentN", Count);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodSrcPix",   SrcPix);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodDstPix",   DstPix);
+    DbgPrint("[WinMali] ===== DOD PRESENT #%lu  srcPix=0x%08lX dstPix=0x%08lX %s =====\n",
+             (unsigned long)Count, (unsigned long)SrcPix, (unsigned long)DstPix,
+             (SrcPix == DstPix) ? "MATCH" : "MISMATCH");
+}
+
+VOID
+WinMaliDodDdi(_In_ ULONG Bit)
+{
+    ULONG updated;
+
+    if (g_WinMaliDodMode == 0) { return; }
+    if ((g_WinMaliDodDdiMask & Bit) != 0) { return; }   /* already recorded */
+
+    updated = (g_WinMaliDodDdiMask |= Bit);
+    if (g_WinMaliRegPath.Length != 0) {
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatDodDdiMask",
+                                             0x80000000u | updated);
+    }
+    DbgPrint("[WinMali] ===== DOD DDI bit 0x%08lX (mask now 0x%08lX) =====\n",
+             (unsigned long)Bit, (unsigned long)updated);
+
+    /* â˜…â˜…â˜…â˜…â˜… dxgk only calls StopDevice when it has GIVEN UP on the adapter.
+       That is the exact moment the ring holds the whole story, so snapshot it
+       into TraceTail now - nothing else in display-only mode ever will. */
+    if ((Bit == WINMALI_DOD_DDI_STOPDEVICE ||
+         Bit == WINMALI_DOD_DDI_STOPANDRELEASE ||
+         Bit == WINMALI_DOD_DDI_REMOVEDEVICE) &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        g_WinMaliRegPath.Length != 0) {
+        const ULONG kTraceBytes = 196608u;
+        PUCHAR      buf;
+
+        buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPoolNx, kTraceBytes, (ULONG)'gLmW');
+        if (buf != NULL) {
+            ULONG got = WinMaliSerialSnapshot(buf, kTraceBytes);
+            if (got != 0) {
+                (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"TraceTail",
+                                               buf, got);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                                              L"TraceTailBytes", got);
+                DbgPrint("[WinMali] ===== DOD: published %lu trace bytes at "
+                         "StopDevice =====\n", (unsigned long)got);
+            }
+            ExFreePoolWithTag(buf, (ULONG)'gLmW');
+        }
+    }
+}
+
+/* Parameters\UvPush - push the finished frame from the BO destroy path instead
+   of polling for it. COMPILED DEFAULT 1 (ARMED) and burned to 0 by the one-shot
+   fuse, because a knob that has to be SET is one that silently never runs on
+   this box - that already cost four graded boots. */
+ULONG g_WinMaliUvPush = 1;
+
+/* Parameters\DodMode - initialise as a DISPLAY-ONLY miniport
+   (DxgkInitializeDisplayOnlyDriver) instead of display+render (DxgkInitialize).
+   Default 0 so the shipping behaviour is unchanged unless deliberately armed;
+   fuse-burned like every other behavioural knob, so a boot that fails to start
+   the adapter comes back disarmed on its own. */
+ULONG g_WinMaliDodMode = 0;
+
+/* Parameters\DodFirstFull - see WinMaliKmd.h. Default 1: without it the panel
+   keeps whatever the previous owner left outside the dirty rects forever. */
+ULONG g_WinMaliDodFirstFull = 1;
+/* Written FLUSHED from the start path when DodMode is set. The trace ring is
+   unreadable in display-only mode (the worker publishes it and never runs), so
+   these are the only account of how far the adapter got. */
+ULONG g_WinMaliDodStage = 0;
+LONG  g_WinMaliStatDodPresent = 0;   /* successful PresentDisplayOnly calls   */
+LONG  g_WinMaliStatDodFull    = 0;   /* full-frame copies                     */
+LONG  g_WinMaliStatDodDirty   = 0;   /* dirty-rect copies                     */
+LONG  g_WinMaliStatDodNoFb    = 0;   /* ScanoutVa NULL / framebuffer too small */
+LONG  g_WinMaliStatDodBadFmt  = 0;   /* bpp != 4 or a non-positive pitch      */
+LONG  g_WinMaliStatDodExc     = 0;   /* SEH fired - MUST STAY 0               */
 ULONG g_WinMaliUvBoDedup = 1;   /* 0 = always mint a new BO (old behaviour) */
 ULONG g_WinMaliQaiDirectFlip = 0;    /* 1 = claim DXGK_DRIVERCAPS.SupportDirectFlip */
 ULONG g_WinMaliQaiMaxQueuedFlip = 0; /* N = claim MaxQueuedFlipOnVSync = N */
+/* ⛔★★★★★ Parameters\SrcModeFormat: the PIXEL FORMAT of the one source mode we
+ * publish. 0 = D3DDDIFMT_X8R8G8B8 (today), 1 = D3DDDIFMT_A8R8G8B8.
+ *
+ * MEASURED: dxgk's SetDisplayMode reports Format=22 (X8R8G8B8) while our own
+ * FlipAllocFmt reads 21 (A8R8G8B8), and every surface dwm composes is
+ * DXGI_FORMAT_B8G8R8A8_UNORM (fmt=87 in the UMD log). DirectFlip requires the
+ * flip source to match the display mode; a mismatch is refused and falls back.
+ *
+ * ⚠ This is the LAST candidate on the list and it is NOT a strong one - a BGRX
+ * primary with BGRA back buffers is the normal arrangement on real hardware and
+ * flips fine there. It is a knob rather than an edit precisely so a negative
+ * costs no rebuild, and so it can be put back in one write. */
+ULONG g_WinMaliSrcModeFormat = 0;
+
+/* Parameters\TgtWireFmt -- D3DKMDT_VIDPN_TARGET_MODE has three writable regions
+ * past Id and we have only ever filled one. bit0 declares Rgb 8 bits per
+ * component in the wire-format union; bit1 also writes MinimumVSyncFreq.
+ * 0 reproduces today's bytes exactly. */
+ULONG g_WinMaliTgtWireFmt = 0;
+
+/* Parameters\PathXform -- 0 = Identity only (today). 1 = also advertise
+ * Centered / Stretched / AspectRatioCenteredMax, which is what the persisted
+ * CCD configuration for this monitor set actually asks for. Source and target
+ * are the SAME size here, so every one of those scalings IS the identity
+ * transform; this widens what we ACCEPT, not what we must implement. */
+ULONG g_WinMaliPathXform = 0;
+/* Parameters\MonModeAdd - add a driver-origin D3DKMDT_MONITOR_SOURCE_MODE from
+   RecommendMonitorModes. Default 0: the census in that DDI has to come back
+   first, because WMI already shows the set holding exactly our 2944x1840 mode. */
+ULONG g_WinMaliMonModeAdd = 0;
+
+/* â˜…â˜…â˜…â˜…â˜… THE KNOWN-GOOD DISPLAY CONFIGURATION - ONE DEFINITION EACH.
+ * Used BOTH as the ReadParamsDword default AND as the value the one-shot fuse
+ * burns back to. Never write either as a bare literal: a read default and a burn
+ * value that drift apart is the defect this block exists to prevent.
+ *
+ * This is display-only over the MediaTek MT6897 display controller with real
+ * dual-pipe OVL page-flips - measured 12032 presents / 12032 flips / 0 rejects,
+ * and confirmed by eye. Render mode (DodMode=0) is NOT the safe fallback: its
+ * VidPn source is switched off ~1.6 s into every boot and never comes back. */
+#define WINMALI_DEF_COMPUTEONLY   0u   /* display DDIs must be wired          */
+#define WINMALI_DEF_DODMODE       1u   /* display-only miniport               */
+#define WINMALI_DEF_OVLFLIP       2u   /* dual-pipe double-buffered OVL flips */
+#define WINMALI_DEF_MONMODEADD    1u
+#define WINMALI_DEF_PATHXFORM     5u   /* bit0 scaling modes + bit2 split gate */
+#define WINMALI_DEF_UVPUSH        0u
+#define WINMALI_DEF_PRESENTHZ     0u   /* DOD is driven by PresentDisplayOnly  */
+#define WINMALI_DEF_CHILDCFG      7u   /* VOT_DISPLAYPORT_EMBEDDED             */
+#define WINMALI_DEF_VIDPNSOURCES  1u
+/*
+ * Parameters\HotReplugMs - ms after StartDevice at which to indicate a monitor
+ * DISCONNECT and then, 200 ms later, a RECONNECT. 0 = off.
+ *
+ * WHY: MEASURED - the OS enables the plane at 0.195 s, sets 2944x1840 at 0.206 s,
+ * then at 1.647 s turns the source off and the plane off and NEVER TOUCHES THE
+ * DISPLAY AGAIN in 313,418 trace events. No error, no failing DDI, and it never
+ * builds another apply VidPn. The driver is innocent on every channel we can
+ * measure: 155/155 IsSupportedVidPn approvals, zero failure sites, failing
+ * modality rounds byte-identical to the healthy one, timings matching the monitor
+ * mode set exactly.
+ *
+ * Indicating a hot re-plug is the documented way to tell the OS "throw the
+ * current configuration away and derive a new one" - the driver-side equivalent
+ * of unplugging and replugging the panel, which is the standard fix for a stuck
+ * display configuration. Doing it AFTER the shell is up means the OS rebuilds at
+ * a moment when DWM already exists, unlike the boot-time derivation.
+ *
+ * ⛔ dxgk only honours a connection change on a child whose HpdAwareness is
+ * INTERRUPTIBLE. We ship AlwaysConnected, so HpdMode=1 must be set with it or
+ * the indication is legally ignored and the run measures nothing.
+ */
+ULONG g_WinMaliHotReplugMs = 0;
+/* Parameters\HpdMode - 1 = force HpdAwarenessInterruptible on the child,
+   independent of which ChildCfg variant is selected. */
+ULONG g_WinMaliHpdMode = 0;
+/* See the extern block in WinMaliKmd.h. FIRST occurrence only: the LAST value is a
+   known trap here - teardown always ends with Visible=FALSE, so a healthy run also
+   reports an OFF at StopDevice. */
+LONG  g_WinMaliVisOnPid  = 0;
+LONG  g_WinMaliVisOffPid = 0;
+UCHAR g_WinMaliVisOnName[16]  = {0};
+UCHAR g_WinMaliVisOffName[16] = {0};
+
+/* Parameters\VpLogVsync -- vsync arm/disarm consumed ~280 of the 506 VpLog
+ * entries this boot, against a 512 cap, so the ring filled at t=43 s and every
+ * later event was silently dropped. Off by default; the vsync question is
+ * answered and the ring is needed for the mode-set window. */
+ULONG g_WinMaliVpLogVsync = 0;
+
+/* Parameters\KnobFuse (default 1) -- see the fuse block in DriverEntry. Set 0
+ * only when you want a lever to persist across several boots deliberately. */
+ULONG g_WinMaliKnobFuse = 1;
+
+/* Parameters\WorkerVisGate (default 1) -- the present worker must not blit
+ * until the OS has made our source VISIBLE. See WinMaliPresentWorker_. */
+ULONG g_WinMaliWorkerVisGate = 1;
 
 /* --- DxgkDdiQueryInterface forensics -------------------------------------
  * When ComputeOnly=0, dxgk queries a run of display interfaces and then fails
@@ -265,6 +632,49 @@ ULONG g_WinMaliVidPnSources = 0;
    2 = HybridIntegrated. See the long comment at the assignment in WinMaliQai.c.
    Default 0 preserves the behaviour every earlier build had. */
 ULONG g_WinMaliHybridRole = 0;
+
+/* Which MT6897 OVL blocks the read-only display probe may touch (bit0=OVL0 ...
+   bit3=OVL3, bit4..7 = the pipe-1 OVLs). DEFAULT 1 = OVL0 ONLY: it is the
+   overlay scanning the panel, so it is provably powered, while the others may
+   be clock-gated - and reading a gated MTK block hangs the bus with no fault. */
+ULONG g_WinMaliOvlProbeMask = 1;
+
+/* 0 = never touch a display register (DEFAULT). 1 = write back the address the
+   overlay already holds (a no-op flip, proves we can write it safely).
+   2 = real double-buffered flip. Fuse-burned like every other lever here, so a
+   bad value costs one boot and the next one comes up with it off. */
+ULONG g_WinMaliOvlFlip = 0;
+/* OVL0 registers, mapped once at StartDevice and kept for the life of the
+   adapter. Mapping per flip would be both slow and illegal at raised IRQL. */
+PVOID g_WinMaliOvlRegsVa = NULL;
+/* Which carveout frame the overlay is currently scanning, and the back buffer
+   VA we compose into when OvlFlip=2. */
+LONG64 g_WinMaliOvlFrontPa = 0;
+PVOID  g_WinMaliOvlBackVa  = NULL;
+LONG64 g_WinMaliOvlBackPa  = 0;
+LONG   g_WinMaliStatOvlFlipN   = 0;
+LONG   g_WinMaliStatOvlFlipRej = 0;
+LONG   g_WinMaliStatOvlFlipBack = 0;
+PVOID  g_WinMaliOvl4RegsVa      = NULL;   /* disp1-ovl0, the right half */
+LONG   g_WinMaliStatOvlFlip2N   = 0;
+LONG   g_WinMaliStatOvlFlip2Rej = 0;
+LONG   g_WinMaliStatOvlFlipRight = 0;     /* readback of the RIGHT overlay */
+/* 0 = off. 1 = probe DSI0. 3 = probe DSI0 and DSI1 (dual-pipe). Read-only. */
+ULONG  g_WinMaliDsiProbe = 0;
+
+/* Override for DXGK_DRIVERCAPS.WDDMVersion. 0 = report the compiled default
+   (WDDMv2 in display-only, WDDMv3_2 in render). Any other value is reported
+   verbatim. Exists because dxgkrnl branches on >= DXGKDDI_WDDMv2_3 (0x2300):
+   below it a lost VidPn source is PAUSED and restored, at/above it the source
+   is torn down and never comes back. See apply145.ps1. */
+ULONG g_WinMaliQaiWddmVer = 0;
+
+/* Milliseconds after adapter start at which to assert
+   DxgkCbIndicateChildStatus(StatusConnection, Connected=TRUE). 0 = never (the
+   compiled behaviour). Exists because dxgk zeroes our display plane when an
+   internal lookup returns STATUS_GRAPHICS_MONITOR_NOT_CONNECTED, and the byte
+   that lookup tests is set by exactly this callback. */
+ULONG g_WinMaliIndicateConnMs = 0;
 
 /* Child-descriptor variant selector for the QueryChildRelations matrix. See the
    switch in WinMaliKmdQueryChildRelations. 0 = baseline. */
@@ -323,15 +733,35 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowDwm", 1, &g_WinMaliAllowDwm);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"BringupStage", 2, &g_WinMaliBringupStage);
-    (VOID)WinMaliReadParamsDword(RegistryPath, L"ComputeOnly", 1, &g_WinMaliComputeOnly);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"ComputeOnly",
+                                 WINMALI_DEF_COMPUTEONLY, &g_WinMaliComputeOnly);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FeatureIface", 1, &g_WinMaliFeatureIface);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"HybridRole", 0, &g_WinMaliHybridRole);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"OvlProbeMask", 1,
+                                 &g_WinMaliOvlProbeMask);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"OvlFlip",
+                                 WINMALI_DEF_OVLFLIP, &g_WinMaliOvlFlip);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"DsiProbe", 0, &g_WinMaliDsiProbe);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiWddmVer", 0, &g_WinMaliQaiWddmVer);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"IndicateConnMs", 0,
+                                 &g_WinMaliIndicateConnMs);
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffIndicateConn",
+                                  0x80000000u | (g_WinMaliIndicateConnMs & 0xFFFFu));
+    /* Published with the usual 0x8000 sentinel so "ran as 0" and "never read"
+       are distinguishable. The value itself is 16-bit, so publish it whole. */
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffQaiWddmVer",
+                                  0x80000000u | (g_WinMaliQaiWddmVer & 0xFFFFu));
+    /* Same 0x8000 sentinel rule as every other knob: "ran as 0" and "never read"
+       must not be the same observation. */
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffOvlFlip",
+                                  0x8000u | (g_WinMaliOvlFlip & 0xFFu));
     (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowHandleDataCb", 0,
                                  &g_WinMaliAllowHandleDataCb);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"SegmentShape", 1,
                                  &g_WinMaliSegmentShape);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"TraceSubmit", 0, &g_WinMaliTraceSubmit);
-    (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTimerHz", 30,
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTimerHz",
+                                 WINMALI_DEF_PRESENTHZ,
                                  &g_WinMaliPresentTimerHz);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FailOnGpuFault", 0,
                                  &g_WinMaliFailOnGpuFault);
@@ -340,27 +770,199 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentSettleMs",
                                  WINMALI_PRESENT_SETTLE_MS,
                                  &g_WinMaliPresentSettleMs);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTickMs", 33,
+                                 &g_WinMaliPresentTickMs);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"ShaderPwrOn", 0,
+                                 &g_WinMaliShaderPwrOn);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiMpoCaps", 0,
+                                 &g_WinMaliQaiMpoCaps);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiMpoWire", 0,
+                                 &g_WinMaliQaiMpoWire);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiFlipCaps", 0,
                                  &g_WinMaliQaiFlipCaps);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"UvSrcInvalidate", 1,
                                  &g_WinMaliUvSrcInvalidate);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"UvPush",
+                                 WINMALI_DEF_UVPUSH, &g_WinMaliUvPush);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"DodMode",
+                                 WINMALI_DEF_DODMODE, &g_WinMaliDodMode);
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffDodMode",
+                                  0x8000u | (g_WinMaliDodMode & 0xFFu));
+    /* Confirmation only. The VOID GATE is StatFuseArmed bits 16-23: it already
+       has a slot on this key and is written FLUSHED, so it survives the power
+       cycle a wedge would force. EffUvPush is a brand-new name on a key far past
+       its value cap and may silently fail to appear. */
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffUvPush",
+                                  0x8000u | (g_WinMaliUvPush & 0xFFu));
     (VOID)WinMaliReadParamsDword(RegistryPath, L"UvBoDedup", 1,
                                  &g_WinMaliUvBoDedup);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiDirectFlip", 0,
                                  &g_WinMaliQaiDirectFlip);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiMaxQueuedFlip", 0,
                                  &g_WinMaliQaiMaxQueuedFlip);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"SrcModeFormat", 0,
+                                 &g_WinMaliSrcModeFormat);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"TgtWireFmt", 0,
+                                 &g_WinMaliTgtWireFmt);
+    /* THE ONE-SHOT FUSE WAS A ONE-WAY TRAP AND IT COST FOUR BOOTS.
+     *
+     * MEASURED 2026-08-23: StatFuseArmed=0 on four consecutive boots even though
+     * the compiled default here was 5 and the registry value had been DELETED.
+     * Cause: the fuse below writes PathXform=0 with WinMaliWriteParamsDwordFlushed
+     * - a COMMITTED write - and a committed registry value beats a compiled
+     * default forever after. The delete, by contrast, was lazily flushed, and this
+     * box loses lazy writes across its unclean power cycles. So the burn is
+     * durable and the undo of the burn is not: the knob could never be re-armed
+     * from the binary again, and four "PathXform changed nothing" results were
+     * really "PathXform never ran".
+     *
+     * THE RULE THIS ESTABLISHES: on this box a knob name that has EVER been
+     * burned is dead. Re-arming from a compiled default needs a name that has
+     * never existed. Hence PathXform2.
+     *
+     * The one-shot safety property is deliberately KEPT: the fuse still burns
+     * this value to 0 (flushed) so a boot that hangs comes back with the lever
+     * off and reaches a desktop unaided. */
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"PathXform2",
+                                 WINMALI_DEF_PATHXFORM, &g_WinMaliPathXform);
+    /* Published BEFORE the fuse burns it, with a 0x8000 sentinel so that "ran as
+       0" and "never read" stop being the same observation. StatFuseArmed=0 is
+       ambiguous - it also means the fuse was disabled. This is not. */
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffPathXform",
+                                  0x8000u | (g_WinMaliPathXform & 0xFFu));
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"MonModeAdd",
+                                 WINMALI_DEF_MONMODEADD, &g_WinMaliMonModeAdd);
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffMonModeAdd",
+                                  0x8000u | (g_WinMaliMonModeAdd & 0xFFu));
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"HotReplugMs", 0,
+                                 &g_WinMaliHotReplugMs);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"HpdMode", 0,
+                                 &g_WinMaliHpdMode);
+    /* Same 0x8000 sentinel rule as EffPathXform: "ran as 0" and "never read" must
+       not be the same observation. HotReplugMs is published in units of 100 ms so
+       it still fits the low byte. */
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffHotReplug",
+                                  0x8000u | ((g_WinMaliHotReplugMs / 100u) & 0xFFu));
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffHpdMode",
+                                  0x8000u | (g_WinMaliHpdMode & 0xFFu));
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"KnobFuse", 1,
+                                 &g_WinMaliKnobFuse);
+    /* Marker string so the PACKAGED binary can be proved to contain this change.
+       â›” Never verify a deploy by hash - signing changes it. Grep for a string. */
+    DbgPrint("[WinMali]    BAKED DEFAULTS v4 MPOFUSED: dod=%u ovl=%u xform=%u mon=%u "
+             "uv=%u hz=%u cfg=%u src=%u\n",
+             (unsigned)WINMALI_DEF_DODMODE, (unsigned)WINMALI_DEF_OVLFLIP,
+             (unsigned)WINMALI_DEF_PATHXFORM, (unsigned)WINMALI_DEF_MONMODEADD,
+             (unsigned)WINMALI_DEF_UVPUSH, (unsigned)WINMALI_DEF_PRESENTHZ,
+             (unsigned)WINMALI_DEF_CHILDCFG, (unsigned)WINMALI_DEF_VIDPNSOURCES);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"WorkerVisGate", 1,
+                                 &g_WinMaliWorkerVisGate);
+
+    /* ---- THE ONE-SHOT FUSE ----------------------------------------------
+     * An experimental lever now survives exactly ONE boot. We have just read
+     * the value, so zero it back out and COMMIT that write before we can hang.
+     * If this boot dies, the next one comes up with the lever off and reaches a
+     * desktop by itself - no spare-install recovery, no offline hive edit.
+     *
+     * WARNING: DURABILITY MUST FOLLOW THE DIRECTION OF SAFETY. We flush the
+     * DISARM and never the arm. Lazy flushing is an accidental safety net for
+     * the arming direction and must not be "fixed"; here we are writing the
+     * SAFE value, which is exactly the one that has to survive a freeze. */
+    if (g_WinMaliKnobFuse != 0) {
+        /* â›” BURN TO THE COMPILED DEFAULT, NEVER TO A BARE 0. Writing 0 here is
+           what made the next boot come up in the BROKEN render path, and what
+           kept PathXform2 permanently off despite a compiled default of 5. */
+        if (g_WinMaliPathXform != WINMALI_DEF_PATHXFORM) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"PathXform2",
+                                                 WINMALI_DEF_PATHXFORM);
+        }
+        if (g_WinMaliMonModeAdd != WINMALI_DEF_MONMODEADD) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"MonModeAdd",
+                                                 WINMALI_DEF_MONMODEADD);
+        }
+        /* A re-plug that wedges the display must not repeat on the next boot. */
+        if (g_WinMaliHotReplugMs != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"HotReplugMs", 0);
+        }
+        if (g_WinMaliHpdMode != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"HpdMode", 0);
+        }
+        if (g_WinMaliTgtWireFmt != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"TgtWireFmt", 0);
+        }
+        /* Count the burns so a silently-cleared knob is distinguishable from
+           one that was never set - those look identical in the registry. */
+        if (g_WinMaliUvPush != WINMALI_DEF_UVPUSH) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"UvPush",
+                                                 WINMALI_DEF_UVPUSH);
+        }
+        /* ⛔ A display-only start that fails leaves the box on BasicDisplay with
+           no accelerated adapter. RETRACTED 2026-08-25: this used to burn
+           DodMode to 0 so that "the NEXT boot is the known good display+render
+           path". RENDER IS NOT THE KNOWN GOOD PATH - its VidPn source is switched
+           off ~1.6 s into every boot and never returns, which is the frozen
+           desktop the user has been living with. Display-only IS the known good
+           path, so the burn now goes to WINMALI_DEF_DODMODE and a boot that dies
+           still recovers by itself, to a configuration that reaches a desktop. */
+        if (g_WinMaliDodMode != WINMALI_DEF_DODMODE) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"DodMode",
+                                                 WINMALI_DEF_DODMODE);
+        }
+        /* ⛔★★★ OvlFlip MUST BURN TOO. 1.1.14.1 shipped a comment claiming it was
+         * "fuse-burned like every other lever" while this block did not touch it,
+         * so a committed OvlFlip=1 would have survived every subsequent boot -
+         * precisely the stale-knob trap the fuse exists to prevent, and the same
+         * shape as the PathXform burn that once cost four boots.
+         * ★ A COMMENT ASSERTING A SAFETY PROPERTY IS NOT THAT PROPERTY. */
+        if (g_WinMaliOvlFlip != WINMALI_DEF_OVLFLIP) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"OvlFlip",
+                                                 WINMALI_DEF_OVLFLIP);
+        }
+        /* ⛔ A wrong WDDM version can stop the adapter dead. Burn it so a bad
+           value costs exactly ONE boot and the next one comes up compiled. */
+        if (g_WinMaliQaiWddmVer != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"QaiWddmVer", 0);
+        }
+        /* Claiming the MPO cap KILLS adapter start unless SupportDirectFlip is also
+           claimed (dxgkrnl DXGADAPTER::Initialize gate at 0x1400EA2C8 returns
+           STATUS_INVALID_PARAMETER). A dead adapter cannot re-arm anything, so
+           without these burns a single bad MPO boot leaves the machine with NO GPU
+           driver on every boot afterwards - which is exactly what happened twice on
+           2026-08-25. Their compiled default is 0, so burning to 0 IS burning to the
+           default. Read at :777/:779/:799, i.e. before this block. */
+        if (g_WinMaliQaiMpoCaps != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"QaiMpoCaps", 0);
+        }
+        if (g_WinMaliQaiMpoWire != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"QaiMpoWire", 0);
+        }
+        if (g_WinMaliQaiDirectFlip != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"QaiDirectFlip", 0);
+        }
+        if (g_WinMaliIndicateConnMs != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"IndicateConnMs", 0);
+        }
+        (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatFuseArmed",
+            (g_WinMaliPathXform & 0xFFu) | ((g_WinMaliTgtWireFmt & 0xFFu) << 8)
+          | ((g_WinMaliUvPush & 0xFFu) << 16) | ((g_WinMaliOvlFlip & 0xFFu) << 24));
+    }
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"VpLogVsync", 0,
+                                 &g_WinMaliVpLogVsync);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentMarker", 0, &g_WinMaliPresentMarker);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentTestPattern", 0,
                                  &g_WinMaliPresentTestPattern);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FlipSrcFromVidMm", 0,
                                  &g_WinMaliFlipSrcFromVidMm);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"FlipSrcPreferAperture", 0,
+                                 &g_WinMaliFlipSrcPreferAperture);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"FlipSrcFromAperture", 0,
                                  &g_WinMaliFlipSrcFromAperture);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"PresentCopyBudgetKB", 0,
                                  &g_WinMaliPresentCopyBudgetKB);
-    (VOID)WinMaliReadParamsDword(RegistryPath, L"ChildCfg", 0, &g_WinMaliChildCfg);
-    (VOID)WinMaliReadParamsDword(RegistryPath, L"VidPnSources", 0, &g_WinMaliVidPnSources);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"ChildCfg",
+                                 WINMALI_DEF_CHILDCFG, &g_WinMaliChildCfg);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"VidPnSources",
+                                 WINMALI_DEF_VIDPNSOURCES, &g_WinMaliVidPnSources);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"ChildCount", (ULONG)-1, &g_WinMaliChildCount);
     if (g_WinMaliChildCount == (ULONG)-1) {
         g_WinMaliChildCount = g_WinMaliVidPnSources;
@@ -429,21 +1031,38 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
             delta = -delta;
         }
 
-        if (g_WinMaliComputeOnly != 0) {
-            /* Disarmed. Clear any stale stamp so the NEXT arm starts clean --
+        if (g_WinMaliComputeOnly != 0 || g_WinMaliDodMode != 0) {
+            /* Disarmed. DodMode != 0 counts as disarmed: display-only is the
+               COMPILED DEFAULT and the shipping configuration, so a DOD boot is
+               not an armed experiment. Without this test the guard reads every
+               healthy reboot as a crashed render test and, on the third one,
+               commits ComputeOnly=1 and refuses to load for good.
+               Clear any stale stamp so the NEXT arm starts clean --
                otherwise an arm in a later boot would inherit an old stamp and
                disarm itself immediately. */
             if (armedStamp != 0) {
                 (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampLo", 0);
                 (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampHi", 0);
             }
+            /* A boot that reached here is healthy, so the escalation ladder must
+               go back to the bottom. ArmDisarmCount had NO reset anywhere in the
+               tree: once nonzero it stayed nonzero, and the next armed run would
+               skip safe mode and full-disarm on its first stale stamp. */
+            {
+                ULONG disarmsOk = 0;
+                (VOID)WinMaliReadParamsDword(RegistryPath, L"ArmDisarmCount", 0,
+                                             &disarmsOk);
+                if (disarmsOk != 0) {
+                    (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmDisarmCount", 0);
+                }
+            }
         } else if (persistent != 0) {
             DbgPrint("[WinMali]    ARM: display path armed and ArmPersistent=1 -- boot guard OFF\n");
         } else if (armedStamp == 0) {
             /* First load of a freshly armed config: record which boot owns it. */
-            (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampLo",
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"ArmBootStampLo",
                                           (ULONG)(bootStamp & 0xFFFFFFFFull));
-            (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampHi",
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"ArmBootStampHi",
                                           (ULONG)(bootStamp >> 32));
             DbgPrint("[WinMali]    ARM: display path armed for THIS boot (stamp %I64u)\n",
                      bootStamp);
@@ -479,9 +1098,9 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                 /* Re-stamp for THIS boot: the armed config now belongs to us, so
                    a reload inside this same boot honours it instead of stepping
                    down again. */
-                (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampLo",
+                (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"ArmBootStampLo",
                                               (ULONG)(bootStamp & 0xFFFFFFFFull));
-                (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampHi",
+                (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"ArmBootStampHi",
                                               (ULONG)(bootStamp >> 32));
             } else {
                 DbgPrint("[WinMali] ** ARM: armed config is from a PREVIOUS BOOT "
@@ -507,7 +1126,10 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                 g_WinMaliComputeOnly  = 1;
                 g_WinMaliChildCfg     = 0;
                 (VOID)WinMaliWriteParamsDword(RegistryPath, L"ComputeOnly",  1);
-                (VOID)WinMaliWriteParamsDword(RegistryPath, L"ChildCfg",     0);
+                /* ChildCfg deliberately NOT persisted: it has no fuse burn, so a
+                   committed 0 survives a manual ComputeOnly recovery and leaves a
+                   child variant that was never validated for display-only armed
+                   on every subsequent boot. The in-memory value above is enough. */
                 /* VidPnSources / ChildCount deliberately LEFT ALONE - see above. */
                 (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampLo", 0);
                 (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmBootStampHi", 0);
@@ -515,7 +1137,8 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
             /* Publish it: "the test didn't crash" must be a measurement, not an
                assumption. A nonzero ArmDisarmCount means a previous armed run
                died before its restore step. */
-            (VOID)WinMaliWriteParamsDword(RegistryPath, L"ArmDisarmCount", disarms + 1);
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"ArmDisarmCount",
+                                                 disarms + 1);
         } else {
             DbgPrint("[WinMali]    ARM: armed config belongs to THIS boot "
                      "(delta %I64d ms) -- honouring it\n", (LONGLONG)(delta / 10000));
@@ -549,6 +1172,19 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
         (VOID)WinMaliWriteParamsDword(RegistryPath, L"QueryInterfaceCount", 0);
         (VOID)WinMaliWriteParamsDword(RegistryPath, L"FeatureIfaceAccepted", 0);
+        /* ⛔★★★★★ ZERO QueryCapsOutSz HERE, IN DriverEntry.
+         * Its only writer was WinMaliPresentWorker_, which cannot run on a boot
+         * where StartDevice never completes - so on every failed start it
+         * reported the PREVIOUS boot's value. Two comments in this tree read
+         * "QueryCapsOutSz==0 => dxgk never queried DRIVERCAPS" off exactly that
+         * stale number. Zeroed here and republished from the DDI itself, it
+         * finally testifies: nonzero afterwards == queried in THIS boot.
+         * EffectiveQaiMpo: bit0 = DDI slots wired, bit1 = cap claimed. Without
+         * it a boot cannot prove the knob was even read. */
+        (VOID)WinMaliWriteParamsDword(RegistryPath, L"QueryCapsOutSz", 0);
+        (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffectiveQaiMpo",
+                                      (g_WinMaliQaiMpoWire != 0 ? 1u : 0u) |
+                                      (g_WinMaliQaiMpoCaps != 0 ? 2u : 0u));
         (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffectiveFeatureIface",
                                       g_WinMaliFeatureIface);
         (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffectiveComputeOnly",
@@ -625,6 +1261,131 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                  g_WinMaliComputeOnly);
     }
     (VOID)WinMaliWriteParamsDword(RegistryPath, L"StatRefusedRenderOnly", 0);
+
+    /* ==================================================================
+     * DISPLAY-ONLY START (Parameters\DodMode=1).
+     *
+     * ⛔ THIS RETURNS. Everything below is the display+RENDER path and must not
+     * also run - DxgkInitialize and DxgkInitializeDisplayOnlyDriver are
+     * alternatives, not a sequence.
+     *
+     * WHY THIS SHAPE: there is no display engine on this part. The panel is
+     * scanned by firmware from a fixed framebuffer and pixels move only by CPU
+     * copy. Presenting ourselves as display+render makes dwm build a flip chain
+     * that can never complete, which is why it releases our VidPn source at
+     * 1.647 s and why dxgk never submits a real flip. A display-only miniport is
+     * the SUPPORTED Windows shape for firmware-owned scanout - it is what
+     * BasicDisplay is - and DxgkDdiPresentDisplayOnly hands us the composed
+     * desktop as a CPU pointer, which is exactly what our copy consumes.
+     *
+     * Every function below already existed and is already debugged; only
+     * PresentDisplayOnly is new.
+     * ================================================================== */
+    if (g_WinMaliDodMode != 0) {
+        KMDDOD_INITIALIZATION_DATA dod;
+        NTSTATUS dodStatus;
+
+        RtlZeroMemory(&dod, sizeof(dod));
+        {
+            /* See the block comment: dod.Version is what dxgk reads BEFORE
+               StartDevice to decide which interfaces to demand. KMDDOD has no
+               version block above WDDM2_0, so sizeof(dod) is unchanged. */
+            ULONG initVer = 0;
+            (VOID)WinMaliReadParamsDword(RegistryPath, L"DodInitVersion", 0, &initVer);
+            if (initVer == 0) { initVer = DXGKDDI_INTERFACE_VERSION_WDDM2_0; }
+            dod.Version = initVer;
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatDodInitVer", initVer);
+            DbgPrint("[WinMali]    DISPLAY-ONLY: dod.Version = 0x%08X "
+                     "(WDK default would be 0x%08X)\n",
+                     (unsigned)initVer, (unsigned)DXGKDDI_INTERFACE_VERSION);
+        }
+
+        dod.DxgkDdiAddDevice                = WinMaliKmdAddDevice;
+        dod.DxgkDdiStartDevice              = WinMaliKmdStartDevice;
+        dod.DxgkDdiStopDevice               = WinMaliKmdStopDevice;
+        dod.DxgkDdiRemoveDevice             = WinMaliKmdRemoveDevice;
+        dod.DxgkDdiDispatchIoRequest        = WinMaliKmdDispatchIoRequest;
+        dod.DxgkDdiInterruptRoutine         = WinMaliKmdInterruptRoutine;
+        dod.DxgkDdiDpcRoutine               = WinMaliKmdDpcRoutine;
+        dod.DxgkDdiQueryChildRelations      = WinMaliKmdQueryChildRelations;
+        dod.DxgkDdiQueryChildStatus         = WinMaliKmdQueryChildStatus;
+        dod.DxgkDdiQueryDeviceDescriptor    = WinMaliKmdQueryDeviceDescriptor;
+        dod.DxgkDdiSetPowerState            = WinMaliKmdSetPowerState;
+        dod.DxgkDdiNotifyAcpiEvent          = WinMaliKmdNotifyAcpiEvent;
+        dod.DxgkDdiResetDevice              = WinMaliKmdResetDevice;
+        dod.DxgkDdiUnload                   = WinMaliKmdDxgkUnload;
+        dod.DxgkDdiQueryInterface           = WinMaliKmdQueryInterface;
+        dod.DxgkDdiControlEtwLogging        = WinMaliKmdControlEtwLogging;
+        dod.DxgkDdiQueryAdapterInfo         = WinMaliKmdQueryAdapterInfo;
+        dod.DxgkDdiSetPalette               = NULL;      /* 32bpp only, no LUT */
+        dod.DxgkDdiSetPointerPosition       = WinMaliKmdSetPointerPosition;
+        dod.DxgkDdiSetPointerShape          = WinMaliKmdSetPointerShape;
+        dod.DxgkDdiEscape                   = WinMaliKmdEscape;
+        dod.DxgkDdiCollectDbgInfo           = WinMaliKmdCollectDbgInfo;
+        dod.DxgkDdiIsSupportedVidPn         = WinMaliKmdIsSupportedVidPn;
+        dod.DxgkDdiRecommendFunctionalVidPn = WinMaliKmdRecommendFunctionalVidPn;
+        dod.DxgkDdiEnumVidPnCofuncModality  = WinMaliKmdEnumVidPnCofuncModality;
+        dod.DxgkDdiSetVidPnSourceVisibility = WinMaliKmdSetVidPnSourceVisibility;
+        dod.DxgkDdiCommitVidPn              = WinMaliKmdCommitVidPn;
+        dod.DxgkDdiUpdateActiveVidPnPresentPath = WinMaliKmdUpdateActiveVidPnPresentPath;
+        dod.DxgkDdiRecommendMonitorModes    = WinMaliKmdRecommendMonitorModes;
+        dod.DxgkDdiGetScanLine              = WinMaliKmdGetScanLine;
+        dod.DxgkDdiQueryVidPnHWCapability   = WinMaliKmdQueryVidPnHWCapability;
+
+        /* THE ONE NEW DDI - the composed desktop, as a CPU pointer. */
+        dod.DxgkDdiPresentDisplayOnly       = WinMaliKmdPresentDisplayOnly;
+
+        dod.DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
+            WinMaliKmdStopDeviceAndReleasePostDisplayOwnership;
+        dod.DxgkDdiSystemDisplayEnable      = WinMaliKmdSystemDisplayEnable;
+        dod.DxgkDdiSystemDisplayWrite       = WinMaliKmdSystemDisplayWrite;
+        dod.DxgkDdiGetChildContainerId      = WinMaliKmdGetChildContainerId;
+        dod.DxgkDdiControlInterrupt         = WinMaliKmdControlInterrupt;
+
+        /* ⛔ TAG THE LOAD. DriverEntry runs MORE THAN ONCE per boot: when the DOD
+           start fails, the fuse has already burned DodMode, PnP retries, and the
+           retry comes up render and OVERWRITES every value. Without a load
+           counter the failing load leaves no trace at all - which is exactly
+           what happened on 1.1.12.0. */
+        {
+            ULONG loadN = 0;
+            (VOID)WinMaliReadParamsDword(RegistryPath, L"StatLoadCount", 0, &loadN);
+            loadN++;
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatLoadCount", loadN);
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatDodLoadN", loadN);
+            DbgPrint("[WinMali] ===== DISPLAY-ONLY START (load #%lu) =====\n",
+                     (unsigned long)loadN);
+        }
+        DbgPrint("[WinMali]    DISPLAY-ONLY: calling "
+                 "DxgkInitializeDisplayOnlyDriver (Version=0x%08x sizeof=%lu)\n",
+                 (unsigned)dod.Version, (unsigned long)sizeof(dod));
+        dodStatus = DxgkInitializeDisplayOnlyDriver(DriverObject, RegistryPath, &dod);
+        DbgPrint("[WinMali] ===== DxgkInitializeDisplayOnlyDriver -> 0x%08X =====\n",
+                 (unsigned)dodStatus);
+        /* ⛔ 0x8000 SENTINEL: a value that was merely CLEARED reads 0 and would
+           otherwise be indistinguishable from STATUS_SUCCESS. Never again. */
+        (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatDodInit",
+                                             0x80000000u | ((ULONG)dodStatus & 0xFFFFu));
+        if (!NT_SUCCESS(dodStatus)) {
+            DbgPrint("[WinMali] << DriverEntry DOD init FAILED 0x%08X\n",
+                     (unsigned)dodStatus);
+        }
+        return dodStatus;
+    }
+
+    /* Tag this load too. If the DOD start fails and PnP retries, the retry lands
+       HERE with DodMode already burned to 0 - and StatRenderLoadN vs StatDodLoadN
+       then says plainly which load did what, instead of leaving me to infer it
+       from a trace ring that survives reboots and mixes boots together. */
+    {
+        ULONG loadN = 0;
+        (VOID)WinMaliReadParamsDword(RegistryPath, L"StatLoadCount", 0, &loadN);
+        loadN++;
+        (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatLoadCount", loadN);
+        (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"StatRenderLoadN", loadN);
+        DbgPrint("[WinMali] ===== RENDER START (load #%lu) =====\n",
+                 (unsigned long)loadN);
+    }
 
     WinMaliDxgkPatchInitializationData(&init);
 
@@ -728,6 +1489,195 @@ WinMaliKmdAddDevice(
     return STATUS_SUCCESS;
 }
 
+/* MT6897 display-overlay register probe - READ ONLY. Provenance of every
+   constant is in the apply140.ps1 header comment. */
+#define WINMALI_OVL_COUNT      8u
+#define WINMALI_OVL_REGS_PER   8u
+static const ULONG g_WinMaliOvlBase[WINMALI_OVL_COUNT] = {
+    0x14402000u, 0x14403000u, 0x14404000u, 0x14405000u,   /* disp-ovl0..3  */
+    0x14602000u, 0x14603000u, 0x14604000u, 0x14605000u    /* disp1-ovl0..3 */
+};
+/* Offsets quoted from mediatek_v2/mtk_disp_ovl.c - do NOT substitute guesses. */
+static const ULONG g_WinMaliOvlOff[WINMALI_OVL_REGS_PER] = {
+    0x000u,  /* DISP_REG_OVL_STA          :65  */
+    0x008u,  /* DISP_REG_OVL_INTSTA       :83  */
+    0x020u,  /* DISP_REG_OVL_ROI_SIZE     :92  */
+    0x02Cu,  /* DISP_REG_OVL_SRC_CON      :110 */
+    0x038u,  /* DISP_REG_OVL_L0_SRC_SIZE  :294 */
+    0x03Cu,  /* DISP_REG_OVL_L0_OFFSET    :293 */
+    0xF40u,  /* L0 ADDR     = data->addr + 0x20*0   :263 */
+    0xF4Cu   /* L0 ADDR MSB = 0x0f4c     + 0x20*0   :278 */
+};
+
+static VOID
+WinMaliOvlProbe_(VOID)
+{
+    ULONG regs[WINMALI_OVL_COUNT * WINMALI_OVL_REGS_PER];
+    ULONG i, r;
+    ULONG match = 0;
+
+    if (g_WinMaliOvlProbeMask == 0 || g_WinMaliRegPath.Length == 0) {
+        return;
+    }
+    /* ⛔ NOT 0xFFFFFFFF. WinMaliHw.c:81-92 already establishes that an all-ones
+       read on this SoC means "the block is still power/clock gated" - so using
+       0xFFFFFFFF as the not-probed filler would make a GATED overlay
+       indistinguishable from one we never looked at, which is exactly the
+       ambiguity this probe exists to remove. */
+    for (i = 0; i < WINMALI_OVL_COUNT * WINMALI_OVL_REGS_PER; i++) {
+        regs[i] = 0xDEADC0DEu;          /* sentinel = "not probed" */
+    }
+
+    for (i = 0; i < WINMALI_OVL_COUNT; i++) {
+        PHYSICAL_ADDRESS pa;
+        volatile UCHAR  *va;
+
+        if ((g_WinMaliOvlProbeMask & (1u << i)) == 0) {
+            continue;
+        }
+        /* Breadcrumb BEFORE the map, flushed: if mapping or the first read
+           hangs the bus this value is the only record of which block did it. */
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep",
+                                             0x1000u | i);
+        pa.QuadPart = (LONGLONG)g_WinMaliOvlBase[i];
+        va = (volatile UCHAR *)MmMapIoSpaceEx(pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+        if (va == NULL) {
+            DbgPrint("[WinMali]    OVL probe: map 0x%08x FAILED\n", g_WinMaliOvlBase[i]);
+            continue;
+        }
+        for (r = 0; r < WINMALI_OVL_REGS_PER; r++) {
+            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep",
+                                                 0x2000u | (i << 4) | r);
+            /* READ ONLY - never write. */
+            regs[i * WINMALI_OVL_REGS_PER + r] =
+                READ_REGISTER_ULONG((volatile ULONG *)(va + g_WinMaliOvlOff[r]));
+        }
+        MmUnmapIoSpace((PVOID)va, 0x1000);
+
+        DbgPrint("[WinMali]    OVL%u @0x%08x STA=0x%08x INTSTA=0x%08x ROI=0x%08x "
+                 "SRC_CON=0x%08x L0SZ=0x%08x L0OFF=0x%08x ADDR=0x%08x MSB=0x%08x\n",
+                 i, g_WinMaliOvlBase[i],
+                 regs[i*WINMALI_OVL_REGS_PER+0], regs[i*WINMALI_OVL_REGS_PER+1],
+                 regs[i*WINMALI_OVL_REGS_PER+2], regs[i*WINMALI_OVL_REGS_PER+3],
+                 regs[i*WINMALI_OVL_REGS_PER+4], regs[i*WINMALI_OVL_REGS_PER+5],
+                 regs[i*WINMALI_OVL_REGS_PER+6], regs[i*WINMALI_OVL_REGS_PER+7]);
+
+        /* THE ANSWER: the overlay whose layer-0 address is our scanout base is
+           the one feeding the panel. Recorded as i+1 so 0 stays "no match". */
+        if (regs[i*WINMALI_OVL_REGS_PER+6] == (ULONG)WINMALI_FB_SCANOUT_PA) {
+            match = i + 1u;
+        }
+    }
+
+    /* ⛔ KEEP THE MAPPING IF WE ARE GOING TO FLIP. MmMapIoSpaceEx is a
+       PASSIVE_LEVEL operation and the flip path runs from the present, so the
+       VA must already exist. Mapped exactly once, never unmapped while the
+       adapter lives. Only OVL0 - the overlay the probe proved is scanning out. */
+    if (g_WinMaliOvlFlip != 0 && g_WinMaliOvlRegsVa == NULL) {
+        PHYSICAL_ADDRESS opa;
+        opa.QuadPart = (LONGLONG)WINMALI_OVL0_PA;
+        g_WinMaliOvlRegsVa = MmMapIoSpaceEx(opa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+        DbgPrint("[WinMali]    OVL flip armed: mode=%u regsVa=%p\n",
+                 g_WinMaliOvlFlip, g_WinMaliOvlRegsVa);
+    }
+    /* Mode 2 additionally needs the RIGHT-half overlay and a back frame. Both
+       mapped once, at PASSIVE_LEVEL, and never from the present path. */
+    if (g_WinMaliOvlFlip == 2 && g_WinMaliOvl4RegsVa == NULL) {
+        PHYSICAL_ADDRESS p4, pb;
+        p4.QuadPart = (LONGLONG)WINMALI_OVL4_PA;
+        g_WinMaliOvl4RegsVa = MmMapIoSpaceEx(p4, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+        pb.QuadPart = (LONGLONG)WINMALI_FB_FRAME2_PA;
+        /* PAYLOAD, not STRIDE - the 0x400 difference between them would map 1 KB
+           of the next region for no reason. */
+        g_WinMaliOvlBackVa = MmMapIoSpaceEx(pb, (SIZE_T)WINMALI_FB_FRAME_PAYLOAD,
+                                            PAGE_READWRITE | PAGE_NOCACHE);
+        g_WinMaliOvlBackPa = (LONG64)WINMALI_FB_FRAME2_PA;
+        /* The probe just read OVL0, so we know which frame is live right now. */
+        g_WinMaliOvlFrontPa = (LONG64)WINMALI_FB_FRAME1_PA;
+        DbgPrint("[WinMali]    OVL mode2: ovl4=%p backVa=%p backPa=0x%llx front=0x%llx\n",
+                 g_WinMaliOvl4RegsVa, g_WinMaliOvlBackVa,
+                 (ULONGLONG)g_WinMaliOvlBackPa, (ULONGLONG)g_WinMaliOvlFrontPa);
+    }
+    /* ⛔★★★★★ BLOCKER 1 FIX - THE ONLY SOUND "DID THE WRITE LAND" TEST.
+     * Writing L0_ADDR's own value back and reading it again proves NOTHING: a
+     * dropped write and a landed write produce identical observables. MTK
+     * reserves a scratch register for exactly this - DISP_REG_OVL_DUMMY_REG
+     * (0x200), which appears at mtk_disp_ovl.c:209 and NOWHERE ELSE in their
+     * driver, so nothing reads or acts on it. Write magic, read back, restore.
+     * Back == magic && Back != Orig is a TRUE proof, with zero scanout effect.
+     * ⛔ Restore the original unconditionally - leaving our magic behind would
+     *    be a change to hardware state we did not need to make. */
+    if (g_WinMaliOvlFlip != 0 && g_WinMaliOvlRegsVa != NULL) {
+        volatile ULONG *dmy = (volatile ULONG *)((PUCHAR)g_WinMaliOvlRegsVa + 0x200u);
+        ULONG orig, back;
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep", 0x3500u);
+        orig = READ_REGISTER_ULONG(dmy);
+        WRITE_REGISTER_ULONG(dmy, 0x574D0001u);          /* 'WM' + 1 */
+        back = READ_REGISTER_ULONG(dmy);
+        WRITE_REGISTER_ULONG(dmy, orig);                 /* restore, always */
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlDummyOrig", orig);
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlDummyBack", back);
+        DbgPrint("[WinMali]    OVL dummy-reg write test: orig=0x%08x wrote=0x574D0001 "
+                 "back=0x%08x -> writes %s\n", orig, back,
+                 (back == 0x574D0001u) ? "LAND" : "DO NOT LAND");
+    }
+    /* ---- READ-ONLY DSI PROBE: latching or self-clearing? ---------------- */
+    if (g_WinMaliDsiProbe != 0) {
+        static const ULONG dsiBase[2] = { 0x1400D000u, 0x1420D000u };
+        ULONG  d, k;
+        ULONG  samples[2][8];
+        ULONG  misc[2][3];
+        for (d = 0; d < 2u; d++) {
+            volatile UCHAR *dva;
+            PHYSICAL_ADDRESS dpa;
+            for (k = 0; k < 8u; k++) { samples[d][k] = 0xDEADC0DEu; }
+            misc[d][0] = misc[d][1] = misc[d][2] = 0xDEADC0DEu;
+            if ((g_WinMaliDsiProbe & (1u << d)) == 0) { continue; }
+            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep",
+                                                 0x5000u | d);
+            dpa.QuadPart = (LONGLONG)dsiBase[d];
+            dva = (volatile UCHAR *)MmMapIoSpaceEx(dpa, 0x1000,
+                                                   PAGE_READWRITE | PAGE_NOCACHE);
+            if (dva == NULL) { continue; }
+            misc[d][0] = READ_REGISTER_ULONG((volatile ULONG *)(dva + 0x08)); /* INTEN     */
+            misc[d][1] = READ_REGISTER_ULONG((volatile ULONG *)(dva + 0x2C)); /* VACT_NL   */
+            misc[d][2] = READ_REGISTER_ULONG((volatile ULONG *)(dva + 0x160));/* STATE_DBG6*/
+            /* 8 samples of INTSTA. A LATCHED bit reads identical every time; a
+               live one varies across a ~60 Hz frame. KeStallExecutionProcessor
+               is legal here (PASSIVE) and 2 ms x 8 spans a frame at 60 Hz. */
+            for (k = 0; k < 8u; k++) {
+                samples[d][k] = READ_REGISTER_ULONG((volatile ULONG *)(dva + 0x0C));
+                KeStallExecutionProcessor(2000);   /* microseconds */
+            }
+            MmUnmapIoSpace((PVOID)dva, 0x1000);
+            DbgPrint("[WinMali]    DSI%u @0x%08x INTEN=0x%08x VACT_NL=0x%08x DBG6=0x%08x\n",
+                     d, dsiBase[d], misc[d][0], misc[d][1], misc[d][2]);
+            DbgPrint("[WinMali]    DSI%u INTSTA x8: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     d, samples[d][0], samples[d][1], samples[d][2], samples[d][3],
+                     samples[d][4], samples[d][5], samples[d][6], samples[d][7]);
+        }
+        {
+            ULONG blob[2 * 11];
+            ULONG i2;
+            for (d = 0; d < 2u; d++) {
+                for (i2 = 0; i2 < 8u; i2++) { blob[d * 11 + i2] = samples[d][i2]; }
+                blob[d * 11 + 8] = misc[d][0];
+                blob[d * 11 + 9] = misc[d][1];
+                blob[d * 11 + 10] = misc[d][2];
+            }
+            (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"StatDsiDump",
+                                           blob, (ULONG)sizeof(blob));
+        }
+        (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep", 0x5900u);
+    }
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlStep", 0x3000u);
+    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath, L"StatOvlMatch", match);
+    (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"StatOvlDump",
+                                   regs, (ULONG)sizeof(regs));
+    DbgPrint("[WinMali]    OVL probe done: mask=0x%x match=%u (0 = none matched "
+             "0x%08x)\n", g_WinMaliOvlProbeMask, match, (ULONG)WINMALI_FB_SCANOUT_PA);
+}
+
 NTSTATUS APIENTRY
 WinMaliKmdStartDevice(
     _In_  CONST PVOID            MiniportDeviceContext,
@@ -739,6 +1689,8 @@ WinMaliKmdStartDevice(
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
     NTSTATUS         status;
     WM_TRACE_ENTER("StartDevice");
+    g_WinMaliAdapterStartTick = KeQueryInterruptTime();
+    WinMaliVpTrail_(8);   /* adapter restarts show up in the VidPn trail */
 
     if (adapter == NULL || DxgkStartInfo == NULL || DxgkInterface == NULL ||
         NumberOfVideoPresentSources == NULL || NumberOfChildren == NULL) {
@@ -769,6 +1721,7 @@ WinMaliKmdStartDevice(
     DbgPrint("[WinMali]    StartDevice reporting VidPnSources=%lu Children=%lu\n",
              g_WinMaliVidPnSources, g_WinMaliChildCount);
 
+    WinMaliDodStage(3);
     DbgPrint("[WinMali]    StartDevice ctx=%p handle=%p\n",
              adapter, adapter->DxgkHandle);
 
@@ -864,6 +1817,42 @@ WinMaliKmdStartDevice(
                      "(we are not the POST device)\n",
                      (unsigned)postStatus);
         }
+    }
+
+    /* ===================================================================
+     * DISPLAY-ONLY: STOP HERE. Everything below brings up the GPU, and a
+     * display-only miniport does not have one - it has a framebuffer that
+     * firmware already scans out. Continuing would also publish a 256 MiB
+     * VidMm segment that a DOD must not have, and would call VidMm/scheduler
+     * callbacks that are absent from the reduced DXGKRNL_INTERFACE dxgk gives
+     * a display-only driver.
+     *
+     * MEASURED: without this, StatDodStage stops at 3 (StartDevice entered,
+     * never returned) and the adapter ends at CM_PROB_FAILED_POST_START.
+     *
+     * POST display ownership above is KEPT deliberately - it is what makes this
+     * adapter the owner of the panel, and DxgkDdiPresentDisplayOnly copies into
+     * exactly that framebuffer.
+     * =================================================================== */
+    /* ⛔★★ THE OVL PROBE MUST RUN IN **BOTH** MODES, SO IT GOES ABOVE THIS
+     * RETURN. 1.1.14.0 called it only at the very end of the render path, and
+     * display-only returns right here - so on the DOD boot the probe never ran
+     * and StatOvlStep/StatOvlMatch kept whatever the deploy script had left in
+     * them. The register dump still arrived, because the pnputil rebind happened
+     * while DodMode was still fuse-burned to 0 (i.e. on the RENDER path), which
+     * made it look like two instruments had failed when the code was simply
+     * never reached on the boot being measured.
+     * ★ A PROBE PLACED AFTER A MODE-SPECIFIC RETURN MEASURES ONE MODE ONLY. */
+    WinMaliOvlProbe_();
+
+    if (g_WinMaliDodMode != 0) {
+        WinMaliDodStage(4);
+        DbgPrint("[WinMali]    DISPLAY-ONLY StartDevice OK: sources=%lu children=%lu "
+                 "postOwned=%u - GPU bring-up deliberately SKIPPED\n",
+                 g_WinMaliVidPnSources, g_WinMaliChildCount,
+                 (unsigned)(adapter->ScanoutVa != NULL));
+        WM_TRACE_EXIT_S("StartDevice", STATUS_SUCCESS);
+        return STATUS_SUCCESS;
     }
 
     /* Real bring-up. Parse ACPI _CRS, map MMIO, probe GPU_ID. Lifted from
@@ -974,6 +1963,8 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
 {
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
     WM_TRACE_ENTER("StopDevice");
+    WinMaliDodDdi(WINMALI_DOD_DDI_STOPDEVICE);
+    WinMaliVpTrail_(9);
     if (adapter == NULL) {
         WM_TRACE_EXIT_S("StopDevice", STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
@@ -1136,6 +2127,7 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
 NTSTATUS APIENTRY
 WinMaliKmdRemoveDevice(_In_ CONST PVOID MiniportDeviceContext)
 {
+    WinMaliDodDdi(WINMALI_DOD_DDI_REMOVEDEVICE);
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
     WM_TRACE_ENTER("RemoveDevice");
     if (adapter == NULL) {
@@ -1432,6 +2424,35 @@ WinMaliVsyncDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
     }
 
     RtlZeroMemory(&notify, sizeof(notify));
+
+    /* ⛔★★★★★ A DISPLAY-ONLY ADAPTER MUST REPORT DISPLAYONLY_VSYNC.
+     * d3dkmddi.h: the CrtcVsync arm carries VidPnTargetId + PhysicalAddress +
+     * PhysicalAdapterMask ("Physical Address of displaying buffer" - a FLIP
+     * RETIREMENT); the DisplayOnlyVsync arm (DXGK_INTERRUPT_DISPLAYONLY_VSYNC=5)
+     * carries ONLY VidPnTargetId, precisely because a DOD has no flip to retire.
+     * dxgk watches this: TdrDodVSyncDelay fails a display-only adapter that
+     * stops reporting vsync, and it reports the failure through
+     * DpiFdoReportDeviceFailure - the ONE IoInvalidateDeviceState site in
+     * dxgkrnl that emits no ETW and no event log. The device then takes
+     * IRP_MN_SURPRISE_REMOVAL + IRP_MN_REMOVE_DEVICE, which is exactly what
+     * decoding ETW event 126 shows happening to us. */
+    if (g_WinMaliDodMode != 0) {
+        notify.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+        notify.DisplayOnlyVsync.VidPnTargetId = WINMALI_TARGET_ID;
+        adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+        /* ⛔★★★★★ NotifyInterrupt only QUEUES it. DxgkCbNotifyDpc is what makes
+         * dxgk PROCESS the queue - and without it dxgk sees NO vsync at all and
+         * its display-only watchdog removes us (MEASURED: BltQueueWakeReason=3
+         * on our LUID, then StopDev+Remove ~80 ms later). The DMA fence path in
+         * WinMaliKmdDpcRoutine has always made both calls; this notifier was the
+         * only one missing its partner. */
+        if (adapter->DxgkInterface.DxgkCbNotifyDpc != NULL) {
+            adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
+        }
+        (VOID)InterlockedIncrement64(&adapter->VsyncNotifyCount);
+        return;
+    }
+
     notify.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
     notify.CrtcVsync.VidPnTargetId = WINMALI_TARGET_ID;
     /* ⛔ ECHO THE ADDRESS dxgk PROGRAMMED, VERBATIM. This is what retires the
@@ -1443,7 +2464,24 @@ WinMaliVsyncDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Context,
     notify.CrtcVsync.PhysicalAdapterMask      = 0;
 
     adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+    /* Same pairing as above and as WinMaliKmdDpcRoutine: queue, then tell dxgk
+       to drain the queue. A CRTC_VSYNC that is never processed cannot retire a
+       flip either, so this was a latent defect on the render path too. */
+    if (adapter->DxgkInterface.DxgkCbNotifyDpc != NULL) {
+        adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
+    }
     (VOID)InterlockedIncrement64(&adapter->VsyncNotifyCount);
+    /* Only the first few: this fires at 30 Hz and would otherwise fill the
+       512-entry fill-once log before anything interesting happened. Three
+       timestamps are enough to prove vsync was LIVE in the fatal window - a
+       zero here would mean the flip could never retire no matter what else
+       is right. */
+    {
+        static LONG s_vsyncLogged = 0;
+        if (InterlockedIncrement(&s_vsyncLogged) <= 3) {
+            WinMaliVpLogOnly_(WINMALI_VPC_VSYNC_FIRE);
+        }
+    }
 
     if (adapter->DxgkInterface.DxgkCbNotifyDpc != NULL) {
         adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
@@ -1553,10 +2591,43 @@ WinMaliPresentWorker_(_In_ PVOID Context)
             L"CandThumbBo",    L"CandThumbPid",  L"CandThumbSt",  L"CandThumbLen",
             L"PanelThumbW",    L"PanelThumbH",
             L"UvSlotsN",       L"StatUvEvictBig", L"StatUvEvictBusy", L"StatUvDropSmall",
+            /* ⛔ NET ZERO NEW NAMES. This key is far past the point where a new
+               value name is guaranteed a slot, and an unreserved name silently
+               fails to appear - which has already produced four wrong
+               conclusions. StatBoDedup/StatBoDeref are defined and published but
+               have NO incrementer anywhere in the tree, so they are structurally
+               0 forever; their slots are free. */
+            L"StatUvPush",      L"StatUvPushBad",
             L"StatUvRevokeBig", L"StatUvRevokeAny", L"TraceAtRevokeBigBytes",
             L"TraceAtFirstTmoBytes",
             L"StatTilerOom",   L"StatTilerOomFail",
-            L"StatBoDedup",     L"StatBoDeref",   L"StatUvPubBig",
+            /* Reserved here for the same reason as everything else in this list:
+               this key is far past the point where a NEW name is guaranteed a
+               slot, and an unreserved name silently fails to appear - which has
+               already produced four wrong conclusions. */
+            L"StatVisOnPid",   L"StatVisOffPid", L"StatVisOnName", L"StatVisOffName",
+            /* StatBoDedup / StatBoDeref removed: no incrementer exists anywhere
+               in the tree, so they published a constant 0 while holding two slots
+               on a key that has none to spare. Their slots now carry StatUvPush /
+               StatUvPushBad above. */
+            L"StatUvPubBig",
+            L"StatWorkerTicks", L"StatWorkerStage",
+            L"StatStripBo",     L"StatStripRows",  L"StatStripBlits", L"StatStripNB",
+            L"StatFbAllocs",    L"StatFbAllocLastW", L"StatFbAllocLastH", L"StatFbAllocLastPitch",
+            L"StatMpoCapsCalls", L"StatMpoCheckCalls", L"StatMpoCheckPlanes", L"StatMpoSetCalls",
+            L"StatMpoPostCompCaps", L"StatMpoPostPresent", L"StatShaderPwrOn",
+            L"StatPresAl0Lo", L"StatPresAl0Hi", L"StatPresAl1Lo",
+            L"StatPresAl0NonNull", L"StatPresAl1NonNull",
+            L"StatVmCreates", L"StatVmDestroys", L"StatVmLive", L"StatVmCreateFail",
+            /* StatDevCreates/StatDevDestroys/StatVmOwnerNull retired: they answered
+               their question (DestroyDevice DOES run; no VM has a NULL owner) and
+               the name table is a hard 127 slots. */
+            L"StatFencePair",
+            L"StatVmDeferredBind", L"StatAsEvictions", L"StatAsLateBinds",
+            L"StatAsEnsureFail",
+            L"StatVpTrail", L"StatVpIsSup", L"StatVpCommit", L"StatVpVis",
+            L"StatVpVisMs",
+            L"StatPresentMpoFlag", L"StatPresentRedirected", L"QaiMpoOff", L"QaiMpoPlanesOff",
             L"StatDmaSegBytes",
             L"StatPresentFlips", L"StatPresentLastFlags",
             L"StatUvC0Box",    L"StatUvC1Box",   L"StatUvC2Box",  L"StatUvC3Box",
@@ -1568,9 +2639,112 @@ WinMaliPresentWorker_(_In_ PVOID Context)
     }
 
     for (;;) {
-        KeWaitForSingleObject(&a->PresentWake, Executive, KernelMode, FALSE, NULL);
+        /* SELF-TICK: see the PresentTickMs note. A NULL timeout here parked the
+           worker forever in the BLT model, because the only signaller requires a
+           latched flip. PresentWake still cuts the wait short, so a real flip is
+           serviced with no added latency. */
+        LARGE_INTEGER tick;
+        PLARGE_INTEGER pTick = NULL;
+        if (g_WinMaliPresentTickMs != 0) {
+            tick.QuadPart = -((LONGLONG)g_WinMaliPresentTickMs * 10000LL);
+            pTick = &tick;
+        }
+        (VOID)KeWaitForSingleObject(&a->PresentWake, Executive, KernelMode,
+                                    FALSE, pTick);
         if (InterlockedCompareExchange(&a->PresentStop, 0, 0) != 0) {
             break;
+        }
+        /* Heartbeat: incremented before ANY early-out below, so a climbing value
+           means the thread is running even on ticks that paint nothing. */
+        (VOID)InterlockedIncrement(&g_WinMaliStatWorkerTicks);
+        (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 1);
+
+        /* ⛔⛔⛔ THE WORKER SUPPRESSION LIVED HERE AND IT HUNG THE BOX (1.1.11.0).
+         * A `continue` at this point is ABOVE the s_pendingUse use-ref sweep, so
+         * it leaks a use-ref; WinMaliUvSrcRevoke then blocks for its FULL timeout
+         * on EVERY BO teardown, and dwm tears one down 12x/s => total stall, black
+         * screen. It also sits above the counter-publish block, so every counter
+         * freezes at once and the failure cannot even be diagnosed.
+         * The design that specified it said "immediately after the s_pendingUse
+         * sweep, NEVER before it". Deliberately shipping the push WITHOUT any
+         * suppression until it is proven; the cost is stale repaints over each
+         * pushed frame (flicker), which is a cosmetic problem, not a hang. */
+
+        /* ---- ASSERT "MONITOR CONNECTED" -----------------------------------
+         * 🎯 dxgk zeroes our display plane when an internal lookup returns
+         * STATUS_GRAPHICS_MONITOR_NOT_CONNECTED (0xC01E0338). The deciding
+         * instruction in that lookup is `ldrb w8,[target+0x2F8] ; cbnz w8 ->
+         * success` - a per-target "monitor connected" byte that reads ZERO for
+         * us. This callback is what sets it.
+         * ⛔ Connect ONLY - no disconnect first. The old hot-replug below sends
+         * disconnect->reconnect to force re-enumeration and was already refuted;
+         * this is a single positive assertion at a byte we can now name.
+         * Same placement rules as the replug: PASSIVE worker, once per boot,
+         * ahead of every early-out so a skipped frame cannot skip it. */
+        if (g_WinMaliIndicateConnMs != 0) {
+            static ULONG s_indState = 0;
+            if (s_indState == 0 &&
+                a->DxgkInterface.DxgkCbIndicateChildStatus != NULL &&
+                WinMaliMsSinceAdapterStart_() >= g_WinMaliIndicateConnMs) {
+                DXGK_CHILD_STATUS cs;
+                NTSTATUS rs;
+                RtlZeroMemory(&cs, sizeof(cs));
+                cs.Type              = StatusConnection;
+                cs.ChildUid          = WINMALI_CHILD_UID;
+                cs.HotPlug.Connected = TRUE;
+                rs = a->DxgkInterface.DxgkCbIndicateChildStatus(a->DxgkHandle, &cs);
+                s_indState = 1;
+                DbgPrint("[WinMali]    INDICATE CONNECTED -> 0x%08X (at %lu ms)\n",
+                         (unsigned)rs, (unsigned long)WinMaliMsSinceAdapterStart_());
+                if (g_WinMaliRegPath.Length != 0) {
+                    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                            L"StatIndConnRs", (ULONG)rs);
+                }
+            }
+        }
+
+        /* ---- HOT RE-PLUG: make the OS rebuild the display configuration ----
+         * Runs on the worker thread (PASSIVE_LEVEL; the callback allows up to
+         * DISPATCH_LEVEL) and exactly ONCE per boot. Placed immediately after the
+         * heartbeat and before every early-out, so a skipped frame cannot skip it
+         * - the same rule the counters above are written under. */
+        if (g_WinMaliHotReplugMs != 0) {
+            static ULONG s_replugState = 0;
+            static ULONG s_replugAtMs  = 0;
+            if (s_replugState < 2 &&
+                a->DxgkInterface.DxgkCbIndicateChildStatus != NULL) {
+                ULONG nowMs = WinMaliMsSinceAdapterStart_();
+                if (s_replugState == 0 && nowMs >= g_WinMaliHotReplugMs) {
+                    DXGK_CHILD_STATUS cs;
+                    NTSTATUS rs;
+                    RtlZeroMemory(&cs, sizeof(cs));
+                    cs.Type = StatusConnection;
+                    cs.ChildUid = WINMALI_CHILD_UID;
+                    cs.HotPlug.Connected = FALSE;
+                    rs = a->DxgkInterface.DxgkCbIndicateChildStatus(
+                             a->DxgkHandle, &cs);
+                    WinMaliVpLogOnly_(WINMALI_VPC_REPLUG | (1u << 16) |
+                                      ((ULONG)rs & 0xFFFFu));
+                    DbgPrint("[WinMali]    HOT REPLUG: disconnect -> 0x%08X\n",
+                             (unsigned)rs);
+                    s_replugAtMs = nowMs;
+                    s_replugState = 1;
+                } else if (s_replugState == 1 && nowMs >= s_replugAtMs + 200u) {
+                    DXGK_CHILD_STATUS cs;
+                    NTSTATUS rs;
+                    RtlZeroMemory(&cs, sizeof(cs));
+                    cs.Type = StatusConnection;
+                    cs.ChildUid = WINMALI_CHILD_UID;
+                    cs.HotPlug.Connected = TRUE;
+                    rs = a->DxgkInterface.DxgkCbIndicateChildStatus(
+                             a->DxgkHandle, &cs);
+                    WinMaliVpLogOnly_(WINMALI_VPC_REPLUG | (2u << 16) |
+                                      ((ULONG)rs & 0xFFFFu));
+                    DbgPrint("[WinMali]    HOT REPLUG: reconnect  -> 0x%08X\n",
+                             (unsigned)rs);
+                    s_replugState = 2;
+                }
+            }
         }
 
         /* ★ PUBLISH BEFORE ANY `continue` — THE INSTRUMENT MUST NOT SIT BEHIND
@@ -1621,6 +2795,26 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"StatUvSrcBo",           (ULONG)g_WinMaliStatUvSrcBo);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatUvSrcHits",         (ULONG)g_WinMaliStatUvSrcHits);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatWorkerTicks",       (ULONG)g_WinMaliStatWorkerTicks);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStripBo",           (ULONG)g_WinMaliStatStripBo);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStripRows",         (ULONG)g_WinMaliStatStripRows);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStripBlits",        (ULONG)g_WinMaliStatStripBlits);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStripNB",           (ULONG)g_WinMaliStatStripNB);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatFbAllocs",          (ULONG)g_WinMaliStatFbAllocs);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatFbAllocLastW",      (ULONG)g_WinMaliStatFbAllocLastW);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatFbAllocLastH",      (ULONG)g_WinMaliStatFbAllocLastH);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatFbAllocLastPitch",  (ULONG)g_WinMaliStatFbAllocLastPitch);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatWorkerStage",       (ULONG)g_WinMaliStatWorkerStage);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatUvSrcAsked",        (ULONG)g_WinMaliStatUvSrcAsked);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1698,10 +2892,8 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         L"StatUvRevokeBig", (ULONG)g_WinMaliStatUvRevokeBig);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatUvRevokeAny", (ULONG)g_WinMaliStatUvRevokeAny);
-                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                        L"StatBoDedup",     (ULONG)g_WinMaliStatBoDedup);
-                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                        L"StatBoDeref",     (ULONG)g_WinMaliStatBoDeref);
+                /* StatBoDedup / StatBoDeref publishes removed with their
+                   reservations: constant 0, no incrementer in the tree. */
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatUvPubBig",    (ULONG)g_WinMaliStatUvPubBig);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -1716,9 +2908,141 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QueryFlipCaps",         g_WinMaliQaiFlipCapsValue);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QaiFlipQueueDepth",     (ULONG)g_WinMaliQaiFlipQueueDepth);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStdAllocPrimary",   (ULONG)g_WinMaliStatStdAllocPrimary);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStdAllocShadow",    (ULONG)g_WinMaliStatStdAllocShadow);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatStdAllocGdi",       (ULONG)g_WinMaliStatStdAllocGdi);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QueryCapsOff",          g_WinMaliQaiFlipCapsOff);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QueryCapsOutSz",        g_WinMaliQaiOutSize);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QaiMpoOff",             g_WinMaliQaiMpoOff);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"QaiMpoPlanesOff",       g_WinMaliQaiMpoPlanesOff);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoCapsCalls",      (ULONG)g_WinMaliStatMpoCapsCalls);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoCheckCalls",     (ULONG)g_WinMaliStatMpoCheckCalls);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoCheckPlanes",    (ULONG)g_WinMaliStatMpoCheckPlanes);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoSetCalls",       (ULONG)g_WinMaliStatMpoSetCalls);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoPostCompCaps",   (ULONG)g_WinMaliStatMpoPostCompCaps);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatMpoPostPresent",    (ULONG)g_WinMaliStatMpoPostPresent);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatShaderPwrOn",       (ULONG)g_WinMaliStatShaderPwrOn);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresAl0Lo",         (ULONG)g_WinMaliStatPresAl0Lo);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresAl0Hi",         (ULONG)g_WinMaliStatPresAl0Hi);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresAl1Lo",         (ULONG)g_WinMaliStatPresAl1Lo);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresAl0NonNull",    (ULONG)g_WinMaliStatPresAl0NonNull);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresAl1NonNull",    (ULONG)g_WinMaliStatPresAl1NonNull);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVmCreates",         (ULONG)g_WinMaliStatVmCreates);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVmDestroys",        (ULONG)g_WinMaliStatVmDestroys);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVmLive",            (ULONG)g_WinMaliStatVmLive);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVmCreateFail",      (ULONG)g_WinMaliStatVmCreateFail);
+                /* ⛔ THE BLT MODEL RETIRES A PRESENT ON DMA COMPLETION, NOT ON VSYNC.
+                   Flips==0 here, so a healthy vsync stream proves nothing about
+                   whether presents are completing. If Submitted runs ahead of
+                   Completed and stays there, dwm is blocked waiting for a buffer
+                   we never released - which is exactly the shape of "24 presents
+                   then silence forever". Equal values clear the whole theory in
+                   one read. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatFencePair",
+                        (((ULONG)a->GpuSubmittedFence & 0xFFFFu) << 16)
+                        | ((ULONG)a->GpuCompletedFence & 0xFFFFu));
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVmDeferredBind",    (ULONG)g_WinMaliStatVmDeferredBind);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatAsEvictions",       (ULONG)g_WinMaliStatAsEvictions);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatAsLateBinds",       (ULONG)g_WinMaliStatAsLateBinds);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatAsEnsureFail",      (ULONG)g_WinMaliStatAsEnsureFail);
+                /* Order, not just counts: see the StatVpTrail comment in
+                   WinMaliVidPn.c. Read StatVpTrail as hex, oldest nibble left. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatVpTrail",  (ULONG)g_WinMaliStatVpTrail);
+                /* WHO turned the source on, and who turned it off. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVisOnPid",
+                        (ULONG)InterlockedCompareExchange(&g_WinMaliVisOnPid, 0, 0));
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVisOffPid",
+                        (ULONG)InterlockedCompareExchange(&g_WinMaliVisOffPid, 0, 0));
+                (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"StatVisOnName",
+                        g_WinMaliVisOnName, sizeof(g_WinMaliVisOnName));
+                (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"StatVisOffName",
+                        g_WinMaliVisOffName, sizeof(g_WinMaliVisOffName));
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatUvPush",    (ULONG)g_WinMaliStatUvPush);
+                {   /* refG | refP<<8 | refD<<16 | EXC<<24, each saturating.
+                       ⛔ BITS 24-31 MUST READ 0. The __except can only fire if
+                       the lifetime model is wrong; anything else there is a STOP. */
+                    ULONG gG = (ULONG)g_WinMaliStatUvPushRefG; if (gG > 255u) gG = 255u;
+                    ULONG gP = (ULONG)g_WinMaliStatUvPushRefP; if (gP > 255u) gP = 255u;
+                    /* ⛔ BITS 16-23 ARE NOW THE NON-BLACK SAMPLE COUNT (0-64), not
+                       refD: refD has been 0 on every single run, and this key has
+                       no spare value names. Blank-frame refusals fold into refG. */
+                    ULONG gD = (ULONG)g_WinMaliStatUvPushNB;  if (gD > 255u) gD = 255u;
+                    ULONG gE = (ULONG)g_WinMaliStatUvPushExc;  if (gE > 255u) gE = 255u;
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatUvPushBad", gG | (gP << 8) | (gD << 16) | (gE << 24));
+                }
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVpIsSup",
+                        (((ULONG)g_WinMaliStatVpIsSupYes & 0xFFFFu) << 16)
+                        | ((ULONG)g_WinMaliStatVpIsSupNo & 0xFFFFu));
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVpCommit",
+                        (((ULONG)g_WinMaliStatVpCommitPath & 0xFFFFu) << 16)
+                        | ((ULONG)g_WinMaliStatVpCommitEmpty & 0xFFFFu));
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVpVis",
+                        (((ULONG)g_WinMaliStatVpVisOn & 0xFFFFu) << 16)
+                        | ((ULONG)g_WinMaliStatVpVisOff & 0xFFFFu));
+                /* When, in ms since StartDevice, visibility last went on and
+                   last went off. Boot-relative and monotonic: KeQueryInterruptTime
+                   is immune to this box's RTC resetting every power cycle. The
+                   gap between them is the whole question - a switch-off seconds
+                   after logon and one that lands when the shell finishes
+                   starting have completely different causes. */
+                /* ⚠ HUNDREDTHS, NOT MILLISECONDS. Both halves are /100 to fit a
+                   16-bit field, so a raw read is 100x too small - I decoded this
+                   as "13.9 s" once and built a whole theory on a number that was
+                   really 23 minutes. Multiply by 100 before believing it. */
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatVpVisMs",
+                        (((ULONG)g_WinMaliStatVpVisOnMs / 100u) << 16)
+                        | (((ULONG)g_WinMaliStatVpVisOffMs / 100u) & 0xFFFFu));
+                /* The ordered, TIMESTAMPED version of StatVpTrail. Fill-once, so
+                   it still holds the boot sequence an hour later. */
+                {
+                    LONG  vn  = InterlockedCompareExchange(&g_WinMaliVpLogN, 0, 0);
+                    ULONG cnt = (vn <= 0) ? 0u
+                              : (((ULONG)vn > WINMALI_VPLOG_MAX) ? WINMALI_VPLOG_MAX
+                                                                 : (ULONG)vn);
+                    static ULONG s_vpPublished = 0;
+                    if (cnt != s_vpPublished) {
+                        s_vpPublished = cnt;
+                        (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"VpLog",
+                                g_WinMaliVpLog, cnt * sizeof(WINMALI_VPLOG_ENT));
+                        (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"VpLogN",
+                                (ULONG)vn);
+                    }
+                }
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresentMpoFlag",    (ULONG)g_WinMaliStatPresentMpoFlag);
+                (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                        L"StatPresentRedirected", (ULONG)g_WinMaliStatPresentRedirected);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"QueryCapsSizeof",       g_WinMaliQaiCapsSizeof);
                 /* ★ The segment flags we actually sent. DirectFlip = 0x400 is the
@@ -2202,6 +3526,15 @@ WinMaliPresentWorker_(_In_ PVOID Context)
             continue;
         }
 
+        /* THE READINESS GATE. See Parameters\WorkerVisGate.
+           The test pattern deliberately bypasses it: proving the OUTPUT path is
+           good must not depend on the OS having accepted a source. */
+        if (g_WinMaliWorkerVisGate != 0 && g_WinMaliPresentTestPattern == 0 &&
+            InterlockedCompareExchange(&a->SourceVisible, 1, 1) != 1) {
+            (VOID)InterlockedIncrement64(&a->ScanoutBltSkipped);
+            continue;
+        }
+
         {
             UINT64 flipAddr = (UINT64)InterlockedCompareExchange64(&a->LastFlipAddress, 0, 0);
             UINT64 segBase  = WINMALI_SYSMEM_GPU_BASE;
@@ -2325,6 +3658,35 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                     WinMaliUvSrcEndUse(s_pendingUse);
                     s_pendingUse = 0;
                 }
+
+                /* ⛔★★★★★ YIELD THE PANEL TO A FRESH PUSH - AND ONLY HERE.
+                 *
+                 * UvPush writes dwm's finished frame straight to the panel from
+                 * the BO destroy path. If the worker also repaints its (stale)
+                 * candidate on its own tick, the two alternate on the glass and
+                 * the panel STROBES between the live desktop and the old frame.
+                 * USER-OBSERVED on 1.1.11.2: "epileptic flashing... between
+                 * desktop and black".
+                 *
+                 * PLACEMENT IS THE WHOLE SAFETY ARGUMENT:
+                 *   - the s_pendingUse sweep is DONE, so no use-ref is in flight
+                 *     and none can be leaked by this `continue`;
+                 *   - the counter-publish block is far above, so the instruments
+                 *     keep publishing on every skipped tick.
+                 * 1.1.11.0 put this after the heartbeat instead - above BOTH -
+                 * and black-screened the box.
+                 *
+                 * 250 ms window: dwm pushes at ~9-12/s, so a live producer holds
+                 * the panel continuously and a dead one hands it back after a
+                 * quarter second - the frozen-desktop behaviour, not a black one. */
+                if (g_WinMaliUvPush != 0) {
+                    LONG64 pushT = InterlockedCompareExchange64(&g_WinMaliUvPushTick, 0, 0);
+                    if (pushT != 0 &&
+                        ((LONG64)KeQueryInterruptTime() - pushT) < (2500LL * 1000LL)) {
+                        (VOID)InterlockedIncrement64(&a->ScanoutBltSkipped);
+                        continue;
+                    }
+                }
                 /* ⛔★★★★★ WHICH BRANCH ACTUALLY SET srcVa. Set it WHERE srcVa is
                  * assigned - never inferred afterwards.
                  *
@@ -2353,6 +3715,14 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                    Over-trusting it walks off a locked MDL, so only widen when
                    the source itself reports a larger extent. */
                 SIZE_T                  srcBytes = 0;
+                /* THE AUTHORITATIVE BOUND - see WinMaliSrcRow_() above.
+                   Bytes readable FROM srcVa (mapped extent MINUS any offset
+                   already added into srcVa). 0 == unknown, and unknown means we
+                   do not read at all. Derived row geometry follows it. */
+                SIZE_T                  srcReadable = 0;
+                ULONG                   srcRowPitch = 0;
+                ULONG                   srcRowBytes = 0;
+                ULONG                   srcMaxRows  = 0;
                 /* TRUE => srcVa points into a 0x93 BO and we hold the candidate
                    table lock, which must be released after the copy. */
                 BOOLEAN                 uvHeld = FALSE;
@@ -2608,6 +3978,11 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             /* The stash records where in the MDL this allocation
                                starts; AperturePageCount is a COUNT, not a total. */
                             srcVa = fv + ((SIZE_T)fa->ApertureMdlOffset * PAGE_SIZE);
+                            /* The gate above already proved
+                               AperturePageCount*PAGE_SIZE >= bytes, and nothing
+                               beyond the stash offset is added to srcVa, so the
+                               whole run is readable from here. */
+                            srcReadable = (SIZE_T)fa->AperturePageCount * PAGE_SIZE;
                             srcPath = 1;   /* VidMm aperture MDL */
                             (VOID)InterlockedIncrement(&g_WinMaliStatFlipSrcUsed);
 
@@ -2743,6 +4118,7 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         }
                     }
                     if (uv == NULL) {
+                        (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 3);
                         uv = WinMaliUvSrcAcquireBest(bytes,
                                                      WINMALI_FB_STRIDE,
                                                      WINMALI_FB_HEIGHT,
@@ -2799,6 +4175,11 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                          * ★ When a well-formed counter reports something
                          * "impossible", suspect the MODEL before the counter. */
                         srcPath = 3;   /* 0x93 uv candidate, AcquireBest */
+                        /* AcquireBest / ReacquireVa set srcBytes to the BO's
+                           Size, and only return a candidate whose Size covers a
+                           full screen AT ITS OWN PITCH. A proven bound, not an
+                           assumption. */
+                        srcReadable = srcBytes;
                         uvHandleForCopy = uvHandle;   /* re-checked between slices */
                         /* Whichever of AcquireBest/ReacquireVa produced `uv` took
                            a use-ref on this handle. Record it so it is dropped -
@@ -2928,23 +4309,89 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                  * continue below) instead of reading memory we do not own.
                  * A skipped frame is a stale panel; an aperture read is a dead box.
                  * `FlipSrcFromAperture=1` re-enables it to re-test deliberately. */
-                if (srcVa == NULL && src != NULL && g_WinMaliFlipSrcFromAperture != 0) {
-                    PUCHAR base = (PUCHAR)MmGetSystemAddressForMdlSafe(
-                                      src->ApertureMdl, NormalPagePriority | MdlMappingNoExecute);
+                /* ★★★ PREFER THE REAL PRIMARY, opt-in via FlipSrcPreferAperture.
+                 *
+                 * MEASURED 1.1.9.77: the driver holds a mapped MDL for the ACTUAL
+                 * primary and never reads it - FlipAllocOk=2, FlipAllocSize=21667840
+                 * (exactly one frame), FlipWorkerMdl=1, FlipWorkerPages=5290,
+                 * ApMapOps=24 - while StatDbgSrcPath=3 and FlipSrcUsed=0. The 0x93
+                 * candidate we blit instead (bo=149, dwm, panel-sized) is FROZEN,
+                 * although dwm composites on every mouse move (+12%% CPU, +26 submits).
+                 *
+                 * ⛔ `srcVa == NULL` alone can never express "prefer": the uv scan runs
+                 * FIRST and almost always succeeds, so this branch was unreachable in
+                 * practice. `src` is not resolved until a few lines above, which is why
+                 * the preference has to be applied HERE and not before the uv scan -
+                 * my first attempt sat above the assignment and read a NULL src.
+                 *
+                 * ⚠ Default 0 keeps today's exact behaviour. */
+                /* ⛔★★★★★ THE 1.1.9.79 REBIND HANG WAS THIS CONDITION.
+                 *
+                 * .79 armed the read with `(FromAperture || PreferAperture)`, so
+                 * PreferAperture alone BOTH overrode a validated 0x93 source AND
+                 * opened the read that FlipSrcFromAperture exists to keep shut.
+                 * Worse, it called MmGetSystemAddressForMdlSafe on VidMm's MDL
+                 * from the worker ~20x/s - the exact operation the ApertureVa
+                 * comment in WinMaliAlloc.h forbids BY NAME because doing it
+                 * per-tick REBOOT-LOOPED this box once already. I wrote that
+                 * warning and then walked straight into it.
+                 *
+                 * Now:
+                 *  - FlipSrcFromAperture is the ONLY thing that can ARM the read.
+                 *    PreferAperture expresses preference and nothing else, so
+                 *    re-testing the real primary takes TWO deliberate knobs and
+                 *    one knob can never open this again.
+                 *  - Magic + MDL + the same size gate the VidMm sibling carries.
+                 *    Undersized => not adopted => srcVa stays NULL => the counted
+                 *    skip below (fail closed).
+                 *  - The mapping is the CACHED ApertureVa, taken once where VidMm
+                 *    guaranteed the MDL valid (WinMaliPaging.c MAP_APERTURE_SEGMENT)
+                 *    and NULLed BEFORE ApertureMdl at UNMAP. We never map here.
+                 *  - KeFlushIoBuffers first: a CACHED mapping of memory the GPU
+                 *    wrote non-coherently reads stale (black) without it. */
+                if ((srcVa == NULL || g_WinMaliFlipSrcPreferAperture != 0) &&
+                    g_WinMaliFlipSrcFromAperture != 0 &&
+                    src != NULL &&
+                    src->Magic == WINMALI_KMD_ALLOC_MAGIC &&
+                    src->ApertureMdl != NULL &&
+                    (SIZE_T)src->AperturePageCount * PAGE_SIZE >= bytes) {
+                    PUCHAR base = (PUCHAR)src->ApertureVa;
                     if (base != NULL) {
+                        if (src->ApertureMdl != NULL) {
+                            KeFlushIoBuffers(src->ApertureMdl, TRUE, TRUE);
+                        }
                         /* Byte offset into the allocation. For an address-matched
                            allocation that is (flipAddr - GpuVa); for a
                            flip-recorded one the frame starts at the beginning of
                            the allocation and flipAddr is unrelated to it (it is
                            still the frozen mode-set address), so use 0. */
+                        SIZE_T apBytes = (SIZE_T)src->AperturePageCount * PAGE_SIZE;
                         SIZE_T off = 0;
                         if (src->GpuVa != 0 &&
                             flipAddr >= src->GpuVa &&
-                            flipAddr < src->GpuVa + (UINT64)src->AperturePageCount * PAGE_SIZE) {
+                            flipAddr < src->GpuVa + (UINT64)apBytes) {
                             off = (SIZE_T)(flipAddr - src->GpuVa);
                         }
+                        if (off >= apBytes) { off = 0; }   /* cannot happen; do not trust it */
                         srcVa = base + (SIZE_T)src->ApertureMdlOffset * PAGE_SIZE + off;
+                        /* srcVa was ADVANCED by off, so what remains readable
+                           from it is the run MINUS off. Getting this wrong is
+                           how .79 handed the copy loop a 21 MB budget over a
+                           mapping that no longer had 21 MB in front of it. */
+                        srcReadable = apBytes - off;
                         srcPath = 2;   /* APERTURE MDL of a dxgk allocation (gated) */
+                        /* ⛔ RESET THE SOURCE METADATA. Until now this branch only ran
+                           when the uv scan had FAILED, so srcPitch/srcBytes/
+                           uvHandleForCopy were all still zero and nobody noticed they
+                           are not set here. With FlipSrcPreferAperture we OVERRIDE a
+                           successful uv result, so leaving them behind would apply one
+                           surface's pitch and length to a completely different
+                           allocation - and make the copy loop re-validate a uv handle
+                           that is no longer the source it is reading. */
+                        srcPitch        = WINMALI_FB_STRIDE;
+                        srcBytes        = srcReadable;   /* never the raw run */
+                        uvHandleForCopy = 0;
+                        (VOID)InterlockedIncrement(&g_WinMaliStatFlipSrcUsed);
                     }
                 }
 
@@ -2960,6 +4407,43 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                     (VOID)InterlockedIncrement64(&a->ScanoutBltSkipped);
                     (VOID)InterlockedIncrement(&g_WinMaliStatSkipNoSrc);
                     continue;
+                }
+
+                /* ⛔★★★★★ ESTABLISH THE BOUND ONCE, HERE, AND FAIL CLOSED.
+                 *
+                 * Every reader below - both samplers, the copy loop and the
+                 * thumbnail - used to walk the source with WINMALI_FB_HEIGHT /
+                 * WINMALI_FB_STRIDE, or with `bytes`, the DESTINATION size. None
+                 * of them could ever be NARROWED by a source smaller than the
+                 * panel; that is how a 4 MB atlas became a 21 MB read off the
+                 * end of a mapping. These three values are computed HERE and
+                 * nowhere else, and the copy block below CONSUMES them rather
+                 * than recomputing its own.
+                 *
+                 * If srcReadable is 0 the extent is unknown, and unknown means
+                 * we do not read: skip the frame, counted, exactly as a missing
+                 * source already does. A stale panel is a cosmetic miss; an
+                 * unmapped kernel read on this box is a dead box with no dump.
+                 *
+                 * srcMaxRows is capped by WINMALI_FB_HEIGHT because that is the
+                 * DESTINATION's limit - the old code started maxRows there and
+                 * only ever lowered it, so this is behaviour-preserving for the
+                 * 0x93 path (selection guarantees Size >= Height*pitch, so the
+                 * cap still lands on 1840 exactly as before). */
+                srcRowPitch = (srcPitch != 0) ? srcPitch : WINMALI_FB_STRIDE;
+                srcRowBytes = (srcRowPitch < WINMALI_FB_STRIDE)
+                            ? srcRowPitch : WINMALI_FB_STRIDE;
+                srcMaxRows  = (srcReadable >= (SIZE_T)srcRowBytes)
+                            ? (ULONG)(((srcReadable - (SIZE_T)srcRowBytes)
+                                       / srcRowPitch) + 1)
+                            : 0;
+                if (srcMaxRows > WINMALI_FB_HEIGHT) {
+                    srcMaxRows = WINMALI_FB_HEIGHT;
+                }
+                if (srcReadable == 0 || srcMaxRows == 0) {
+                    (VOID)InterlockedIncrement64(&a->ScanoutBltSkipped);
+                    (VOID)InterlockedIncrement(&g_WinMaliStatSkipNoSrc);
+                    continue;      /* no bound => no read */
                 }
 
                 /* ⛔★★★★★ WHERE DOES THE SOURCE'S CONTENT END?
@@ -3014,17 +4498,24 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                      * described the probe's own striding, not the content.
                      * ★ A measurement taken with the wrong geometry is not a
                      * weaker measurement, it is a different question. */
-                    const ULONG probePitch =
-                        (srcPitch != 0) ? srcPitch : WINMALI_FB_STRIDE;
+                    const ULONG probePitch = srcRowPitch;
                     if ((InterlockedIncrement64(&s_extTick) % 120) == 1) {
                         ULONG y, x, first = 0xFFFFFFFFu, last = 0, rowsNz = 0;
-                        ULONG probeRows = (ULONG)(bytes / probePitch);
-                        if (probeRows > WINMALI_FB_HEIGHT) { probeRows = WINMALI_FB_HEIGHT; }
+                        /* Rows and columns come from THE BOUND, never from
+                           `bytes` (the destination) or the panel height. The
+                           old column step (probePitch/64) also produced a ZERO
+                           step for any pitch < 64; 16 samples per row is what it
+                           actually intended. */
+                        ULONG probeRows = srcMaxRows;
+                        ULONG probeCols = srcRowBytes / 4u;
+                        ULONG colStep   = probeCols / 16u;
+                        if (colStep == 0) { colStep = 1; }
                         for (y = 0; y < probeRows; y += 8) {
-                            const ULONG *row =
-                                (const ULONG *)(srcVa + (SIZE_T)y * probePitch);
+                            const ULONG *row = (const ULONG *)
+                                WinMaliSrcRow_(srcVa, srcMaxRows, srcRowPitch, y);
                             BOOLEAN nz = FALSE;
-                            for (x = 0; x < (probePitch / 4); x += (probePitch / 64)) {
+                            if (row == NULL) { break; }
+                            for (x = 0; x < probeCols; x += colStep) {
                                 if ((row[x] & 0x00FFFFFFu) != 0) { nz = TRUE; break; }
                             }
                             if (nz) {
@@ -3094,10 +4585,19 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                          * Both are published; edges is the honest one. */
                         ULONG edges = 0, prevPx = 0;
                         BOOLEAN havePrev = FALSE;
-                        for (y = 0; y < WINMALI_FB_HEIGHT; y += 97) {
-                            const ULONG *row =
-                                (const ULONG *)(srcVa + (SIZE_T)y * WINMALI_FB_STRIDE);
-                            for (x = 0; x < WINMALI_FB_WIDTH; x += 89) {
+                        /* ⛔ Walk at the SOURCE's pitch, bounded by THE BOUND.
+                           The hard-coded WINMALI_FB_HEIGHT/WINMALI_FB_STRIDE
+                           here was the single worst reader in the worker: it
+                           walked a mapping 21 MB deep with no source bound of
+                           any kind. Cell divisors stay panel-relative so the
+                           published mask keeps its meaning. */
+                        ULONG sampCols = srcRowBytes / 4u;
+                        if (sampCols > WINMALI_FB_WIDTH) { sampCols = WINMALI_FB_WIDTH; }
+                        for (y = 0; y < srcMaxRows; y += 97) {
+                            const ULONG *row = (const ULONG *)
+                                WinMaliSrcRow_(srcVa, srcMaxRows, srcRowPitch, y);
+                            if (row == NULL) { break; }
+                            for (x = 0; x < sampCols; x += 89) {
                                 ULONG px = row[x] & 0x00FFFFFFu;
                                 orAll |= px;
                                 if (px != 0) {
@@ -3295,21 +4795,22 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                      * the source is at least `bytes` long (selection guarantees
                      * Size >= NeedBytes), so bound rows by that and never by the
                      * surface's own claimed height. */
+                    /* ⛔★★★★★ THE COPY NO LONGER COMPUTES ITS OWN BOUND.
+                     * `avail = (srcBytes > bytes) ? srcBytes : bytes` was a MAX:
+                     * a source SHORTER than the panel selected `bytes`, the
+                     * DESTINATION size, so maxRows stayed 1840 and the loop read
+                     * 21,667,840 bytes out of whatever `src` happened to be.
+                     * These three now come from the single bound established at
+                     * source-adoption time, and they are const so no later edit
+                     * can quietly widen them. */
                     const ULONG  dstPitch = WINMALI_FB_STRIDE;
-                    ULONG        effPitch = (srcPitch != 0) ? srcPitch : dstPitch;
-                    ULONG        rowBytes = (effPitch < dstPitch) ? effPitch : dstPitch;
-                    ULONG        maxRows  = WINMALI_FB_HEIGHT;
+                    const ULONG  effPitch = srcRowPitch;
+                    const ULONG  rowBytes = srcRowBytes;
+                    const ULONG  maxRows  = srcMaxRows;
                     static ULONG s_copyRow = 0;
                     BOOLEAN      restartSweep = FALSE;
                     ULONG        rowsPerWake = (ULONG)(budget / dstPitch);
                     ULONG        startRow, endRow, r, doneRows = 0;
-                    if (effPitch == 0) { effPitch = dstPitch; rowBytes = dstPitch; }
-                    {
-                        SIZE_T avail = (srcBytes > bytes) ? srcBytes : bytes;
-                        SIZE_T cap = (avail >= rowBytes)
-                                   ? ((avail - rowBytes) / effPitch) + 1 : 0;
-                        if (cap < maxRows) { maxRows = (ULONG)cap; }
-                    }
                     if (rowsPerWake == 0) { rowsPerWake = 1; }
                     startRow = (s_copyRow < maxRows) ? s_copyRow : 0;
                     endRow   = startRow + rowsPerWake;
@@ -3369,6 +4870,7 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         }
                     }
 
+                    (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 4);
                     for (r = startRow; r < endRow; r++) {
 
                         /* ⛔★★★★★ TEARDOWN MUST NOT WAIT FOR THIS COPY.
@@ -3406,6 +4908,7 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         if (srcPath == 3 && uvHandleForCopy != 0 &&
                             !WinMaliUvSrcStillValid(uvHandleForCopy)) {
                             (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                            (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 42);
                             /* ★ RESTART THE SWEEP, don't resume it. Resuming would
                                fill the remainder of this frame from a DIFFERENT
                                surface - the mosaic we are removing. Drop the latch
@@ -3419,7 +4922,35 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                         /* Re-validate between slices. Only meaningful when the
                            source came from the flip allocation; for other source
                            paths ga is NULL and we simply copy through. */
-                        if (ga != NULL) {
+                        /* ⛔★★★★★ GUARD ONLY THE PATH IT PROTECTS.
+                         *
+                         * The comment above says "for other source paths ga is
+                         * NULL and we simply copy through". That is FALSE in
+                         * practice: `ga` is read from g_WinMaliFlipAlloc
+                         * unconditionally, and dxgk HAS latched a flip
+                         * (LiveFlipLatch=2), so ga is non-NULL even when the
+                         * source we are actually copying is a 0x93 candidate
+                         * (srcPath 3) that has nothing to do with it. And under
+                         * escape submission dxgk never aperture-maps that
+                         * allocation, so ga->ApertureMdl is NULL FOREVER - which
+                         * made this abort fire on the FIRST row of EVERY tick.
+                         *
+                         * MEASURED 1.1.9.30: StatCopyAbort +210 per 10 s (one per
+                         * tick), StatCopyKB=0, while srcPath=3, StatUvCoverage=99
+                         * and StatDbgBytes=21667840 - i.e. a full, 99%-painted
+                         * desktop was selected and then discarded before a single
+                         * byte was copied. On the glass: the marker square
+                         * flashing over an untouched EDK2 boot image, because the
+                         * marker is stamped after the copy loop regardless.
+                         *
+                         * srcVa for path 3 is a system VA over pages WE
+                         * probe-locked; its liveness is covered by the
+                         * WinMaliUvSrcStillValid check above. This one is only
+                         * meaningful for the flip-allocation paths (1 and 2).
+                         * ★ A GUARD MUST BE SCOPED TO THE THING IT GUARDS - an
+                         *   unscoped one silently disables a path it never
+                         *   examined. */
+                        if (ga != NULL && srcPath != 3) {
                             PWINMALI_KMD_ALLOCATION now =
                                 (PWINMALI_KMD_ALLOCATION)InterlockedCompareExchangePointer(
                                     (PVOID volatile *)&g_WinMaliFlipAlloc, NULL, NULL);
@@ -3428,6 +4959,7 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                                 ga->ApertureMdl == NULL ||
                                 ga->ApertureVa != gaVa) {
                                 (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                                (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 41);
                                 break;   /* leave the rest of the frame stale */
                             }
                         }
@@ -3441,9 +4973,20 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                            by the panel pitch, src by the SOURCE's pitch. When the
                            two are equal this is byte-for-byte what the old flat
                            copy did, so a UMD that reports no pitch is unaffected. */
-                        RtlCopyMemory((PUCHAR)a->ScanoutVa + (SIZE_T)r * dstPitch,
-                                      srcVa + (SIZE_T)r * effPitch,
-                                      rowBytes);
+                        {
+                            PUCHAR srcRow =
+                                WinMaliSrcRow_(srcVa, maxRows, effPitch, r);
+                            if (srcRow == NULL) {
+                                /* Unreachable while r < endRow <= maxRows, and
+                                   that is the point: if a future edit breaks the
+                                   invariant we stop and COUNT it instead of
+                                   reading an unmapped VA. */
+                                (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
+                                break;
+                            }
+                            RtlCopyMemory((PUCHAR)a->ScanoutVa + (SIZE_T)r * dstPitch,
+                                          srcRow, rowBytes);
+                        }
                         doneRows++;
                         done += dstPitch;
                     }
@@ -3477,6 +5020,47 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                            lifetime is EXACTLY one frame, by construction. */
                         (VOID)InterlockedExchange(&g_WinMaliUvLatchBo, 0);
                         (VOID)InterlockedIncrement(&g_WinMaliStatSweeps);
+                        (VOID)InterlockedExchange(&g_WinMaliStatWorkerStage, 5);
+
+                        /* ★★★ COMPOSITE THE TASKBAR STRIP OVER THE FINISHED FRAME.
+                         *
+                         * The desktop copy above is ONE candidate. dwm publishes
+                         * the taskbar as a SEPARATE full-width partial-height
+                         * layer (measured: bo=344, 414 pages @ pitch 11776 =
+                         * exactly 2944x144), which AcquireBest correctly rejects
+                         * as "not the screen" - and which we then threw away.
+                         * That is the whole reason the panel has never shown a
+                         * taskbar: not a missing surface, not a bad selection,
+                         * we simply never drew the pixels we already had.
+                         *
+                         * Done HERE, at sweep completion, so it lands on top of a
+                         * COMPLETE frame rather than being overwritten by the
+                         * remaining slices of a partial one. Bottom-anchored:
+                         * that is where the strip belongs on a default Windows
+                         * desktop, and a wrong guess is visible immediately
+                         * rather than silent.
+                         *
+                         * ⚠ If this ever shows the strip in the wrong place, the
+                         * fix is to carry the layer's Y offset through the 0x93
+                         * publish - NOT to widen the guess. */
+                        {
+                            ULONG stripBo = 0, stripRows = 0;
+                            PVOID stripVa = WinMaliUvSrcAcquireStrip(
+                                                WINMALI_FB_STRIDE, WINMALI_FB_HEIGHT,
+                                                &stripBo, &stripRows);
+                            if (stripVa != NULL && stripRows != 0 &&
+                                stripRows < WINMALI_FB_HEIGHT && a->ScanoutVa != NULL) {
+                                ULONG dstTop = WINMALI_FB_HEIGHT - stripRows;
+                                RtlCopyMemory(
+                                    (PUCHAR)a->ScanoutVa + (SIZE_T)dstTop * WINMALI_FB_STRIDE,
+                                    stripVa,
+                                    (SIZE_T)stripRows * WINMALI_FB_STRIDE);
+                                (VOID)InterlockedIncrement(&g_WinMaliStatStripBlits);
+                            }
+                            if (stripBo != 0) {
+                                WinMaliUvSrcEndUse(stripBo);
+                            }
+                        }
                     }
                     /* ⛔★★★★★ SHIP A THUMBNAIL OF WHAT WE ACTUALLY SCAN OUT.
                      *
@@ -3509,14 +5093,21 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             }
                             if (s_thumb != NULL) {
                                 ULONG tx, ty;
+                                /* The row bound was already honoured; the COLUMN
+                                   bound was not - tx*STEP*4 reaches 11,747 B,
+                                   past the end of any row whose pitch is under
+                                   the panel's. */
+                                ULONG thumbCols = srcRowBytes / 4u;
                                 for (ty = 0; ty < TH; ++ty) {
                                     ULONG sy = ty * STEP;
-                                    if (sy >= maxRows) break;
+                                    const UCHAR *srow = (const UCHAR *)
+                                        WinMaliSrcRow_(srcVa, maxRows, effPitch, sy);
+                                    if (srow == NULL) break;
                                     for (tx = 0; tx < TW; ++tx) {
                                         ULONG sx = tx * STEP;
-                                        const UCHAR* px = (const UCHAR*)
-                                            (srcVa + (SIZE_T)sy * effPitch +
-                                             (SIZE_T)sx * 4u);
+                                        const UCHAR* px;
+                                        if (sx >= thumbCols) break;
+                                        px = srow + (SIZE_T)sx * 4u;
                                         PUCHAR o = s_thumb + ((SIZE_T)ty * TW + tx) * 3u;
                                         o[0] = px[0]; o[1] = px[1]; o[2] = px[2];
                                     }
@@ -3757,40 +5348,158 @@ WinMaliPresentInit(_Inout_ PWINMALI_ADAPTER Adapter)
                 return;
             }
         } else {
-            pa.QuadPart = (LONGLONG)WINMALI_FB_SCANOUT_PA;
-            mapBytes    = frameBytes;
+            /* ⛔⛔ ALIGN DOWN. WINMALI_FB_SCANOUT_PA is 0xFD619400 - 0x400 INTO a
+             * page - and MmMapIoSpaceEx REFUSES A WRITE-COMBINED MAPPING OF AN
+             * UNALIGNED PHYSICAL BASE while happily granting the same range
+             * uncached. That one detail is why every frame this project has ever
+             * painted went through the ~1000x-slower uncached path: ~20 s per
+             * 21 MB frame instead of ~30 ms, which is why the copy had to be
+             * sliced across ~11 worker wakes and why the panel shows a TORN
+             * frame (photographed - new content above the slice boundary, the
+             * previous frame below).
+             *
+             * MEASURED (StatWcProbe=0x7): one page at the region base, one page
+             * at the PAGE-ALIGNED scanout base, and MmMapIoSpace(MmWriteCombined)
+             * ALL succeed. Write-combining was available the whole time; only
+             * the alignment of this one request was wrong.
+             *
+             * So map from the page-aligned base and carry the remainder as an
+             * offset - exactly what the firmware-resource branch above already
+             * does. */
+            ULONGLONG rawPa = (ULONGLONG)WINMALI_FB_SCANOUT_PA;
+            ULONGLONG alnPa = rawPa & ~((ULONGLONG)PAGE_SIZE - 1);
+            scanoutOff  = (SIZE_T)(rawPa - alnPa);
+            pa.QuadPart = (LONGLONG)alnPa;
+            /* ⛔⛔ REVERTED TO ROUND-UP - THIS IS THE KNOWN-GOOD MAPPING.
+             *
+             * 1.1.9.68 booted with round-UP. 1.1.9.69 changed it to round-DOWN
+             * (to obtain a write-combined mapping that does not overrun the end
+             * of the framebuffer region) and the box HUNG THE INSTANT THE DRIVER
+             * LOADED - three times, each costing a USB-spare recovery.
+             *
+             * I found and fixed one genuine overrun that change created (the row
+             * loop bounded on WINMALI_FB_HEIGHT rather than on the mapped
+             * extent) and the hang SURVIVED it. So round-DOWN breaks something
+             * else I have not identified, and the honest move is to go back to
+             * the mapping that demonstrably boots rather than keep guessing on a
+             * machine that costs a physical recovery per attempt.
+             *
+             * Write-combining is still worth having - StatWcMaxKb proved a
+             * full-frame WC map SUCCEEDS at the aligned base - but it must be
+             * pursued without changing the extent the rest of the driver assumes. */
+            mapBytes    = (SIZE_T)(((scanoutOff + frameBytes) + (PAGE_SIZE - 1)) &
+                                   ~((SIZE_T)PAGE_SIZE - 1));
+        }
+        /* ⛔ THE WC CAPABILITY PROBE HAS BEEN REMOVED - IT ANSWERED ITS QUESTION.
+         *
+         * It established the fact we needed: StatWcMaxKb reached 21160 KB, i.e.
+         * a WRITE-COMBINED mapping of the FULL 21,667,840-byte frame succeeds at
+         * the page-aligned base. Keeping it would cost ten map/unmap cycles of
+         * up to 21 MB inside StartDevice on every boot - thousands of system
+         * PTEs churned for an answer we already have, on a path that has just
+         * hung the machine twice. An instrument that has reported should be
+         * taken out of the aircraft.
+         *
+         * ⛔ If it is ever reinstated: do NOT add its value names to the worker's
+         * reserve list. The worker reserves by WRITING ZERO and starts AFTER
+         * PresentInit, so reserving them silently erased the results and produced
+         * a convincing 0x0 that read as "write-combining is impossible here". The
+         * give-away was StatFbPhysLo=0 with the page-aligned bit CLEAR: zero IS
+         * page-aligned, so that result could not have come from this code. */
+        if (g_WinMaliRegPath.Length != 0) {
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatFbPhysLo",
+                                          (ULONG)((ULONGLONG)pa.QuadPart & 0xFFFFFFFFu));
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatFbMapBytes",
+                                          (ULONG)mapBytes);
         }
 
-        /* Write-combined: this is a framebuffer, and a fully-cached mapping
-           would leave the panel showing stale lines until something flushed. */
-        Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes,
-                                               PAGE_READWRITE | PAGE_WRITECOMBINE);
+
+        /* ⛔⛔ WRITE-COMBINED OR THE MACHINE IS UNUSABLE - SO TRY MORE THAN ONCE.
+         *
+         * MEASURED 2026-08-22: StatScanoutWc = 0, i.e. every frame this project
+         * has ever painted went through the UNCACHED fallback. That is not a
+         * degraded mode, it is the cause of a whole cluster of symptoms:
+         * uncached MMIO writes on ARM64 run at a few MB/s, so 21,667,840 bytes
+         * takes ~20 s. It is why the copy had to be sliced into 2 MB bursts at
+         * all, why a frame is spread over ~11 worker wakes, and therefore why
+         * the panel shows a TORN frame - new content above the slice boundary,
+         * the previous frame below (photographed).
+         *
+         * One refused attempt was being treated as the final answer. Ladder it:
+         *
+         *  1. MmMapIoSpaceEx(PAGE_WRITECOMBINE) - what we always tried.
+         *  2. MmMapIoSpace(MmWriteCombined) - the OLDER api. It takes a
+         *     MEMORY_CACHING_TYPE rather than PTE protection bits and goes down
+         *     a different path in the memory manager, so it can succeed where
+         *     the Ex form is refused. Costs one call to find out.
+         *  3. Uncached, as before - but now it is the THIRD answer, not the
+         *     first, and StatScanoutWc records WHICH rung won so this can never
+         *     again be invisible.
+         */
+        if (g_WinMaliScanoutWcOff == 0) {
+            Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes,
+                                                   PAGE_READWRITE | PAGE_WRITECOMBINE);
+        }
         if (Adapter->ScanoutMapVa != NULL) {
             (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 1);
         } else {
-            /* ⛔★★★★★ THE UNCACHED FALLBACK IS A ~1000x SLOWDOWN, AND IT WAS
-             * SILENT.
-             *
-             * Uncached MMIO writes on ARM64 run at a few MB/s, so a 21,667,840-byte
-             * frame takes on the order of TWENTY SECONDS instead of ~30 ms. That
-             * is not a slow frame, it is a wedged machine:
-             *   - the panel visibly paints TOP-DOWN over ~20 s (user-observed;
-             *     being able to SEE it paint at all is itself proof the mapping
-             *     is uncached - write-combined would land in well under a second)
-             *   - teardown does KeWaitForSingleObject(PresentWorkerThread), so
-             *     Disable-PnpDevice BLOCKS for as long as the copy runs, PnP
-             *     times out and the box hangs. Two of three hangs on 2026-08-17
-             *     happened during exactly that call, inside deploy_hot.
-             *
-             * Which attribute won was never recorded, so a catastrophic
-             * performance cliff looked identical to a healthy mapping. Count it. */
-            (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 0);
-            Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes, PAGE_READWRITE);
-            WINMALI_WARN("Present: WRITE-COMBINED map REFUSED for 0x%llx (%Iu bytes) - "
-                         "falling back to UNCACHED. Expect ~20 s per frame and a "
-                         "teardown that blocks that long.",
-                         (ULONGLONG)pa.QuadPart, mapBytes);
+            if (g_WinMaliScanoutWcOff == 0) {
+                Adapter->ScanoutMapVa = MmMapIoSpace(pa, mapBytes, MmWriteCombined);
+            }
+            if (Adapter->ScanoutMapVa != NULL) {
+                (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 2);
+                WINMALI_WARN("Present: MmMapIoSpaceEx(WRITECOMBINE) refused but "
+                             "MmMapIoSpace(MmWriteCombined) SUCCEEDED for 0x%llx "
+                             "(%Iu bytes) - full-speed scanout after all",
+                             (ULONGLONG)pa.QuadPart, mapBytes);
+            }
         }
+        if (Adapter->ScanoutMapVa == NULL) {
+            /* ⛔⛔ THE "UNCACHED FALLBACK" MAY NEVER HAVE BEEN UNCACHED.
+             *
+             * PAGE_NOCACHE and PAGE_WRITECOMBINE are OPTIONAL MODIFIERS to
+             * MmMapIoSpaceEx's protection argument. Bare PAGE_READWRITE is
+             * therefore the DEFAULT (cached) request - not the uncached one the
+             * old comment here asserted for months. So the last rung was
+             * mislabelled, and the "~20 s per frame" figure attached to it was
+             * arithmetic from an assumed write rate, never a measurement.
+             *
+             * That matters far beyond speed: if this mapping is CACHED then the
+             * driver has never cleaned the D-cache after a blit, and the DSI has
+             * been scanning out STALE DRAM. "We blit and the panel does not
+             * change" is better explained by that than by slowness.
+             *
+             * So: try NOCACHE explicitly first, keep bare PAGE_READWRITE as a
+             * distinct LAST rung, and record which one won - then read the PTE
+             * attribute back with MmGetCacheAttribute rather than believing any
+             * of these labels. */
+            /* ⛔⛔ DO NOT REQUEST PAGE_NOCACHE HERE. I added it as a rung and it
+             * HUNG THE BOX INSTANTLY, twice. A genuinely uncached 21 MB frame
+             * really does take ~20 s to write, and the worker holds the CPU for
+             * all of it. The historical bare-PAGE_READWRITE mapping never hung -
+             * which is itself the evidence that it was CACHED, not uncached, and
+             * that the "~1000x uncached" story attached to it for months was
+             * wrong. Keep the mapping that works and record what it actually is. */
+            Adapter->ScanoutMapVa = MmMapIoSpaceEx(pa, mapBytes, PAGE_READWRITE);
+            (VOID)InterlockedExchange(&g_WinMaliScanoutWc, 4);
+            WINMALI_WARN("Present: write-combined REFUSED for 0x%llx (%Iu bytes) - "
+                         "fell back to rung %ld (3=NOCACHE, 4=default/cached)",
+                         (ULONGLONG)pa.QuadPart, mapBytes, g_WinMaliScanoutWc);
+        }
+        /* ⛔⛔ MmGetCacheAttribute REMOVED - IT HUNG THE MACHINE.
+         *
+         * Added in 1.1.9.70 purely as a diagnostic ("what attribute did we
+         * actually get?"). It is documented for SYSTEM MEMORY, and this is a
+         * DEVICE physical address from the framebuffer resource - not RAM, and
+         * not necessarily described in the OS memory map at all. Calling it here
+         * hung the box on driver load in .70, .72, .73 and .74.
+         *
+         * ⛔ THIS WAS THE SECOND OF TWO SEPARATE HANGS I INTRODUCED, and it is
+         * why reverting the first one (the round-down mapping, 1.1.9.69) did not
+         * bring the machine back: I fixed one cause and left the other in place,
+         * then reported the revert as if it should have worked. Nothing in the
+         * driver reads the result - it was information for me, and it cost four
+         * USB-spare recoveries. */
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                 L"StatScanoutWc", (ULONG)g_WinMaliScanoutWc);
         if (Adapter->ScanoutMapVa == NULL) {
@@ -3801,7 +5510,11 @@ WinMaliPresentInit(_Inout_ PWINMALI_ADAPTER Adapter)
         }
         Adapter->ScanoutMapBytes = mapBytes;
         Adapter->ScanoutVa       = (PUCHAR)Adapter->ScanoutMapVa + scanoutOff;
-        Adapter->ScanoutBytes    = frameBytes;
+        /* Back to the known-good extent: the mapping covers a whole frame again,
+           so ScanoutBytes is simply frameBytes as it was before 1.1.9.69. The
+           destination row-bound added alongside stays - a no-op while these are
+           equal, and a guard if they ever diverge again. */
+        Adapter->ScanoutBytes = frameBytes;
         DbgPrint("[WinMali]    PRESENT: framebuffer resource pa=0x%llx map=%Iu va=%p "
                  "scanout=+0x%Ix\n",
                  (ULONGLONG)pa.QuadPart, mapBytes, Adapter->ScanoutMapVa, scanoutOff);
@@ -3928,6 +5641,10 @@ WinMaliPresentTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
        ScanoutBytes is one frame - passing those to MmUnmapIoSpace would
        free a different range than we mapped. */
     if (Adapter->ScanoutMapVa != NULL) {
+        /* ⛔ THE PUSH RUNS ON dwm's THREAD, NOT OURS. Disarm it and WAIT for any
+           in-flight copy to finish before the mapping it writes into disappears,
+           or teardown races a live RtlCopyMemory into freed PTEs. */
+        WinMaliUvPushDrain();
         MmUnmapIoSpace(Adapter->ScanoutMapVa, Adapter->ScanoutMapBytes);
         Adapter->ScanoutMapVa = NULL;
         Adapter->ScanoutMapBytes = 0;
@@ -3964,9 +5681,30 @@ WinMaliVsyncInit(_Inout_ PWINMALI_ADAPTER Adapter)
        which it will not do without vblank. Starting here breaks that circle at
        adapter init rather than waiting for a trigger that never comes. */
     if (WinMaliVsyncFreeRunEnabled(Adapter)) {
-        WinMaliVsyncSetEnabled(Adapter, TRUE);
-        DbgPrint("[WinMali]    VSYNC: free-running heartbeat started at init "
-                 "(VsyncFreeRun=1)\n");
+        ULONG dodFree = 0;
+
+        if (g_WinMaliDodMode != 0) {
+            /* ⛔ DEFAULT 1, NOT 0. 1.1.12.7 defaulted this OFF and that is what
+               starves dxgk's DOD vsync watchdog. Set DodVsyncFreeRun=0 to get
+               the old (fatal) behaviour back for an A/B without a rebuild. */
+            (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"DodVsyncFreeRun",
+                                         1, &dodFree);
+        }
+        if (g_WinMaliDodMode != 0 && dodFree == 0) {
+            /* â›” A DOD HAS NO CRTC AND NO FLIP TO RETIRE. CrtcVsync carries a
+               PhysicalAddress (the displaying buffer); DisplayOnlyVsync carries
+               only VidPnTargetId. Firing CRTC_VSYNC from a DPC during adapter
+               start, for a target dxgk has not registered yet, is a claim about
+               hardware we do not have. Let ControlInterrupt arm it if dxgk ever
+               actually asks. */
+            DbgPrint("[WinMali]    VSYNC: free-running heartbeat SUPPRESSED "
+                     "(DodVsyncFreeRun=0) - dxgk's DOD vsync watchdog WILL "
+                     "fail this adapter\n");
+        } else {
+            WinMaliVsyncSetEnabled(Adapter, TRUE);
+            DbgPrint("[WinMali]    VSYNC: free-running heartbeat started at init "
+                     "(VsyncFreeRun=1)\n");
+        }
     }
 }
 
@@ -4072,6 +5810,11 @@ WinMaliKmdQueryChildRelations(
     WM_TRACE_ENTER("QueryChildRelations");
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
 
+    /* Stage 6 = the caps negotiation was ACCEPTED. dxgk only enumerates
+       children once it is satisfied with the adapter, so reaching here means
+       PHYSICALADAPTERCAPS and friends are behind us. */
+    if (g_WinMaliDodMode != 0 && g_WinMaliDodStage < 6) { WinMaliDodStage(6); }
+
     if (ChildRelations == NULL || ChildRelationsSize == 0) {
         WM_TRACE_EXIT_S("QueryChildRelations", STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
@@ -4126,6 +5869,14 @@ WinMaliKmdQueryChildRelations(
     ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
     ChildRelations[0].AcpiUid  = 0;
     ChildRelations[0].ChildUid = WINMALI_CHILD_UID;
+
+    /* HpdMode is ORTHOGONAL to the ChildCfg variant: dxgk only honours a
+       connection change on an INTERRUPTIBLE child, and the variant we ship
+       (cfg 7 = DP_EMBEDDED) sets AlwaysConnected. Applied before the switch so
+       any variant can be combined with it. */
+    if (g_WinMaliHpdMode != 0) {
+        ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
+    }
 
     switch (g_WinMaliChildCfg) {
     case 1:
@@ -4195,6 +5946,11 @@ WinMaliKmdQueryChildRelations(
              (unsigned)ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology,
              (unsigned)ChildRelations[0].ChildCapabilities.HpdAwareness,
              (unsigned)ChildRelations[0].ChildUid, slots);
+    /* Stage 7 = we came back OUT of QueryChildRelations with SUCCESS. Stage 6
+       is set on ENTRY, so without this "we hung inside it" and "we returned
+       cleanly and dxgk stopped anyway" are indistinguishable - and they need
+       opposite fixes. */
+    if (g_WinMaliDodMode != 0 && g_WinMaliDodStage < 7) { WinMaliDodStage(7); }
     WM_TRACE_EXIT_S("QueryChildRelations", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
@@ -4206,6 +5962,7 @@ WinMaliKmdQueryChildStatus(
     _In_    BOOLEAN             NonDestructiveOnly)
 {
     WM_TRACE_ENTER("QueryChildStatus");
+    WinMaliDodDdi(WINMALI_DOD_DDI_CHILDSTATUS);
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
 
@@ -4250,6 +6007,7 @@ WinMaliKmdQueryDeviceDescriptor(
     NTSTATUS status;
 
     WM_TRACE_ENTER("QueryDeviceDescriptor");
+    WinMaliDodDdi(WINMALI_DOD_DDI_DEVICEDESC);
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
 
     /*
@@ -4271,9 +6029,20 @@ WinMaliKmdQueryDeviceDescriptor(
         return STATUS_MONITOR_NO_DESCRIPTOR;
     }
 
-    status = WinMaliEdidCopy(DeviceDescriptor->DescriptorOffset,
-                             DeviceDescriptor->DescriptorLength,
-                             DeviceDescriptor->DescriptorBuffer);
+    {
+        /* ⛔ DescriptorLength is _Inout_ (dispmprt.h:296-300): the caller says how
+           much it wants, the driver reports how much it SUPPLIED. We used to copy
+           fewer bytes than asked and leave the count untouched, so dxgk parsed
+           stale trailing bytes as if they were EDID. */
+        ULONG supplied = 0;
+        status = WinMaliEdidCopy(DeviceDescriptor->DescriptorOffset,
+                                 DeviceDescriptor->DescriptorLength,
+                                 DeviceDescriptor->DescriptorBuffer,
+                                 &supplied);
+        if (NT_SUCCESS(status)) {
+            DeviceDescriptor->DescriptorLength = supplied;
+        }
+    }
     DbgPrint("[WinMali]    QueryDeviceDescriptor: uid=%lu off=%lu len=%lu -> 0x%08x\n",
              ChildUid, DeviceDescriptor->DescriptorOffset,
              DeviceDescriptor->DescriptorLength, (unsigned)status);
@@ -4291,6 +6060,8 @@ WinMaliKmdSetPowerState(
     PWINMALI_ADAPTER a = (PWINMALI_ADAPTER)MiniportDeviceContext;
 
     WM_TRACE_ENTER("SetPowerState");
+    WinMaliDodDdi(WINMALI_DOD_DDI_SETPOWERSTATE);
+    WinMaliVpLogOnly_(WINMALI_VPC_POWER);
     UNREFERENCED_PARAMETER(DeviceUid);
 
     /* ⛔★★★★★★ STOP THE PRESENT WORKER ON SHUTDOWN. THIS WAS A PURE STUB.
@@ -4346,6 +6117,7 @@ WinMaliKmdNotifyAcpiEvent(
 VOID APIENTRY
 WinMaliKmdResetDevice(_In_ CONST PVOID MiniportDeviceContext)
 {
+    WinMaliDodDdi(WINMALI_DOD_DDI_RESETDEVICE);
     WM_TRACE_ENTER("ResetDevice");
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     WM_TRACE_EXIT("ResetDevice");

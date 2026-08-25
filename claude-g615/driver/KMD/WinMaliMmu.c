@@ -197,6 +197,10 @@ WinMaliMmuTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
         Adapter->AsBindings[i].Bound    = FALSE;
         Adapter->AsBindings[i].hContext = NULL;
         Adapter->AsBindings[i].RootPtPa = 0;
+        /* ⛔ CLEAR THE BACK-POINTER TOO. Leaving VmOwner set on a released slot
+           leaves a raw pointer that can outlive its VM, and the evictor reads
+           LastUseStamp through exactly that pointer. */
+        Adapter->AsBindings[i].VmOwner  = NULL;
         Adapter->AsSlotInUseMask &= ~(1u << i);
         releasedMask |= (1u << i);
     }
@@ -730,6 +734,7 @@ WinMaliMmuInitAsAllocator(_Inout_ PWINMALI_ADAPTER Adapter)
     }
 
     KeInitializeSpinLock(&Adapter->AsSlotLock);
+    KeInitializeMutex(&Adapter->AsSchedLock, 0);
     Adapter->AsSlotPresentMask = (Adapter->Hw.AsPresent != 0)
                                      ? Adapter->Hw.AsPresent
                                      : 0xFFu;
@@ -875,6 +880,13 @@ WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
     if (Adapter == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    /* ⛔ A NULL hContext IS NOT A CONTEXT. VM-leased slots are deliberately
+       tagged hContext == NULL (WinMaliMmuVmPickAs_), so a NULL here would match
+       the first VM-leased slot and release a live VM's address space out from
+       under it. */
+    if (hContext == NULL) {
+        return STATUS_SUCCESS;
+    }
 
     KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
     as = WinMaliMmuFindAsForContext_(Adapter, hContext);
@@ -886,6 +898,7 @@ WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
     Adapter->AsBindings[as].Bound    = FALSE;
     Adapter->AsBindings[as].hContext = NULL;
     Adapter->AsBindings[as].RootPtPa = 0;
+    Adapter->AsBindings[as].VmOwner  = NULL;   /* never leave a stale back-pointer */
     Adapter->AsSlotInUseMask &= ~(1u << as);
     KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
 
@@ -1038,6 +1051,7 @@ WinMaliMmuVmReleaseAs_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG As)
     Adapter->AsBindings[As].Bound    = FALSE;
     Adapter->AsBindings[As].hContext = NULL;
     Adapter->AsBindings[As].RootPtPa = 0;
+    Adapter->AsBindings[As].VmOwner  = NULL;
     Adapter->AsSlotInUseMask &= ~(1u << As);
     KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
 }
@@ -1067,12 +1081,19 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
     VmPt->RootPa = root->Pa;
     InsertTailList(&VmPt->AllocatedPages, &root->Link);
 
+    /* ★ NO SLOT IS NOT A FAILURE. This used to return
+       STATUS_INSUFFICIENT_RESOURCES, which propagated out as WMERR_ENOMEM ->
+       E_OUTOFMEMORY from OpenAdapter -> the D3D11 runtime giving up with
+       "Failed to find DDI to drive requested feature levels". With 6 usable
+       slots and 6 shell processes, that refused every later client a GPU for
+       the whole boot. Leave the VM unbound; the submit path binds it. */
     as = WinMaliMmuVmPickAs_(Adapter);
     if (as >= WINMALI_AS_SLOT_MAX) {
-        WinMaliMmuPtFreePage_(CONTAINING_RECORD(
-            RemoveHeadList(&VmPt->AllocatedPages), WINMALI_VM_PT_PAGE, Link));
-        VmPt->RootVa = NULL;
-        return STATUS_INSUFFICIENT_RESOURCES;
+        (VOID)InterlockedIncrement(&g_WinMaliStatVmDeferredBind);
+        VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
+        WINMALI_TRACE("VmInit: no free AS, deferring bind (root_pa=0x%llx)",
+                      (ULONGLONG)VmPt->RootPa.QuadPart);
+        return STATUS_SUCCESS;
     }
     VmPt->AsSlot = as;
 
@@ -1094,12 +1115,55 @@ WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter, _Out_ PWINMALI_VM_PT VmPt)
         KIRQL irql;
         KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
         Adapter->AsBindings[as].RootPtPa = (UINT64)VmPt->RootPa.QuadPart;
+        Adapter->AsBindings[as].VmOwner  = VmPt;
         KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
     }
 
     WINMALI_TRACE("VmInit: AS%u root_pa=0x%llx",
                   as, (ULONGLONG)VmPt->RootPa.QuadPart);
     return STATUS_SUCCESS;
+}
+
+/*
+ * Erase every trace of VmPt from the AS binding table, keyed on the POINTER.
+ *
+ * ⛔ THIS IS THE ONLY SAFE WAY TO UNBIND. Every other approach trusts
+ * VmPt->AsSlot, which is read outside AsSlotLock and can be stale the instant
+ * an evictor touches it: teardown would then release a slot that now belongs to
+ * a DIFFERENT live VM (clearing its VmOwner and its in-use bit while its
+ * Pt.AsSlot still names the slot), leaving two VMs on one AS - one of them
+ * running its command stream against another process's page table. Keying on
+ * the pointer cannot get that wrong, and it also catches slots left behind by
+ * paths that never cleared VmOwner at all.
+ *
+ * Returns the slot that was released, or WINMALI_AS_SLOT_MAX if none. The
+ * caller unprograms the MMU for that slot after the lock is dropped.
+ */
+static ULONG
+WinMaliMmuVmForgetOwner_(_Inout_ PWINMALI_ADAPTER Adapter,
+                         _In_ PWINMALI_VM_PT VmPt)
+{
+    KIRQL irql;
+    ULONG i, found = WINMALI_AS_SLOT_MAX;
+
+    if (Adapter == NULL || VmPt == NULL) {
+        return WINMALI_AS_SLOT_MAX;
+    }
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        if (Adapter->AsBindings[i].VmOwner != VmPt) {
+            continue;
+        }
+        Adapter->AsBindings[i].VmOwner  = NULL;
+        Adapter->AsBindings[i].RootPtPa = 0;
+        Adapter->AsBindings[i].Bound    = FALSE;
+        Adapter->AsBindings[i].hContext = NULL;
+        Adapter->AsSlotInUseMask &= ~(1u << i);
+        found = i;
+    }
+    VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+    return found;
 }
 
 VOID
@@ -1110,12 +1174,15 @@ WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM_PT Vm
     if (VmPt == NULL) {
         return;
     }
-    if (VmPt->AsSlot < WINMALI_AS_SLOT_MAX && Adapter != NULL &&
-        Adapter->GpuRegsMapped) {
-        (VOID)WinMaliMmuAsDisable(Adapter, VmPt->AsSlot);
-    }
-    if (Adapter != NULL && VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
-        WinMaliMmuVmReleaseAs_(Adapter, VmPt->AsSlot);
+    {
+        /* Find the slot by POINTER, not by the unsynchronised VmPt->AsSlot -
+           see WinMaliMmuVmForgetOwner_. It clears the binding under the lock
+           and hands back the slot so we can unprogram the MMU after. */
+        ULONG slot = WinMaliMmuVmForgetOwner_(Adapter, VmPt);
+        if (slot < WINMALI_AS_SLOT_MAX && Adapter != NULL &&
+            Adapter->GpuRegsMapped) {
+            (VOID)WinMaliMmuAsDisable(Adapter, slot);
+        }
     }
 
     while (!IsListEmpty(&VmPt->AllocatedPages)) {
@@ -1125,6 +1192,163 @@ WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM_PT Vm
     VmPt->RootVa = NULL;
     VmPt->RootPa.QuadPart = 0;
     VmPt->AsSlot = WINMALI_AS_SLOT_MAX;
+}
+
+/* ---------------------------------------------------------------------------
+   AS-slot scheduling.
+
+   Mali exposes 8 address spaces; AS0 is the CSF MCU and AS1 is the kernel
+   bring-up AS, leaving 6 for clients. Binding one per client for that client's
+   whole lifetime capped the GPU at 6 concurrent clients per boot - and the
+   Windows shell alone (dwm, explorer, ShellHost, StartMenuExperienceHost,
+   PhoneExperienceHost, CrossDeviceResume) uses all 6. Everything launched
+   afterwards was refused a D3D device until reboot.
+
+   So an AS slot is a scheduled resource, not property: a VM holds one only
+   while it is running work. This mirrors kbase's kbase_ctx_sched.
+
+   Eviction is safe here because the driver programs a single CSG slot bound to
+   one AS at a time, so at most one VM can have work in flight - the caller
+   passes it as ProtectAs. Unbinding does not destroy anything: the page table
+   is untouched and a later rebind reprograms the same root PA.
+   --------------------------------------------------------------------------- */
+
+static ULONG64 g_WinMaliAsUseStamp = 0;
+
+/* Find the least-recently-used VM-owned slot, excluding ProtectAs.
+   Caller holds AsSlotLock. */
+static ULONG
+WinMaliMmuPickEvictAs_(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG ProtectAs,
+                       _In_ ULONG CsgAs)
+{
+    ULONG   i, victim = WINMALI_AS_SLOT_MAX;
+    ULONG64 oldest = ~0ull;
+
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        PWINMALI_VM_PT owner = Adapter->AsBindings[i].VmOwner;
+        if (owner == NULL || i == ProtectAs || i == CsgAs) {
+            /* NULL owner = MCU / bringup / dxgk-context slot, never a victim.
+               CsgAs = the AS the MCU firmware is currently bound to; the GPU
+               may still page-walk through it even with nothing of ours in
+               flight, so it is off limits regardless of how idle it looks. */
+            continue;
+        }
+        if (owner->LastUseStamp <= oldest) {
+            oldest = owner->LastUseStamp;
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+NTSTATUS
+WinMaliMmuVmEnsureAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                     _Inout_ PWINMALI_VM_PT VmPt,
+                     _In_ ULONG ProtectAs)
+{
+    KIRQL          irql;
+    ULONG          as;
+    ULONG          victim = WINMALI_AS_SLOT_MAX;
+    ULONG          csgAs;
+    UINT64         transcfg = 0, memattr = 0;
+    NTSTATUS       status;
+
+    if (Adapter == NULL || VmPt == NULL || !Adapter->GpuRegsMapped) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (VmPt->RootVa == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    csgAs = WinMaliCsfCurrentAs(Adapter);
+
+    /* Already bound: just refresh the LRU stamp. */
+    if (VmPt->AsSlot < WINMALI_AS_SLOT_MAX) {
+        VmPt->LastUseStamp = (ULONG64)InterlockedIncrement64(
+                                 (LONG64 volatile *)&g_WinMaliAsUseStamp);
+        return STATUS_SUCCESS;
+    }
+
+    as = WinMaliMmuVmPickAs_(Adapter);
+    if (as >= WINMALI_AS_SLOT_MAX) {
+        /* Pool full - take the slot from the idlest VM.
+         *
+         * ⛔ EVERY WRITE THROUGH victimVm HAPPENS UNDER AsSlotLock, IN THE SAME
+         * CRITICAL SECTION THAT CLEARS VmOwner. The first version snapshotted
+         * the pointer, dropped the lock, ran a multi-hundred-millisecond MMIO
+         * poll, and only then wrote victimVm->AsSlot - a use-after-free WRITE
+         * into NonPagedPoolNx if the victim's process exited during the poll
+         * (DestroyDevice -> VmRundownOwner -> ExFreePoolWithTag). Teardown
+         * clears VmOwner under this same lock BEFORE it frees the VM, so a
+         * pointer read here while holding the lock is guaranteed live - but
+         * only for as long as the lock is held.
+         *
+         * AsDisable moves AFTER the critical section deliberately: the caller
+         * holds the CSF scheduler lock, so no submit can be in flight and the
+         * victim cannot be running. Marking it unbound before the MMU is
+         * actually unprogrammed is therefore unobservable. */
+        KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+        victim = WinMaliMmuPickEvictAs_(Adapter, ProtectAs, csgAs);
+        if (victim < WINMALI_AS_SLOT_MAX) {
+            PWINMALI_VM_PT v = Adapter->AsBindings[victim].VmOwner;
+            if (v != NULL) {
+                v->AsSlot = WINMALI_AS_SLOT_MAX;   /* under the lock */
+            }
+            Adapter->AsBindings[victim].VmOwner  = NULL;
+            Adapter->AsBindings[victim].RootPtPa = 0;
+            /* Claim it for ourselves in the same critical section so no other
+               thread can pick the same victim and race us for the slot. */
+            Adapter->AsSlotInUseMask |= (1u << victim);
+            Adapter->AsBindings[victim].Bound    = TRUE;
+            Adapter->AsBindings[victim].hContext = NULL;
+        }
+        KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
+        if (victim >= WINMALI_AS_SLOT_MAX) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatAsEnsureFail);
+            WINMALI_WARN("EnsureAs: pool full and no evictable slot "
+                         "(protect=%u csg=%u)", ProtectAs, csgAs);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        /* The victim's page table is NOT freed - it rebinds on its next
+           submit, which is the whole point of scheduling the slot. */
+        (VOID)WinMaliMmuAsDisable(Adapter, victim);
+        (VOID)InterlockedIncrement(&g_WinMaliStatAsEvictions);
+        as = victim;
+    }
+
+    WinMaliMmuGetDefaultAsParams(Adapter, &transcfg, &memattr);
+    status = WinMaliMmuAsEnable(Adapter, as,
+                                (UINT64)VmPt->RootPa.QuadPart,
+                                transcfg, memattr);
+    if (!NT_SUCCESS(status)) {
+        WinMaliMmuVmReleaseAs_(Adapter, as);
+        (VOID)InterlockedIncrement(&g_WinMaliStatAsEnsureFail);
+        WINMALI_WARN("EnsureAs: AsEnable AS%u failed 0x%08x", as, status);
+        return status;
+    }
+
+    /* ⛔ PUBLISH BOTH DIRECTIONS OF THE BINDING ATOMICALLY. The binding is a
+       PAIR - AsBindings[as].VmOwner points at the VM, and VmPt->AsSlot names
+       the slot - and teardown decides whether to release the slot by reading
+       VmPt->AsSlot. Setting VmOwner under the lock and VmPt->AsSlot after it
+       left a window in which a concurrent teardown saw AsSlot still == MAX,
+       skipped WinMaliMmuVmReleaseAs_ entirely, and freed the VM with its
+       back-pointer still installed in AsBindings - the next evictor then read
+       LastUseStamp out of freed pool. Same use-after-free as before, entered
+       through a different door. */
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    Adapter->AsBindings[as].RootPtPa = (UINT64)VmPt->RootPa.QuadPart;
+    Adapter->AsBindings[as].VmOwner  = VmPt;
+    VmPt->AsSlot = as;
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
+    VmPt->LastUseStamp = (ULONG64)InterlockedIncrement64(
+                             (LONG64 volatile *)&g_WinMaliAsUseStamp);
+    (VOID)InterlockedIncrement(&g_WinMaliStatAsLateBinds);
+    WINMALI_TRACE("EnsureAs: bound AS%u root_pa=0x%llx (evicted=%u)",
+                  as, (ULONGLONG)VmPt->RootPa.QuadPart, victim);
+    return STATUS_SUCCESS;
 }
 
 /* Walk one level deeper. *Cur points at the parent PT entry; if it's

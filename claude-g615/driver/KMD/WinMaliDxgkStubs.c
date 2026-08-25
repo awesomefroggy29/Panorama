@@ -956,8 +956,43 @@ WinMaliKmdStub_ControlInterrupt3(
                    truthiness, which would invert the meaning exactly. */
                 BOOLEAN enable =
                     (InterruptControl->CrtcVsyncState == DXGK_VSYNC_ENABLE);
+                /* Timestamped, so the arm/disarm lines up against the moment the
+                   OS switches our source off. A DISARM right before that switch-off
+                   means dxgk gave up on the flip; an ARM still standing means it
+                   never asked us to retire one. */
+                /* See Parameters\VpLogVsync. These two consumed ~280 of 506
+                   entries against a 512 cap, so the ring filled mid-boot and
+                   dropped everything after t=43 s. */
+                if (g_WinMaliVpLogVsync != 0) {
+                    WinMaliVpLogOnly_(enable ? WINMALI_VPC_VSYNC_ON
+                                             : WINMALI_VPC_VSYNC_OFF);
+                }
                 if (enable) { (VOID)InterlockedIncrement64(&a->VsyncArmCount); }
-                WinMaliVsyncSetEnabled(a, enable);
+                if (g_WinMaliDodMode != 0) {
+                    /* ⛔★★★★★ DISPLAY-ONLY: RECORD THE INTENT, KEEP THE
+                     * HEARTBEAT RUNNING.
+                     * A KMDOD reports DXGK_INTERRUPT_DISPLAYONLY_VSYNC (=5),
+                     * which is NOT the interrupt dxgk is arming/disarming here.
+                     * WinMaliVsyncDpc gates on VsyncEnabled alone, so obeying a
+                     * CRTC_VSYNC disarm silences the DISPLAY-ONLY vsync too -
+                     * and dxgk's DOD vsync watchdog then removes the adapter.
+                     * MEASURED: BltQueueWakeReason=3 on our LUID, then
+                     * StopDeviceAndReleasePostDisplayOwnership +80 ms and
+                     * DdiRemoveDevice +98 ms, silently.
+                     * ⛔ Do NOT "fix" this by raising TdrDodVSyncDelay - that
+                     * watchdog is what keeps the display stack alive when the
+                     * vsync stops; setting it to 900 s HUNG THE MACHINE and
+                     * needed an offline registry repair from the USB spare. */
+                    if (!enable) {
+                        DbgPrint("[WinMali]    ControlInterrupt3: display-only - "
+                                 "CRTC_VSYNC disarm NOTED, DISPLAYONLY_VSYNC "
+                                 "heartbeat KEPT RUNNING\n");
+                    } else {
+                        WinMaliVsyncSetEnabled(a, TRUE);
+                    }
+                } else {
+                    WinMaliVsyncSetEnabled(a, enable);
+                }
             }
         }
         return STATUS_SUCCESS;
@@ -1442,5 +1477,209 @@ WinMaliKmdStub_NotifyContextPriorityChange(
     }
     /* Informational: a context's priority changed. We schedule uniformly, so
        there is nothing to reprogram; acknowledge so dxgkrnl proceeds. */
+    return STATUS_SUCCESS;
+}
+
+/*
+ * ======================================================================
+ *  MULTIPLANE OVERLAY - CYCLE 1 PROBE
+ *
+ * ⛔★★★★★ WHY THIS EXISTS, AND WHY IT REFUSES EVERYTHING.
+ *
+ * DWM's steady-state composition is UNREACHABLE by a display miniport: the
+ * composition surface lives only inside D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN,
+ * PresentHistoryTokenOnly presents generate ZERO driver calls, and nothing in
+ * the entire kernel DDI surface names a present-history token. Chasing it was
+ * dead from the start.
+ *
+ * MPO is the ONE contractual channel where the OS hands a miniport N separate
+ * buffers with placement rects and per-plane blend. That is exactly the shape
+ * this driver already has: we hold dwm's 2944x1840 desktop and the 2944x144
+ * taskbar strip as separate BOs and already CPU-composite two layers per sweep.
+ * So MPO would replace our 0x93 scavenging heuristic with the OS TELLING us
+ * which buffers to draw and where.
+ *
+ * ⚠ THIS BUILD DELIBERATELY CHANGES NO BEHAVIOUR. Check3 reports Supported=FALSE
+ * for every configuration, so the OS composes exactly as it does today and we
+ * cannot break the picture. The only question being asked is whether dxgkrnl
+ * CALLS these at all on a BLT-model adapter with a software scanout - which no
+ * amount of header reading can answer, because MPO presents arrive through a
+ * separate thunk and our frozen present counter is not evidence either way.
+ *
+ * ⚠ SupportMultiPlaneOverlay sits IMMEDIATELY BESIDE SupportDirectFlip in
+ * DXGK_DRIVERCAPS, and setting that one previously produced device PROBLEM 37.
+ * Hence: caps gated on Parameters\QaiMpoCaps, and the DDIs implemented BEFORE
+ * the cap is claimed - never the reverse, because claiming a cap makes dxgk call
+ * a DDI that would otherwise be NULL.
+ * ======================================================================
+ */
+
+_Function_class_(DXGKDDI_GETMULTIPLANEOVERLAYCAPS)
+NTSTATUS
+APIENTRY
+WinMaliKmdGetMultiPlaneOverlayCaps(
+    IN_CONST_HANDLE                          hAdapter,
+    IN_OUT_PDXGKARG_GETMULTIPLANEOVERLAYCAPS pCaps
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    if (pCaps == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    (VOID)InterlockedIncrement(&g_WinMaliStatMpoCapsCalls);
+
+    /* Two RGB planes at 1:1, no stretch, no YUV, no rotation. That is not a
+       conservative guess - it is precisely what the present worker can honestly
+       do: a row-wise CPU copy of one full-screen plane plus one strip, both at
+       the panel's own pitch. Anything more would be advertising a scanout engine
+       we do not have. */
+    pCaps->MaxPlanes         = 2;
+    pCaps->MaxRGBPlanes      = 2;
+    pCaps->MaxYUVPlanes      = 0;
+    pCaps->OverlayCaps.Value = 0;
+    /* NO FLOAT LITERALS IN KERNEL CODE: MaxStretchFactor/MaxShrinkFactor are
+       `float`, and assigning 1.0f pulls in _fltused, which fails the link
+       (LNK2001) because a driver must not touch the FPU without an explicit
+       state save. 1.0f is IEEE-754 0x3F800000; copy the bit pattern. */
+    {
+        static const ULONG kOneF = 0x3F800000u;
+        RtlCopyMemory(&pCaps->MaxStretchFactor, &kOneF, sizeof(kOneF));
+        RtlCopyMemory(&pCaps->MaxShrinkFactor,  &kOneF, sizeof(kOneF));
+    }
+
+    (VOID)InterlockedExchange(&g_WinMaliStatMpoCapsSrc, (LONG)pCaps->VidPnSourceId);
+    return STATUS_SUCCESS;
+}
+
+_Function_class_(DXGKDDI_CHECKMULTIPLANEOVERLAYSUPPORT3)
+NTSTATUS
+APIENTRY
+WinMaliKmdCheckMultiPlaneOverlaySupport3(
+    IN_CONST_HANDLE                                hAdapter,
+    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3 pCheck
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    if (pCheck == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    (VOID)InterlockedIncrement(&g_WinMaliStatMpoCheckCalls);
+    (VOID)InterlockedExchange(&g_WinMaliStatMpoCheckPlanes, (LONG)pCheck->PlaneCount);
+    (VOID)InterlockedExchange(&g_WinMaliStatMpoCheckPostComp,
+                              (LONG)pCheck->PostCompositionCount);
+
+    /* ★ RECORD WHAT THE OS IS PROPOSING. If DWM ever offers us the taskbar as a
+       plane, the plane count and the first plane's source id are what say so -
+       and they are the whole reason this probe is worth a boot. */
+    if (pCheck->PlaneCount != 0 && pCheck->ppPlanes != NULL &&
+        pCheck->ppPlanes[0] != NULL) {
+        (VOID)InterlockedExchange(&g_WinMaliStatMpoCheckSrc,
+                                  (LONG)pCheck->ppPlanes[0]->VidPnSourceId);
+    }
+
+    /* Refuse every configuration this cycle. Supported=FALSE is a CONTRACTUAL
+       answer, not a failure: the OS falls back to composing as it does today, so
+       a wrong guess here cannot damage the picture. Cycle 2 turns this into real
+       acceptance once we know the call even happens. */
+    pCheck->Supported = FALSE;
+    RtlZeroMemory(&pCheck->ReturnInfo, sizeof(pCheck->ReturnInfo));
+    return STATUS_SUCCESS;
+}
+
+_Function_class_(DXGKDDI_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3)
+NTSTATUS
+APIENTRY
+WinMaliKmdSetVidPnSourceAddressWithMultiPlaneOverlay3(
+    IN_CONST_HANDLE                                             hAdapter,
+    IN_OUT_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3  pSet
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    /* TRIPWIRE ONLY. While Check3 refuses everything this must never be called;
+       if it fires anyway, that is a finding about how dxgk sequences MPO, and it
+       is far better to learn it from a counter than from a bugcheck. Retiring an
+       MPO flip needs CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2, which we do not send
+       yet - so accept and count, change nothing. */
+    if (pSet == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    (VOID)InterlockedIncrement(&g_WinMaliStatMpoSetCalls);
+    (VOID)InterlockedExchange(&g_WinMaliStatMpoSetPlanes, (LONG)pSet->PlaneCount);
+    return STATUS_SUCCESS;
+}
+
+/* ⛔★★★★★ THE TWO SLOTS WHOSE ABSENCE CAUSED CODE 43.
+ *
+ * MEASURED 1.1.9.39: wiring Check3 + Set3 + GetMultiPlaneOverlayCaps and leaving
+ * the rest NULL aborted adapter start before any capability query
+ * (QueryCapsOutSz==0, QueryInterfaceCount 22->9), event 549
+ * StartAdapter_AddAdapterFailed / STATUS_INVALID_PARAMETER.
+ *
+ * The MPO family is declared in CONTIGUOUS VERSION-GUARDED UNITS, and we split
+ * both of them:
+ *   dispmprt.h:2893-2895  Check3 + Set3 + PostMultiPlaneOverlayPresent   (WDDM2_1)
+ *   dispmprt.h:2934-2935  GetMultiPlaneOverlayCaps + GetPostCompositionCaps (WDDM2_2)
+ * We wired 2 of the first 3 and 1 of the second 2. Worse, BOTH v3 argument
+ * structs carry post-composition payloads whose ONLY caps source is
+ * GetPostCompositionCaps - which we left NULL, i.e. we accepted arguments we
+ * had declared no ability to describe.
+ *
+ * ★ A DDI FAMILY IS A UNIT. Filling part of one is not a smaller claim, it is an
+ *   INCOHERENT claim - and dxgk validates the table before it ever asks what we
+ *   can do.
+ */
+
+_Function_class_(DXGKDDI_GETPOSTCOMPOSITIONCAPS)
+NTSTATUS
+APIENTRY
+WinMaliKmdGetPostCompositionCaps(
+    IN_CONST_HANDLE                        hAdapter,
+    IN_OUT_PDXGKARG_GETPOSTCOMPOSITIONCAPS pCaps
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    if (pCaps == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    (VOID)InterlockedIncrement(&g_WinMaliStatMpoPostCompCaps);
+
+    /* No post-composition scaling: the worker copies row-for-row at the panel's
+       own pitch. 1:1 both ways is the honest answer, and it is the same answer
+       GetMultiPlaneOverlayCaps gives - the two MUST agree or the pair is as
+       incoherent as the split family was.
+       ⛔ Bit patterns, not float literals: 1.0f in kernel code pulls in _fltused
+       and fails the link (LNK2001). */
+    {
+        static const ULONG kOneF = 0x3F800000u;
+        RtlCopyMemory(&pCaps->MaxStretchFactor, &kOneF, sizeof(kOneF));
+        RtlCopyMemory(&pCaps->MaxShrinkFactor,  &kOneF, sizeof(kOneF));
+    }
+    return STATUS_SUCCESS;
+}
+
+_Function_class_(DXGKDDI_POSTMULTIPLANEOVERLAYPRESENT)
+NTSTATUS
+APIENTRY
+WinMaliKmdPostMultiPlaneOverlayPresent(
+    IN_CONST_HANDLE                                hAdapter,
+    IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT pPost
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    if (pPost == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* Completion notification for an MPO present. While Check3 refuses every
+       configuration this should never fire; counting it costs nothing and makes
+       "did the OS actually drive an MPO present" a number rather than a guess. */
+    (VOID)InterlockedIncrement(&g_WinMaliStatMpoPostPresent);
+    (VOID)InterlockedExchange(&g_WinMaliStatMpoPostLayer, (LONG)pPost->LayerIndex);
     return STATUS_SUCCESS;
 }

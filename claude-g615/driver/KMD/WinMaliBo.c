@@ -707,6 +707,136 @@ WinMaliUvSrcEndUse(_In_ ULONG Handle)
     WinMaliUvSrcUnlock_();
 }
 
+
+/* ⛔★★★★★ THE TASKBAR IS A SEPARATE LAYER, AND WE WERE DROPPING IT.
+ *
+ * MEASURED 2026-08-21, straight out of the UvSlots dump on a live desktop:
+ *     idx=20  bo=344  pid=1252(dwm)  pages=414  pitch=11776  -> "TOO SMALL"
+ * 414 pages = 1,695,744 B, and 1,695,744 / 11776 = EXACTLY 144 rows. That is
+ * 2944x144 at the PANEL'S OWN PITCH - the taskbar strip, sitting in our
+ * candidate table the whole time, correctly failing the full-screen size gate
+ * and then discarded, because the worker composites exactly ONE candidate.
+ *
+ * So "no taskbar" was never a missing surface, a wrong selection, or a dwm
+ * failure: we had the pixels and never drew them. AcquireBest is right to
+ * reject a 144-row buffer as THE SCREEN; it is wrong to throw it away as a
+ * LAYER.
+ *
+ * A strip is identified STRUCTURALLY, not guessed: its pitch equals the panel
+ * pitch (so it spans the full width and needs no horizontal scaling) and its
+ * height is a fraction of the panel. Anything at a different pitch is some
+ * other surface and is left alone.
+ *
+ * Returns the mapped system VA and row count, having taken a use-ref the caller
+ * MUST drop with WinMaliUvSrcEndUse - same contract as AcquireBest. Takes the
+ * table lock only for the lookup, never across the copy (holding it there wedges
+ * dwm, which needs the same mutex from the 0x93 escape path). */
+PVOID
+WinMaliUvSrcAcquireStrip(_In_ ULONG Stride,
+                         _In_ ULONG PanelHeight,
+                         _Out_ ULONG* OutHandle,
+                         _Out_ ULONG* OutRows)
+{
+    ULONG  i;
+    PVOID  bestVa   = NULL;
+    ULONG  bestRows = 0;
+    ULONG  bestIdx  = WINMALI_UVSRC_SLOTS;
+
+    *OutHandle = 0;
+    *OutRows   = 0;
+
+    if (Stride == 0 || PanelHeight == 0 ||
+        InterlockedCompareExchange(&g_WinMaliUvSrcReady, 0, 0) == 0) {
+        return NULL;
+    }
+
+    WinMaliUvSrcLock_();
+    for (i = 0; i < WINMALI_UVSRC_SLOTS; i++) {
+        ULONG rows;
+
+        if (g_WinMaliUvSrc[i].Handle == 0 || g_WinMaliUvSrc[i].Mdl == NULL ||
+            g_WinMaliUvSrc[i].Dying) {
+            continue;
+        }
+        /* Full-width by construction: same bytes per row as the panel. */
+        if (g_WinMaliUvSrc[i].Pitch != Stride) {
+            continue;
+        }
+        rows = (ULONG)(g_WinMaliUvSrc[i].Size / Stride);
+        /* A LAYER, not the screen: at least a few rows, strictly shorter than
+           the panel (a full-height buffer is AcquireBest's job). */
+        if (rows < 8u || rows >= PanelHeight) {
+            continue;
+        }
+        /* Tallest wins - the taskbar is the biggest strip dwm publishes. */
+        if (rows > bestRows) {
+            bestRows = rows;
+            bestIdx  = i;
+        }
+    }
+
+    if (bestIdx < WINMALI_UVSRC_SLOTS) {
+        bestVa = MmGetSystemAddressForMdlSafe(
+                     g_WinMaliUvSrc[bestIdx].Mdl,
+                     NormalPagePriority | MdlMappingNoExecute);
+        if (bestVa != NULL) {
+            /* ⛔★★★★★ INVALIDATE BEFORE READING - THE GPU IS NON-COHERENT.
+             *
+             * The scan path above already does this for the desktop candidate;
+             * this one did not, and the result was EXACTLY what that predicts:
+             * USER-OBSERVED 2026-08-21, the strip composited in the right place
+             * at the right size (bo=368, 144 rows, 2436 blits) but rendering
+             * BLACK - i.e. we read CPU cache lines the GPU's writes never
+             * invalidated, which are zeros.
+             * ★ A NEW READER OF GPU-WRITTEN MEMORY INHERITS EVERY COHERENCY
+             *   RULE THE OLD ONE HAD; copying the selection logic without the
+             *   invalidate copies half the contract. */
+            if (g_WinMaliUvSrcInvalidate) {
+                KeFlushIoBuffers(g_WinMaliUvSrc[bestIdx].Mdl, TRUE, TRUE);
+            }
+
+            /* ⛔ NEVER PAINT AN EMPTY LAYER OVER A GOOD FRAME.
+             *
+             * If the strip is uniformly black - not yet painted, or the wrong
+             * buffer - compositing it REPLACES a correct region of the desktop
+             * with black, and because the desktop copy is chunked across several
+             * wakes the panel then alternates between the two. That is precisely
+             * the reported "flickering between black and the background".
+             * Refusing a blank layer degrades to the previous behaviour (no
+             * taskbar) instead of actively damaging the frame. */
+            {
+                const UCHAR *px = (const UCHAR *)bestVa;
+                ULONG        k, nb = 0;
+                for (k = 0; k < 256u; k++) {
+                    /* Spread the samples over the whole strip, not one row. */
+                    SIZE_T off = ((SIZE_T)bestRows * Stride / 256u) * k;
+                    if (off + 3u >= (SIZE_T)bestRows * Stride) { break; }
+                    if (px[off] != 0 || px[off + 1] != 0 || px[off + 2] != 0) {
+                        nb++;
+                    }
+                }
+                (VOID)InterlockedExchange(&g_WinMaliStatStripNB, (LONG)nb);
+                if (nb == 0) {
+                    bestVa   = NULL;   /* blank - leave the desktop alone */
+                    bestRows = 0;
+                }
+            }
+        }
+        if (bestVa != NULL) {
+            /* Use-ref under the lock we still hold, so Revoke waits instead of
+               letting BoFree unmap what we are about to read. */
+            g_WinMaliUvSrc[bestIdx].InUse++;
+            *OutHandle = g_WinMaliUvSrc[bestIdx].Handle;
+            *OutRows   = bestRows;
+            (VOID)InterlockedExchange(&g_WinMaliStatStripBo,
+                                      (LONG)g_WinMaliUvSrc[bestIdx].Handle);
+            (VOID)InterlockedExchange(&g_WinMaliStatStripRows, (LONG)bestRows);
+        }
+    }
+    WinMaliUvSrcUnlock_();
+    return bestVa;
+}
+
 /* ⛔★★★★★★ MUST COMPLETE BEFORE THE CALLER UNMAPS ANYTHING.
  *
  * Marks the slot dying so no new use can begin, then waits for any in-flight
@@ -816,6 +946,169 @@ WinMaliUvSrcRevoke(_In_ ULONG Handle)
     WinMaliUvSrcUnlock_();
 }
 
+
+/* ==========================================================================
+ * UvPush - PUSH THE FINISHED FRAME, DO NOT LATCH IT.
+ *
+ * ⛔★★★★★ WHY THIS EXISTS. MEASURED 2026-08-24:
+ *   dwm delivers the composed desktop by CPU COPY into a full-screen buffer,
+ *   publishes it to the UvSrc table, and DESTROYS the wrapper ~1-2 ms later,
+ *   12 times a second (StatUvPubBig/StatUvRevokeBig +524 per 840 worker ticks).
+ *   The worker polls at 33 ms, so StatUvQual is ALWAYS 1 - only ever the one
+ *   stale buffer dwm abandoned at boot, whose content never changes
+ *   (StatUvC0Chg=0, and two FrameThumb grabs 45 s apart were BYTE-IDENTICAL,
+ *   though the thumb itself renders a real desktop). We were reading a real
+ *   frame - just a dead one. A poller cannot win this race; the producer has to
+ *   hand us the frame.
+ *
+ * ⛔★★★★★ WHY THE DESTROY PATH AND NOWHERE ELSE.
+ *   WinMaliBoDestroy has already popped this BO from the table under the
+ *   spinlock and released it, so we are its SOLE owner and hold NO lock.
+ *   WinMaliUvSrcRevoke has not run yet (it is inside WinMaliBoFree_), so Dying
+ *   is clear and nothing is blocked on us. The pages are still probe-locked and
+ *   cannot move until WE call WinMaliBoFree_. And dwm has locked, CPU-written
+ *   and unlocked by now, so this is the FINISHED frame with zero lag.
+ *   ⇒ Every lifetime question this investigation kept hitting is answered by
+ *   the CALL SITE, not by a protocol, a pin, or a comment I would have to
+ *   trust. That is the whole point - I have already shipped a use-after-free in
+ *   this subsystem by trusting a comment instead of a lock.
+ *
+ * ⛔ WE READ THE USER VA, IN THE OWNING PROCESS - deliberately. A second kernel
+ *   alias is exactly where the coherency trap lives (see the UvSrcInvalidate
+ *   note above: an invalidate can discard the lines a CPU writer just dirtied).
+ *   Same VA, same process, PIPT caches: no flush, no invalidate, no new PTEs.
+ *
+ * ⛔ Armed/Busy is a real DRAIN, not an assertion. Teardown clears Armed and
+ *   waits for Busy to reach 0 before MmUnmapIoSpace.
+ * ========================================================================== */
+#define WINMALI_UVPUSH_MIN_GAP_100NS  (250LL * 1000LL)   /* 25 ms hard cap */
+
+LONG    g_WinMaliUvPushBusy  = 0;
+LONG64  g_WinMaliUvPushTick  = 0;   /* KeQueryInterruptTime of the last push */
+LONG    g_WinMaliStatUvPush     = 0;
+LONG    g_WinMaliStatUvPushRefG = 0;  /* refused: not panel-class at own pitch */
+LONG    g_WinMaliStatUvPushRefP = 0;  /* refused: wrong process / no UserVa    */
+LONG    g_WinMaliStatUvPushRefD = 0;  /* refused: disarmed / no ScanoutVa      */
+LONG    g_WinMaliStatUvPushExc  = 0;  /* __except fired - MUST STAY 0          */
+LONG    g_WinMaliStatUvPushNB   = 0;  /* last frame's non-black sample count, 0-64 */
+
+VOID
+WinMaliUvPushDrain(VOID)
+{
+    ULONG spins = 0;
+    g_WinMaliUvPush = 0;                      /* disarm first, then drain */
+    while (InterlockedCompareExchange(&g_WinMaliUvPushBusy, 0, 0) != 0 &&
+           spins < 400u) {                    /* 400 x 5 ms = 2 s ceiling */
+        LARGE_INTEGER d; d.QuadPart = -50000; /* 5 ms */
+        (VOID)KeDelayExecutionThread(KernelMode, FALSE, &d);
+        spins++;
+    }
+}
+
+VOID
+WinMaliUvPushFrame(_Inout_ PWINMALI_ADAPTER Adapter, _In_ PWINMALI_BO Bo)
+{
+    ULONG   gp, rows, r;
+    SIZE_T  need;
+    PUCHAR  dst;
+    LONG64  now, last;
+
+    if (g_WinMaliUvPush == 0 || Adapter == NULL || Bo == NULL) { return; }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)                   { return; }
+
+    /* ⛔ SAME GATE AS AcquireBest - A FULL SCREEN AT THIS SURFACE'S OWN PITCH.
+       Gating at the PANEL's pitch would let a wider surface through and paint
+       only the top fraction of the glass, which is the "~50% fill" artefact
+       this driver has already paid for once. */
+    gp = (Bo->UserPitch != 0) ? Bo->UserPitch : WINMALI_FB_STRIDE;
+    if (gp < WINMALI_FB_STRIDE) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefG);
+        return;
+    }
+    need = (SIZE_T)WINMALI_FB_HEIGHT * gp;
+    if (Bo->Size < need) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefG);
+        return;
+    }
+    if (Bo->PushVa == NULL || Bo->PushProcess != PsGetCurrentProcess()) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefP);
+        return;                       /* not our address space - never touch it */
+    }
+
+    /* Hard cap on how much of dwm's escape thread this can ever consume, so a
+       churning client cannot turn 12/s into 200/s. A no-op at dwm's 12/s. */
+    now  = (LONG64)KeQueryInterruptTime();
+    last = InterlockedCompareExchange64(&g_WinMaliUvPushTick, 0, 0);
+    if (last != 0 && (now - last) < WINMALI_UVPUSH_MIN_GAP_100NS) { return; }
+
+    (VOID)InterlockedIncrement(&g_WinMaliUvPushBusy);
+    if (g_WinMaliUvPush == 0 || Adapter->ScanoutVa == NULL) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefD);
+        (VOID)InterlockedDecrement(&g_WinMaliUvPushBusy);
+        return;
+    }
+
+    rows = WINMALI_FB_HEIGHT;
+    /* BOTH bounds PROVEN, not clamped:
+         src last byte = (rows-1)*gp + FB_STRIDE <= rows*gp = need <= Bo->Size
+         dst last byte = rows*FB_STRIDE, checked against ScanoutBytes here. */
+    if ((SIZE_T)rows * WINMALI_FB_STRIDE > Adapter->ScanoutBytes) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefD);
+        (VOID)InterlockedDecrement(&g_WinMaliUvPushBusy);
+        return;
+    }
+    dst = (PUCHAR)Adapter->ScanoutVa;
+
+    /* ⛔★★★ IS THERE ANYTHING IN IT? The push demonstrably WORKS (9.5 frames/s
+     * reach the panel, EXC=0) and the panel is BLACK, so the frames themselves
+     * are blank. Sample before copying: an 8x8 grid of 32-bit pixels, 64 reads,
+     * negligible next to a 21 MB copy. A pixel counts as painted if any of its
+     * low 24 bits are set - alpha is ignored, because a fully transparent-but-
+     * coloured surface is still content and a 0x00000000 surface is not.
+     * ⛔ Inside the SAME __try as the copy: PushVa is the producer's VA and a
+     *    stale one must not fault us here either. */
+    {
+        ULONG nb = 0, gx, gy;
+        __try {
+            for (gy = 0; gy < 8u; gy++) {
+                ULONG yy = (WINMALI_FB_HEIGHT / 9u) * (gy + 1u);
+                const UCHAR *rowp = (const UCHAR *)Bo->PushVa + (SIZE_T)yy * gp;
+                for (gx = 0; gx < 8u; gx++) {
+                    ULONG xx = (WINMALI_FB_WIDTH / 9u) * (gx + 1u);
+                    ULONG px = *(const ULONG *)(rowp + (SIZE_T)xx * 4u);
+                    if ((px & 0x00FFFFFFu) != 0u) { nb++; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvPushExc);
+            (VOID)InterlockedDecrement(&g_WinMaliUvPushBusy);
+            return;
+        }
+        (VOID)InterlockedExchange(&g_WinMaliStatUvPushNB, (LONG)nb);
+        if (nb == 0u) {
+            /* Blank. Painting it would BLACK OUT the panel - which is exactly the
+               1.1.11.3 regression. Leave the glass to the worker and refuse. */
+            (VOID)InterlockedIncrement(&g_WinMaliStatUvPushRefG);
+            (VOID)InterlockedDecrement(&g_WinMaliUvPushBusy);
+            return;
+        }
+    }
+
+    __try {
+        for (r = 0; r < rows; r++) {
+            RtlCopyMemory(dst + (SIZE_T)r * WINMALI_FB_STRIDE,
+                          (const UCHAR *)Bo->PushVa + (SIZE_T)r * gp,
+                          WINMALI_FB_STRIDE);
+        }
+        (VOID)InterlockedExchange64(&g_WinMaliUvPushTick, now);
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPush);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Probe-locked pages cannot fault; this catches a stale/hostile VA only.
+           If it EVER fires the model is wrong - grade it as a STOP, not a nit. */
+        (VOID)InterlockedIncrement(&g_WinMaliStatUvPushExc);
+    }
+    (VOID)InterlockedDecrement(&g_WinMaliUvPushBusy);
+}
 
 /* Is "prefer a candidate that is actually being written" enabled?
    Registry knob (UvPreferLive, default 1) so a bad first trial can be undone
@@ -1567,6 +1860,19 @@ WinMaliBoCreateFromUserVa(_Inout_ PWINMALI_ADAPTER Adapter,
     Adapter->BoTable.BoCount++;
     KeReleaseSpinLock(&Adapter->BoTable.Lock, oldIrql);
 
+    /* Record the producer's OWN VA / process / pitch, in fields DEDICATED to the
+       push. It is what lets the destroy-time push read the frame through DWM'S
+       OWN CACHED MAPPING instead of minting a second kernel alias - which is
+       where the coherency question lives, and which would also mean mapping 5290
+       system PTEs per frame, the shape that hung .79.
+       ⛔ NOT UserVa/UserVaProcess: those mean "BoMapCpu made a mapping and
+       BoFree_ must MmUnmapLockedPages it" (WinMaliBo.c:119-136). Writing them
+       here made BoFree_ unmap the PRODUCER's own address on every destroy and
+       black-screened the box in 1.1.11.0, ungated by any knob. */
+    bo->PushVa      = UserVa;
+    bo->PushProcess = PsGetCurrentProcess();
+    bo->UserPitch   = SrcPitch;
+
     /* Offer it to the present worker as a scanout source. Publishing every
        0x93 BO and scoring them by painted content is deliberate: nothing tells
        us WHICH surface DWM composed into (its presents are not ours and carry
@@ -1621,6 +1927,10 @@ WinMaliBoDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
     }
     WINMALI_TRACE("BoDestroy: handle=%u size=%llu",
                   bo->Handle, (ULONGLONG)bo->Size);
+    /* ⛔ ORDER IS THE WHOLE DESIGN: the frame is finished and the pages are
+       still probe-locked and solely ours HERE. WinMaliBoFree_ is what runs
+       WinMaliUvSrcRevoke and unlocks the pages, so this MUST precede it. */
+    WinMaliUvPushFrame(Adapter, bo);
     WinMaliBoFree_(bo);
     return WMERR_OK;
 }

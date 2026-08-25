@@ -120,9 +120,28 @@
     init->DxgkDdiPowerRuntimeSetDeviceHandle                      = WinMaliKmdStub_PowerRuntimeSetDeviceHandle;
     init->DxgkDdiSetStablePowerState                              = WinMaliKmdStub_SetStablePowerState;
     init->DxgkDdiSetVideoProtectedRegion                          = WinMaliKmdStub_SetVideoProtectedRegion;
-    init->DxgkDdiCheckMultiPlaneOverlaySupport3                   = NULL;
-    init->DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3      = NULL;
-    init->DxgkDdiPostMultiPlaneOverlayPresent                     = NULL;
+    /* ⛔★★★★★ GATE THE WIRING, NOT JUST THE CAP.
+       MEASURED 1.1.9.39: wiring these three unconditionally gave device CODE 43
+       (FAILED_POST_START) with QueryCapsOutSz==0 and QueryInterfaceCount 22->9 -
+       i.e. adapter start aborted BEFORE dxgk ever read DRIVERCAPS, so the cap
+       write was never even reached and QaiMpoCaps could not undo it. Filling a
+       DDI slot is itself a claim about the interface contract, and it is made
+       EARLIER than any capability query. Gate both halves on the same knob or
+       the recovery path is a lie. */
+    /* ★ "|| Caps" is NOT redundant: it preserves the invariant that the cap can
+       never be claimed with NULL slots behind it, while allowing the one arm
+       that has never been run - Wire=1 / Caps=0, i.e. 5-of-5 slots with no cap.
+       1.1.9.39 tested 3-of-5 slots with no cap, which is a different thing. */
+    if (g_WinMaliQaiMpoWire != 0 || g_WinMaliQaiMpoCaps != 0) {
+        /* WDDM2_1 unit: all THREE together (dispmprt.h:2893-2895). */
+        init->DxgkDdiCheckMultiPlaneOverlaySupport3               = WinMaliKmdCheckMultiPlaneOverlaySupport3;
+        init->DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3  = WinMaliKmdSetVidPnSourceAddressWithMultiPlaneOverlay3;
+        init->DxgkDdiPostMultiPlaneOverlayPresent                 = WinMaliKmdPostMultiPlaneOverlayPresent;
+    } else {
+        init->DxgkDdiCheckMultiPlaneOverlaySupport3               = NULL;
+        init->DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3  = NULL;
+        init->DxgkDdiPostMultiPlaneOverlayPresent                 = NULL;
+    }
     init->DxgkDdiValidateUpdateAllocationProperty                 = WinMaliKmdStub_ValidateUpdateAllocationProperty;
     init->DxgkDdiControlModeBehavior                              = NULL;
     /* ⛔ The unconditional "= NULL" that used to sit here silently undid the
@@ -146,8 +165,15 @@
     init->DxgkDdiDisplayDetectControl                             = NULL;
     init->DxgkDdiQueryConnectionChange                            = NULL;
     init->DxgkDdiExchangePreStartInfo                             = NULL;
-    init->DxgkDdiGetMultiPlaneOverlayCaps                         = NULL;
-    init->DxgkDdiGetPostCompositionCaps                           = NULL;
+    /* WDDM2_2 pair: BOTH together (dispmprt.h:2934-2935). The v3 arg structs
+       carry post-composition payloads, so declaring Check3/Set3 without a
+       post-composition caps source is an incoherent claim. */
+    init->DxgkDdiGetMultiPlaneOverlayCaps                         =
+        (g_WinMaliQaiMpoWire != 0 || g_WinMaliQaiMpoCaps != 0)
+            ? WinMaliKmdGetMultiPlaneOverlayCaps : NULL;
+    init->DxgkDdiGetPostCompositionCaps                           =
+        (g_WinMaliQaiMpoWire != 0 || g_WinMaliQaiMpoCaps != 0)
+            ? WinMaliKmdGetPostCompositionCaps : NULL;
     init->DxgkDdiUpdateHwContextState                             = WinMaliKmdStub_UpdateHwContextState;
     init->DxgkDdiCreateProtectedSession                           = WinMaliKmdStub_CreateProtectedSession;
     init->DxgkDdiDestroyProtectedSession                          = WinMaliKmdStub_DestroyProtectedSession;

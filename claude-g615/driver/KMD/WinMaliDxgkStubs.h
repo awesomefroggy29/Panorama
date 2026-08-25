@@ -432,3 +432,29 @@ NTSTATUS APIENTRY WinMaliKmdStub_NotifyContextPriorityChange(
     IN_CONST_HANDLE                                 hAdapter,
     IN_CONST_PDXGKARG_NOTIFYCONTEXTPRIORITYCHANGE   pNotifyContextPriorityChange
     );
+
+/* Multiplane overlay - Cycle 1 probe. Implemented BEFORE the cap is claimed:
+   claiming SupportMultiPlaneOverlay makes dxgk call these, and a NULL pointer
+   there is how a cap claim turns into a dead device. See the long note on the
+   definitions in WinMaliDxgkStubs.c. */
+NTSTATUS APIENTRY WinMaliKmdGetMultiPlaneOverlayCaps(
+    IN_CONST_HANDLE hAdapter,
+    IN_OUT_PDXGKARG_GETMULTIPLANEOVERLAYCAPS pCaps);
+
+NTSTATUS APIENTRY WinMaliKmdCheckMultiPlaneOverlaySupport3(
+    IN_CONST_HANDLE hAdapter,
+    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3 pCheck);
+
+NTSTATUS APIENTRY WinMaliKmdSetVidPnSourceAddressWithMultiPlaneOverlay3(
+    IN_CONST_HANDLE hAdapter,
+    IN_OUT_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3 pSet);
+
+/* The two slots whose absence made the first MPO attempt an incoherent claim.
+   Both belong to contiguous version-guarded units with the DDIs above. */
+NTSTATUS APIENTRY WinMaliKmdGetPostCompositionCaps(
+    IN_CONST_HANDLE hAdapter,
+    IN_OUT_PDXGKARG_GETPOSTCOMPOSITIONCAPS pCaps);
+
+NTSTATUS APIENTRY WinMaliKmdPostMultiPlaneOverlayPresent(
+    IN_CONST_HANDLE hAdapter,
+    IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT pPost);

@@ -311,6 +311,14 @@ WinMaliKmdCreateDevice(
     }
     RtlZeroMemory(dev, sizeof(*dev));
     dev->Magic        = WINMALI_KMD_DEVICE_MAGIC;
+    /* ★ PAIR THESE TWO COUNTERS. VmCreates=8 / VmDestroys=2 says six AS slots
+       leaked, but NOT why. If DevDestroys tracks DevCreates then dxgk IS tearing
+       devices down and the fault is VM OWNERSHIP (a VM tagged to a device that
+       never owned it, e.g. an adapter-level escape whose hDevice is NULL - the
+       rundown bails on NULL). If DevDestroys lags, dxgk is not calling us at all
+       and the leak is a lifetime/handle problem instead. Two very different
+       fixes; one boot separates them. */
+    (VOID)InterlockedIncrement(&g_WinMaliStatDevCreates);
     dev->Adapter      = adapter;
     dev->OwnerProcess = owner;
     dev->hRtDevice    = pCreateDevice->hDevice;
@@ -337,7 +345,9 @@ WinMaliKmdDestroyDevice(
 {
     PWINMALI_KMD_DEVICE dev = (PWINMALI_KMD_DEVICE)hDevice;
 
+    (VOID)InterlockedIncrement(&g_WinMaliStatDevDestroys);
     if (dev == NULL || dev->Magic != WINMALI_KMD_DEVICE_MAGIC) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatDevDestroyBadHandle);
         return STATUS_INVALID_HANDLE;
     }
     if (dev->ContextCount != 0) {
@@ -1058,26 +1068,49 @@ WinMaliKmdSubmitCommandVirtual(
                baseline) use the escape VM's AS. Both resolve to a Mali AS slot
                the CSG rebinds to before the CALL. The flag keeps the baseline
                correct even if dxgk pre-binds an (empty) context AS. */
-            ULONG asSlot = WINMALI_AS_SLOT_MAX;
-            if (cs->Flags & WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) {
-                asSlot = WinMaliMmuGetContextAsSlot(adapter, pSubmit->hContext);
-            }
-            if (asSlot >= WINMALI_AS_SLOT_MAX) {
-                PWINMALI_VM vm = WinMaliVmGet(adapter, cs->VmId);
-                if (vm != NULL) {
-                    asSlot = vm->Pt.AsSlot;
-                    WinMaliVmPut(vm);
-                }
-            }
-            if (asSlot < WINMALI_AS_SLOT_MAX) {
-                WinMaliBoFlushVm(adapter, cs->VmId, TRUE);   /* CPU->DRAM */
-                (VOID)WinMaliCsfSubmitGroupStream(adapter, asSlot,
-                                                  cs->StreamGpuVa, cs->StreamSize,
-                                                  0u, 500u);
-                WinMaliBoFlushVm(adapter, cs->VmId, FALSE);  /* DRAM->CPU */
+            ULONG    asSlot = WINMALI_AS_SLOT_MAX;
+            NTSTATUS schedSt;
+
+            /* ⛔ THE SCHEDULER LOCK MUST SPAN EnsureAs -> READ AsSlot -> SUBMIT
+               AS ONE UNIT. Binding an AS slot and then reading it back are two
+               operations; between them another thread could evict the slot we
+               just bound and hand it to a different process, and we would run
+               this command stream against someone else's page table. Taking the
+               lock only inside CsfSubmitGroupStream (as the first version did)
+               is far too late. KMUTEX is recursive, so the nested acquire
+               inside the submit is correct and intended. */
+            schedSt = WinMaliCsfAcquireSchedLock(adapter);
+            if (!NT_SUCCESS(schedSt)) {
+                WINMALI_WARN("SubmitCommandVirtual: sched lock unavailable "
+                             "(0x%08x) - dropping vm=%u", schedSt, cs->VmId);
             } else {
-                WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no AS slot",
-                             cs->VmId);
+                if (cs->Flags & WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR) {
+                    asSlot = WinMaliMmuGetContextAsSlot(adapter, pSubmit->hContext);
+                }
+                if (asSlot >= WINMALI_AS_SLOT_MAX) {
+                    PWINMALI_VM vm = WinMaliVmGet(adapter, cs->VmId);
+                    if (vm != NULL) {
+                        /* Bind an AS slot now if this VM does not hold one. VMs
+                           are created unbound when the 6-slot pool is full, so
+                           this is the normal path for the 7th client onward. It
+                           also refreshes the LRU stamp, so an actively
+                           submitting VM sorts newest and is picked last. */
+                        (VOID)WinMaliMmuVmEnsureAs(adapter, &vm->Pt, asSlot);
+                        asSlot = vm->Pt.AsSlot;
+                        WinMaliVmPut(vm);
+                    }
+                }
+                if (asSlot < WINMALI_AS_SLOT_MAX) {
+                    WinMaliBoFlushVm(adapter, cs->VmId, TRUE);   /* CPU->DRAM */
+                    (VOID)WinMaliCsfSubmitGroupStream(adapter, asSlot,
+                                                      cs->StreamGpuVa, cs->StreamSize,
+                                                      0u, 500u);
+                    WinMaliBoFlushVm(adapter, cs->VmId, FALSE);  /* DRAM->CPU */
+                } else {
+                    WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no AS slot",
+                                 cs->VmId);
+                }
+                WinMaliCsfReleaseSchedLock(adapter);
             }
             cs->Magic = 0;   /* consume */
         }
@@ -1325,6 +1358,44 @@ LONG g_WinMaliStat0x93Fail          = 0;
    uvBo != 0 means the panel is being fed from a user-VA import, i.e. a path
    that never needed dxgk to aperture-map anything. */
 LONG g_WinMaliStatUvSrcBo           = 0;
+LONG g_WinMaliStatStripBo           = 0;
+LONG g_WinMaliStatStripRows         = 0;
+LONG g_WinMaliStatStripBlits        = 0;
+LONG g_WinMaliStatStripNB           = 0;
+LONG g_WinMaliStatFbAllocs          = 0;
+LONG g_WinMaliStatFbAllocLastW      = 0;
+LONG g_WinMaliStatFbAllocLastH      = 0;
+LONG g_WinMaliStatFbAllocLastPitch  = 0;
+LONG g_WinMaliStatMpoCapsCalls      = 0;
+LONG g_WinMaliStatMpoCapsSrc        = 0;
+LONG g_WinMaliStatMpoCheckCalls     = 0;
+LONG g_WinMaliStatMpoCheckPlanes    = 0;
+LONG g_WinMaliStatMpoCheckPostComp  = 0;
+LONG g_WinMaliStatMpoCheckSrc       = 0;
+LONG g_WinMaliStatMpoSetCalls       = 0;
+LONG g_WinMaliStatMpoSetPlanes      = 0;
+LONG g_WinMaliStatPresentMpoFlag    = 0;
+LONG g_WinMaliStatPresentRedirected = 0;
+LONG g_WinMaliStatMpoPostCompCaps   = 0;
+LONG g_WinMaliStatMpoPostPresent    = 0;
+LONG g_WinMaliStatMpoPostLayer      = 0;
+LONG g_WinMaliStatPresAl0Hi         = 0;
+LONG g_WinMaliStatPresAl0Lo         = 0;
+LONG g_WinMaliStatPresAl1Lo         = 0;
+LONG g_WinMaliStatPresAl0NonNull    = 0;
+LONG g_WinMaliStatPresAl1NonNull    = 0;
+LONG g_WinMaliStatVmCreates         = 0;
+LONG g_WinMaliStatVmDestroys        = 0;
+LONG g_WinMaliStatVmLive            = 0;
+LONG g_WinMaliStatVmCreateFail      = 0;
+LONG g_WinMaliStatDevCreates        = 0;
+LONG g_WinMaliStatDevDestroys       = 0;
+LONG g_WinMaliStatDevDestroyBadHandle = 0;
+LONG g_WinMaliStatVmOwnerNull       = 0;
+LONG g_WinMaliStatVmDeferredBind    = 0;
+LONG g_WinMaliStatAsEvictions       = 0;
+LONG g_WinMaliStatAsLateBinds       = 0;
+LONG g_WinMaliStatAsEnsureFail      = 0;
 LONG g_WinMaliStatUvSrcHits         = 0;
 LONG g_WinMaliStatUvSrcAsked        = 0;
 LONG g_WinMaliStatUvSrcCands        = 0;
@@ -1461,6 +1532,8 @@ LONG g_WinMaliStatUvSrcQual        = 0;
    Uncached is ~1000x slower for a 21 MB frame (~20 s vs ~30 ms) and was the
    silent cause of the visible top-down paint AND of teardown hangs. */
 LONG g_WinMaliScanoutWc            = 0;
+LONG g_WinMaliScanoutWcOff         = 0;
+LONG g_WinMaliScanoutAttr          = -1;
 LONG g_WinMaliFlipHasMdl           = 0;
 LONG g_WinMaliFlipMdlPages         = 0;
 LONG g_WinMaliFlipAllocOk           = 0;
@@ -1575,6 +1648,24 @@ WinMaliKmdPresent(
      * so the DDI itself says what DWM is asking for instead of us inferring. */
     (VOID)InterlockedExchange(&g_WinMaliStatPresentLastFlags,
                               (LONG)pPresent->Flags.Value);
+
+    /* ★ TWO FREE COUNTERS THAT MAKE THE NEXT TWO EXPERIMENTS REGISTRY-ONLY.
+     *
+     * FlipWithMultiPlaneOverlay says the OS is driving us through the MPO path,
+     * and it also names a UNION arm - the same union family that has already
+     * cost us a wrong reading once (pAllocationList vs pAllocationInfo), so it
+     * is worth knowing BEFORE dereferencing anything on an MPO present.
+     *
+     * RedirectedFlip is the documented route by which redirected-surface content
+     * reaches a miniport. If it ever appears, the iflip pivot becomes a knob
+     * change rather than a build. Counting both now costs nothing and saves a
+     * whole deploy cycle later. */
+    if (pPresent->Flags.FlipWithMultiPlaneOverlay) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatPresentMpoFlag);
+    }
+    if (pPresent->Flags.RedirectedFlip) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatPresentRedirected);
+    }
     (VOID)InterlockedExchange(&g_WinMaliStatPresentLastCounts,
                               (LONG)((pPresent->NumSrcAllocations & 0xFFFF) |
                                      ((pPresent->NumDstAllocations & 0xFF) << 16) |
@@ -1760,6 +1851,45 @@ WinMaliKmdPresent(
                                                      fsrc);
                     (VOID)InterlockedIncrement(&g_WinMaliStatPresentPrivHits);
                     return WinMaliPresentEmitDmaToken_(pPresent);
+                }
+            }
+        }
+
+        /* ★★★ LOOK IN THE ALLOCATION LIST BEFORE GIVING UP.
+         *
+         * We are the ONLY display adapter on this machine (measured: one
+         * Win32_VideoController, one PnP Display device, one active child), so
+         * dwm's composed frame has nowhere to go EXCEPT through these presents -
+         * yet all of them land here and we drop them.
+         *
+         * The reason we drop them is a COUNT check: NumSrcAllocations and
+         * NumDstAllocations both read 0. But those two fields are WDDM2_0
+         * additions to DXGKARG_PRESENT, and pAllocationList itself is NON-NULL
+         * on every one of these presents. If dxgk populates the list without
+         * setting the WDDM2_0 counts for this present shape, the frame has been
+         * sitting one dereference away the whole time.
+         *
+         * ⚠ pAllocationList is a UNION with pAllocationInfo and
+         * pPresentMultiPlaneOverlayInfo - the same union that has already
+         * produced one wrong reading here - so publish the RAW contents and let
+         * the numbers say which arm is live rather than assuming. Read-only, and
+         * only on the path that is already failing. */
+        {
+            const DXGK_ALLOCATIONLIST *al = pPresent->pAllocationList;
+            if (al != NULL) {
+                (VOID)InterlockedExchange(&g_WinMaliStatPresAl0Hi,
+                    (LONG)((ULONG_PTR)al[0].hDeviceSpecificAllocation >> 32));
+                (VOID)InterlockedExchange(&g_WinMaliStatPresAl0Lo,
+                    (LONG)((ULONG_PTR)al[0].hDeviceSpecificAllocation & 0xFFFFFFFFu));
+                (VOID)InterlockedExchange(&g_WinMaliStatPresAl1Lo,
+                    (LONG)((ULONG_PTR)al[1].hDeviceSpecificAllocation & 0xFFFFFFFFu));
+                /* If either entry resolves to one of OUR allocations, the frame
+                   is reachable and the count check is the only thing in the way. */
+                if (al[0].hDeviceSpecificAllocation != NULL) {
+                    (VOID)InterlockedIncrement(&g_WinMaliStatPresAl0NonNull);
+                }
+                if (al[1].hDeviceSpecificAllocation != NULL) {
+                    (VOID)InterlockedIncrement(&g_WinMaliStatPresAl1NonNull);
                 }
             }
         }

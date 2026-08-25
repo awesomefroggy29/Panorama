@@ -59,8 +59,23 @@ typedef struct _WINMALI_KMD_ALLOCATION {
     UINT                Width;
     UINT                Height;
     UINT                Pitch;        /* row stride in bytes */
-    UINT                Format;       /* D3DDDIFORMAT (or DXGI_FORMAT for
-                                         UMD 'WMAl' backbuffer allocs) */
+    /* ⛔★★★★★ ONE VARIABLE ANSWERING TWO QUESTIONS - AND THE COMMENT SAID SO.
+     *
+     * This field holds a D3DDDIFORMAT from the standard-allocation path and a
+     * DXGI_FORMAT from the UMD 'WMAl' path, and DxgkDdiDescribeAllocation cast
+     * it straight to D3DDDIFORMAT either way. DWM's primary is DXGI_FORMAT 87
+     * (B8G8R8A8_UNORM), and **87 IS NOT A MEMBER OF D3DDDIFORMAT** - that enum
+     * runs D3DDDIFMT_S8_LOCKABLE = 85 then jumps to D3DDDIFMT_G8R8 = 91, so
+     * 86..90 is a hole. dxgk learns an allocation's scanout geometry from
+     * DescribeAllocation, so it was being handed a nonsense format for exactly
+     * the allocations DWM wants to scan out - which is why FlipAllocFmt only
+     * ever latched 21, a real D3DDDIFORMAT, from the STANDARD path.
+     *
+     * ⛔ Do NOT translate unconditionally: 21/22/32 are legal values in BOTH
+     * enums, so a blind translate corrupts the standard-allocation path
+     * instead. Record which enum this came from and translate only that one. */
+    UINT                Format;       /* see FormatIsDxgi */
+    BOOLEAN             FormatIsDxgi; /* TRUE => Format is a DXGI_FORMAT */
     UINT                Usage;        /* WINMALI_ALLOC_USAGE_* */
     /* Residency state (filled by BuildPagingBuffer when the alloc gets a
        GPU VA / sysmem page set). Until then both are zero. */

@@ -231,17 +231,36 @@ typedef struct _WINMALI_VM_PT {
     FAST_MUTEX          Lock;
     /* AS slot the VM is bound to (WINMALI_AS_SLOT_MAX = unbound). */
     ULONG               AsSlot;
+    /* LRU stamp, bumped each time this VM is used for a submit. Only
+       meaningful while AsSlot < MAX; picks the eviction victim. */
+    ULONG64             LastUseStamp;
 } WINMALI_VM_PT, *PWINMALI_VM_PT;
 
-// Initialize a fresh VM PT: allocates the L0 root, picks a free AS slot,
-// programs the AS via AS_TRANSTAB. Returns STATUS_INSUFFICIENT_RESOURCES if
-// no AS slot is available.
+// Initialize a fresh VM PT: allocates the L0 root and, IF a slot is free, picks
+// an AS slot and programs it via AS_TRANSTAB.
+//
+// Running out of AS slots is NOT an error here. Only 6 slots are usable (AS0 =
+// MCU, AS1 = bringup) and the Windows shell alone runs 6 GPU clients, so failing
+// here refused every 7th process a D3D device for the rest of the boot. A VM with
+// AsSlot == WINMALI_AS_SLOT_MAX is fully constructed and mappable, just not yet
+// programmed into the MMU; WinMaliMmuVmEnsureAs binds it on the submit path.
+// Fails only if the root page table cannot be allocated.
 NTSTATUS WinMaliMmuVmInit(_Inout_ PWINMALI_ADAPTER Adapter,
                           _Out_ PWINMALI_VM_PT VmPt);
 
 // Tear down a VM PT: disables the AS, frees all PT pages.
 VOID     WinMaliMmuVmTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
                               _Inout_ PWINMALI_VM_PT VmPt);
+
+// Ensure VmPt owns an AS slot, binding one now if it does not, and mark it
+// most-recently-used. If the pool is full, evicts the least-recently-used VM
+// other than `ProtectAs` - safe because this driver binds a single CSG slot to
+// one AS at a time, so no other VM can have work in flight. Eviction only
+// unprograms the MMU: the page table survives and rebinds unchanged.
+// PASSIVE_LEVEL, serialized submit path only.
+NTSTATUS WinMaliMmuVmEnsureAs(_Inout_ PWINMALI_ADAPTER Adapter,
+                              _Inout_ PWINMALI_VM_PT VmPt,
+                              _In_ ULONG ProtectAs);
 
 // Install LPAE PTEs for `PageCount` 4 KiB pages starting at `GpuVa`. The
 // physical frames are taken from `Pfns[0..PageCount-1]`. Attrs is one of

@@ -825,9 +825,20 @@ WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
     if (args == NULL) {
         return WMERR_EINVAL;
     }
-    err = WinMaliVmCreate(adapter, args->Flags, args->UserVaRange,
-                          WinMaliDeviceOwnerToken(pEscape->hDevice),
-                          &id, &granted);
+    /* ★ IS THIS VM EVEN OWNED? The rundown matches on OwnerDevice and RETURNS
+       IMMEDIATELY when it is NULL, so a VM created on an adapter-level escape
+       (hDevice == NULL) can never be reclaimed - it pins one of the 8 AS slots
+       until reboot. Count the NULL case separately from the total: "the rundown
+       did not run" and "the rundown ran but this VM was invisible to it" look
+       identical from the leak counters alone. */
+    {
+        PVOID ownerTok = WinMaliDeviceOwnerToken(pEscape->hDevice);
+        if (ownerTok == NULL) {
+            (VOID)InterlockedIncrement(&g_WinMaliStatVmOwnerNull);
+        }
+        err = WinMaliVmCreate(adapter, args->Flags, args->UserVaRange,
+                              ownerTok, &id, &granted);
+    }
     if (err == WMERR_OK) {
         args->Id          = id;
         args->UserVaRange = granted;
@@ -1559,10 +1570,26 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
             NTSTATUS csfSt = STATUS_INVALID_PARAMETER;
             ULONG    asSlot = WINMALI_AS_SLOT_MAX;
             ULONG    vmId   = 0;
+            NTSTATUS schedSt;
+
+            /* Same one-unit rule as the dxgk submit path: the AS slot must not
+               be evictable between EnsureAs and the CALL that runs against it. */
+            schedSt = WinMaliCsfAcquireSchedLock(adapter);
+            if (!NT_SUCCESS(schedSt)) {
+                WINMALI_WARN("GroupSubmit: sched lock unavailable (0x%08x)", schedSt);
+                err = WMERR_EBUSY;
+                break;
+            }
 
             if (WinMaliGroupGetVmId(adapter, args->GroupHandle, &vmId) == WMERR_OK) {
                 PWINMALI_VM vm = WinMaliVmGet(adapter, vmId);
                 if (vm != NULL) {
+                    /* Same lazy bind as the dxgk submit path: a VM created
+                       while the AS pool was full has no slot until it first
+                       runs work. Without this the "no runnable stream" bail
+                       below fires forever for every client past the sixth. */
+                    (VOID)WinMaliMmuVmEnsureAs(adapter, &vm->Pt,
+                                               WINMALI_AS_SLOT_MAX);
                     asSlot = vm->Pt.AsSlot;
                     WinMaliVmPut(vm);
                 }
@@ -1573,6 +1600,7 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                              "(as=%u stream_va=0x%llx size=%u)",
                              args->GroupHandle, qs->QueueIndex, asSlot,
                              (ULONGLONG)qs->StreamAddr, qs->StreamSize);
+                WinMaliCsfReleaseSchedLock(adapter);
                 err = WMERR_EINVAL;
                 break;
             }
@@ -1589,6 +1617,10 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
             csfSt = WinMaliCsfSubmitGroupStream(adapter, asSlot, qs->StreamAddr,
                                                 qs->StreamSize, 0u, 500u);
             WinMaliBoFlushVm(adapter, vmId, FALSE /* invalidate DRAM->CPU */);
+            /* Critical window ends here: the slot is bound, the stream has run
+               against it, and the invalidate is done. Everything below only
+               reports what happened. */
+            WinMaliCsfReleaseSchedLock(adapter);
             if (!NT_SUCCESS(csfSt)) {
                 WINMALI_WARN("GroupSubmit: group=%u queue=%u REAL stream failed 0x%08x "
                              "(as=%u stream_va=0x%llx size=%u)",

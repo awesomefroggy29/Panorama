@@ -36,14 +36,43 @@ WinMaliVmTableInit(_Out_ PWINMALI_VM_TABLE Table)
 static VOID
 WinMaliVmFree_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ PWINMALI_VM Vm)
 {
-    if (Vm != NULL) {
-        if (Vm->PtInitialized) {
-            WinMaliMmuVmTeardown(Adapter, &Vm->Pt);
-            Vm->PtInitialized = FALSE;
-        }
-        Vm->Magic = 0;
-        ExFreePoolWithTag(Vm, WINMALI_POOL_TAG);
+    /* ⛔ SERIALIZE AGAINST AS-SLOT SCHEDULING. The eviction path holds a raw
+       pointer to a VM page table while it reprograms the MMU; freeing a VM
+       underneath it was a confirmed use-after-free. Teardown also releases an
+       AS slot, which must not race an evictor claiming that same slot.
+       Every caller of this function is at PASSIVE_LEVEL and holds no spinlock
+       (VmTableTeardown, VmDestroy and VmRundownOwner all build a free list
+       under the table lock and free it after releasing) - a mutex here is
+       therefore legal. KMUTEX is recursive, so a submit path that already
+       holds it nests correctly. */
+    NTSTATUS schedSt;
+    if (Vm == NULL) {
+        return;
     }
+    schedSt = WinMaliCsfAcquireSchedLock(Adapter);
+    if (!NT_SUCCESS(schedSt)) {
+        /* ⛔ WE FREE ANYWAY - AND THAT IS SAFE ONLY BECAUSE OF THE SWEEP.
+           The acquire aborts on thread-termination and device-removal, which
+           are exactly the process-exit and adapter-stop paths that free VMs,
+           so this is not a rare corner. Refusing to free would leak the VM and
+           its AS slot forever. What actually protects us is that
+           WinMaliMmuVmForgetOwner_ erases the back-pointer under AsSlotLock
+           BEFORE the pool free, keyed on the pointer - so no evictor can hold
+           a reference into freed memory whether or not this mutex was taken.
+           The mutex only narrows a much smaller residual: unprogramming an AS
+           that a concurrent evictor has just re-claimed. */
+        WINMALI_WARN("VmFree: sched lock unavailable (0x%08x) - relying on the "
+                     "AsSlotLock sweep", schedSt);
+    }
+    if (Vm->PtInitialized) {
+        WinMaliMmuVmTeardown(Adapter, &Vm->Pt);
+        Vm->PtInitialized = FALSE;
+    }
+    Vm->Magic = 0;
+    if (NT_SUCCESS(schedSt)) {
+        WinMaliCsfReleaseSchedLock(Adapter);
+    }
+    ExFreePoolWithTag(Vm, WINMALI_POOL_TAG);
 }
 
 VOID
@@ -114,7 +143,19 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
         NTSTATUS st = WinMaliMmuVmInit(Adapter, &vm->Pt);
         if (!NT_SUCCESS(st)) {
             ExFreePoolWithTag(vm, WINMALI_POOL_TAG);
-            WINMALI_WARN("VmCreate: WinMaliMmuVmInit failed 0x%08x", st);
+            /* ★★★ THE SUSPECTED CEILING ON GPU CLIENTS.
+             * There are only 8 Mali AS slots. When they are gone this returns
+             * WMERR_ENOMEM, the UMD screen create fails, OpenAdapter answers
+             * E_OUTOFMEMORY, and DXGI reports the opaque "Failed to find DDI to
+             * drive requested feature levels" - which is EXACTLY what the ETW
+             * trace decoded for a client that could not get a device while five
+             * others were running happily.
+             * Count it: "no new process can use the GPU" and "this process asked
+             * for something silly" are the same HRESULT to everyone above us. */
+            (VOID)InterlockedIncrement(&g_WinMaliStatVmCreateFail);
+            WINMALI_WARN("VmCreate: WinMaliMmuVmInit failed 0x%08x - AS slots "
+                         "exhausted? live VMs=%u (only 8 slots exist)",
+                         st, (unsigned)Adapter->VmTable.Count);
             return (st == STATUS_INSUFFICIENT_RESOURCES) ? WMERR_ENOMEM
                                                          : WMERR_EINVAL;
         }
@@ -136,6 +177,8 @@ WinMaliVmCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     vm->Id = (ULONG)(Adapter->VmTable.NextId++);
     InsertTailList(&Adapter->VmTable.Head, &vm->Link);
     Adapter->VmTable.Count++;
+    (VOID)InterlockedIncrement(&g_WinMaliStatVmCreates);
+    (VOID)InterlockedExchange(&g_WinMaliStatVmLive, (LONG)Adapter->VmTable.Count);
     KeReleaseSpinLock(&Adapter->VmTable.Lock, oldIrql);
 
     *OutId = vm->Id;
@@ -161,6 +204,8 @@ WinMaliVmTakeById_(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Id)
         if (vm->Id == Id) {
             RemoveEntryList(&vm->Link);
             Adapter->VmTable.Count--;
+            (VOID)InterlockedIncrement(&g_WinMaliStatVmDestroys);
+            (VOID)InterlockedExchange(&g_WinMaliStatVmLive, (LONG)Adapter->VmTable.Count);
             found = vm;
             break;
         }
@@ -203,6 +248,8 @@ WinMaliVmRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter, _In_ PVOID OwnerDevice)
         if (vm->OwnerDevice == OwnerDevice) {
             RemoveEntryList(&vm->Link);
             Adapter->VmTable.Count--;
+            (VOID)InterlockedIncrement(&g_WinMaliStatVmDestroys);
+            (VOID)InterlockedExchange(&g_WinMaliStatVmLive, (LONG)Adapter->VmTable.Count);
             InsertTailList(&freeHead, &vm->Link);
         }
     }
