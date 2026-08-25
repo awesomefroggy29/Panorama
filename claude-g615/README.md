@@ -42,10 +42,84 @@ demonstrably live — the present worker paints regardless of the OS source-visi
 Months of judging render mode by that flag were judging the wrong thing. Use instead:
 `StatSrcChg` (source content changing), `StatScanoutBlits`, `StatSweeps`, `StatWorkerTicks`.
 
-**Still open:** delivery is the worker's CPU blit (~15 fps). The dual-pipe OVL hardware flip
-lived inside `WinMaliKmdPresentDisplayOnly` — the KMDOD DDI — and is therefore *structurally
-unreachable* from render mode. 1.1.17.x lifts it into `WinMaliOvlFlipDual_()` called from the
-present worker at sweep completion, behind the fuse-burned knob `OvlFlipRender`.
+**Hardware flips now work in render mode.** The dual-pipe OVL flip used to live inside
+`WinMaliKmdPresentDisplayOnly` — the KMDOD DDI — and was therefore *structurally unreachable*
+from render. 1.1.17.x lifts it into `WinMaliOvlFlipDual_()`, called from the present worker at
+sweep completion behind the fuse-burned `OvlFlipRender`. Measured: `StatOvlFlipN` tracks
+`StatSweeps` 1:1 with zero rejects.
+
+### The flashing taskbar — fixed (1.1.18.x)
+dwm keeps **four** full-screen buffers holding **different** frames. A per-sweep contest
+between them picks a different one as ticks shift — measured across six captures as
+`bo 63,63,63,63,64,62`. Showing frame N, then N−2, then N−1 *is* the flashing. Follow one
+buffer and it becomes video again:
+
+```
+before:  bo=63 won 11/20 samples, bo=62 won 9/20     taskbar blinks in and out
+after :  bo=63 won 20/20                             steady
+```
+
+Two traps that fix exposed, both worth stealing:
+
+* **"Still live" must mean *changed recently*, not *ever changed*.** `changes` is cumulative,
+  so `live = (changes > 0)` is true for ever after the first write and the incumbent can never
+  be released. That is not stability, it is a frozen frame — user-visible as a taskbar that
+  stopped flashing while the clock stopped ticking. Hence the freshness window
+  (`UvStickyTicks`).
+* **A knob's lifetime and its fuse value are one design.** Making `UvSticky` live-read meant
+  the driver re-read the value the one-shot fuse had just burned to `0`, switching stickiness
+  off seconds into every boot. Bake the wanted value as a `WINMALI_DEF_*` default and burn
+  **to it**, never to a bare literal.
+
+### Still open: the tray/clock, and it is *not* a text-rendering bug
+A controlled A/B — same driver, same 1:1 region `(2208,1696) 736×144`, same code path, only
+the mode differs:
+
+```
+display-only : chevron, OneDrive, network, volume, "17:54:27 / 25/08/2026"
+render       : completely empty
+```
+
+Display-only composites on **WARP** (CPU); render composites on **Mali**. So the defect is in
+our GPU path — and that asymmetry is what makes the display-only capture a true control.
+
+Traced to a specific mechanism, **not yet fixed**: glyphs are CPU-rasterised by DirectWrite and
+written into `A8_UNORM` textures through `ResourceMap` — not by GPU draws, and not via
+`UpdateSubresourceUP` (measured across all nine GPU clients: every upload is a constant/vertex
+buffer or a tiny strip, nothing atlas-sized). The data is **provably present at unmap** —
+Explorer's 442×66 glyph run comes back `25438/28288` non-zero at full range — and never reaches
+the panel, while everything the GPU itself draws (A8 shape masks, the BGRA wallpaper) is
+pixel-perfect. We report `MEMORY_ARCHITECTURE UMA=TRUE CacheCoherent=FALSE`, and gallium
+panfrost never issues cache maintenance: every caller of `pan_kmod_queue_bo_map_sync()` lives
+under `src/panfrost/vulkan/`. **Unflushed CPU writes** is the leading explanation and fits every
+observation.
+
+⛔ **Forcing that chain open is a mistake we already made.** Setting
+`PAN_KMOD_BO_FLAG_WB_MMAP` on every CPU-mappable BO, and flushing on every texture unmap,
+produced several black-screen boots — dwm crashed and restarted with *no explorer at all*.
+Changing a **global allocation flag** to reach one refusing code path was the error, and the
+stop signal had been there for three builds: the flush counter read **0** every time.
+**When a chain refuses, measure why it refuses — do not force the next gate.**
+
+### Refuted by measurement (do not re-chase)
+Each with the channel calibrated *first*, so the zero meant something:
+SM5 opcode holes (0 `WMCSOPC1` in 106 logs) · glyph-atlas format support (`R8_UNORM` and
+`A8_UNORM` both `0x4507`, SAMPLE+RT) · present-fence timeouts (`WMPRESFENCE1` = 0) · A8 and
+BGRA render targets (dumped: crisp shapes, correct wallpaper) · AFBC on A8
+(`PAN_AFBC_MODE_INVALID` for arch ≥ 7) · the MediaTek write-back gap (real, but
+`panfrost_best_modifier` can never return that modifier).
+
+### Diagnostics worth stealing
+* **A 1:1 framebuffer crop, live re-aimable by registry** (`CropX/Y/W/H`, `CropEvery`) — any
+  region of the panel at full resolution without a rebuild. The 8× thumbnail *cannot* show a
+  glyph (the taskbar survives as 18 px), which is why it misled for hours. Every capture is
+  stamped `FrameCropSeq` / `FrameCropSrc` / `FrameCropBo`, because **a registry blob outlives
+  its boot and its age is invisible in its content** — a stale render-mode crop once
+  impersonated a display-only control.
+* **`TracePrevBoot`** — the whole **256 KB** DbgPrint ring snapshotted at `DriverEntry`, before
+  this boot overwrites it. 64 KB was not enough: it only ever caught the *firmware* log, since
+  EDK2 refills the ring before our driver loads.
+* Counters over the map/upload paths (`WMMAPW`, `WMUPL`, `WMMAP1`).
 
 ---
 
