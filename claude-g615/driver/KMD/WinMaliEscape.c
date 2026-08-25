@@ -1648,6 +1648,43 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                 (VOID)InterlockedExchange(&g_WinMaliStatCsfLastVaHi,
                                           (LONG)(ULONG)((qs->StreamAddr >> 32) & 0xFFFFFFFFull));
                 (VOID)InterlockedIncrement(&g_WinMaliStatCsfFailCount);
+
+                /* ★★ FLUSH THE REASON NOW, NOT AT THE NEXT PUBLISH.
+                 *
+                 * The globals above are published by the present worker using
+                 * the NON-flushed writer (WinMaliDriver.c ~3603). But THIS
+                 * failure is the last thing that happens before the box wedges,
+                 * so that publish either never runs again or never reaches the
+                 * hive before the power cycle.
+                 *
+                 * MEASURED, and this is why it matters: FOUR hangs - 25/08
+                 * 19:37, 22:32, 23:36 and 26/08 00:09 - every one of them ended
+                 * with "GROUP_SUBMIT escape FAILED err=-5" as the final line in
+                 * dwm's UMD log, and every one came back after the power cycle
+                 * with CsfLastStatus=0 and CsfFailCount=0. The driver recorded
+                 * the reason four times and threw it away four times.
+                 *
+                 * DxgkDdiEscape runs at PASSIVE_LEVEL, and this path fired 4
+                 * times in 509 logs, so the cost of flushing is irrelevant.
+                 * ⛔ Only names that ALREADY EXIST in the key are written - a
+                 * name first created late in the publish order can fail to be
+                 * created at all (see the registry value-cap note). */
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfLastStatus", (ULONG)csfSt);
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfLastAs",     (ULONG)asSlot);
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfLastSize",   (ULONG)qs->StreamSize);
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfLastVaLo",
+                        (ULONG)(qs->StreamAddr & 0xFFFFFFFFull));
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfLastVaHi",
+                        (ULONG)((qs->StreamAddr >> 32) & 0xFFFFFFFFull));
+                (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                        L"CsfFailCount",
+                        (ULONG)g_WinMaliStatCsfFailCount);
+
                 err = (csfSt == STATUS_DEVICE_NOT_READY) ? WMERR_EINVAL : WMERR_EIO;
                 break;
             }

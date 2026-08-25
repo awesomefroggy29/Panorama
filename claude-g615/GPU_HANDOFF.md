@@ -299,6 +299,74 @@ first-8 unconditional prints. A busier steady-state read is still worth taking, 
 ⚠ `0x00304507` (BGRA) vs `0x00004507` (A8/R8) in `CheckFormatSupport` differ only by
 `0x00300000` = the two multisample bits. Already refuted as a cause; not a lead.
 
+### 4.7 THE RENDER-MODE HANG HAS ONE SIGNATURE, AND IT IS **NOT A REGRESSION**
+
+Every render-mode hang ends the same way. The last line dwm's UMD ever writes is:
+
+```
+wm: WMDXGICALL _TrimResidencySet #1
+wm: GROUP_SUBMIT escape FAILED err=-5 group=2 queues=1 cs0=0xfffffce1a000 size0=8616 syncs=2
+```
+
+`err=-5` is `WMERR_EIO`, returned from `WinMaliEscape.c` when the real CSF stream submit
+fails (`WinMaliEscapeGroupSubmit_`, ~line 1651).
+
+**Frequency across the whole log archive: 4 of 509 non-empty logs. All four are `dwm`,
+and all four are the final line before a hang.**
+
+| when | build |
+|---|---|
+| **25/08 19:37** | **predates the 1.1.21.x work entirely** |
+| 25/08 22:32 | 1.1.21.0 (probes still in) |
+| 25/08 23:36 | 1.1.21.1 + `PAN_MESA_DEBUG=linear` |
+| 26/08 00:09 | 1.1.21.2, no env var |
+
+⇒ **Not a regression from the probe removal or the census.** The identical terminal
+signature exists hours before either landed, and it survives across three different
+builds and with/without the linear flag.
+
+⇒ It is also **not a config regression**: the full input-knob set on a fresh boot was
+diffed against a known-healthy snapshot and is **identical** — `ChildCfg=7`,
+`ComputeOnly=0`, `MonModeAdd=1`, `OvlFlip=2`, `PathXform2=5`, `PresentTickMs=33`,
+`PresentTimerHz=12`, `SegmentShape=1`, `UvSticky=1/4`, `VidPnSources=1`, and the rest.
+
+⛔ `_TrimResidencySet` is **not** the trigger — it appears in **268** logs. Trimming is
+routine; the `-EIO` submit is rare and fatal.
+
+⚠ Context worth reading before chasing this: `WinMaliEscape.c` ~1085 documents the
+recorded **0x9F P2=0x12C** class — a syncobj that never signals (exactly what a wedged
+GPU produces) parks a user thread inside `DxgkDdiEscape`, the process becomes
+unkillable, PnP can never take the device lock, and a GPU that merely stopped drawing
+takes the whole machine down. A plausible terminal chain is: submit fails → group marked
+fatal → a later wait never signals → machine dies. **Plausible, not proven.**
+
+#### Why we had four failures and zero recorded reasons — fixed in 1.1.21.3
+
+A previous session already latched the real reason into `CsfLastStatus`, `CsfLastAs`,
+`CsfLastSize`, `CsfLastVaLo/Hi` and `CsfFailCount`. But those globals are published by
+the **present worker** using the **non-flushed** writer — and this failure is the last
+thing that happens before the box wedges, so the publish either never runs again or
+never reaches the hive. Every one of the four hangs came back after the power cycle
+reading `CsfLastStatus=0`, `CsfFailCount=0`. **The driver recorded the reason four times
+and threw it away four times.**
+
+1.1.21.3 writes those six values with `WinMaliWriteParamsDwordFlushed` **at the failure
+site**. `DxgkDdiEscape` is PASSIVE_LEVEL and the path fired 4 times in 509 logs, so the
+flush cost is irrelevant. Only names that **already exist** in the key are written — a
+name first created late in the publish order can fail to be created at all.
+
+⇒ **The next hang should name its own cause.** Read `CsfLastStatus` (an NTSTATUS),
+`CsfLastAs` and `CsfLastVaLo/Hi` after the power cycle.
+
+#### ⛔ Instrument limit: `TracePrevBoot` is useless after a hard power cycle
+
+The EDK2 ring at PA `0x48300000` is refilled by firmware on every cold boot **before**
+our driver loads, so after a hang + power cycle `TracePrevBoot` contains pure firmware
+log (`SCPBOOT`, `MtkUfs`, `LVTS`, `mtkwifi`) and **no `[WinMali]` line at all**. It only
+carries KMD lines across a driver reload *within* a live boot session.
+✅ The **UMD logs in `C:\umdlog` are files on disk and do survive** — that is how the
+signature above was recovered. Go there first after a hang.
+
 ---
 
 ## 5. Solved — root causes worth remembering
