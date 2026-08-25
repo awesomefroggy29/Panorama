@@ -254,6 +254,13 @@ atlas is wrong in the specific way an alpha mask goes wrong when its coverage re
 1.0 or 0.0: the Start logo is **solid white**, the search magnifier is a **solid white
 blob**, and the clock, date, chevron and network glyphs are **absent**.
 
+**The cleanest single control for this is inside one widget.** In the taskbar search
+pill, the Bing daily photo renders in **perfect colour detail** while the search
+magnifier glyph **immediately beside it** is a solid white blob. Same widget, adjacent
+pixels, same frame, same draw call sequence — the only difference is which atlas the
+source came from. Photo = BGRA = correct. Glyph = A8 = blown out. If you need one image
+to explain this bug to someone, use that one.
+
 ⚠ This is NOT the old "text doesn't render" or "A8 format unsupported" claim — both are
 refuted and stay refuted (`A8_UNORM` reports `0x4507`, SAMPLE+RT, and desktop label
 glyphs render perfectly). The refined statement is narrower and about transport:
