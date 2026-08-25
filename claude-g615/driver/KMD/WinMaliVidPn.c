@@ -1763,6 +1763,13 @@ WinMaliKmdPresentDisplayOnly(_In_ CONST HANDLE hAdapter,
             }
         }
     }
+
+    /* THE CONTROL GROUP. Without this the crop existed only on the render path, so
+     * "the clock region is empty" had nothing to be empty COMPARED TO - and the
+     * blob left in the registry by the previous render boot read exactly like a
+     * display-only sample. Same helper, same region, tagged Which=2. */
+    WinMaliPublishCrop_((PUCHAR)src, WINMALI_FB_HEIGHT, (ULONG)srcPitch,
+                        copyBytes, 2u);
     return STATUS_SUCCESS;
 }
 

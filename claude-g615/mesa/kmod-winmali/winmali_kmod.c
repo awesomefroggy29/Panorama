@@ -16,6 +16,7 @@
 
 #ifdef _WIN32
 
+#include <intrin.h>   /* _ReturnAddress - names the destroy caller without symbols */
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -100,6 +101,45 @@ struct winmali_kmod_bo {
       uint32_t handle;
       uint64_t read_point;
       uint64_t write_point;
+      /* ⛔★★★★★ EXPLICIT OWNERSHIP. TRUE only when WE minted this handle.
+       *
+       * bo_free used to decide ownership from `!bo->exclusive_vm`, which asks
+       * the WRONG QUESTION. MEASURED 2026-08-18 in dwm:
+       *   bo_free handle=1 exclusive_vm=000002C7BB1AFBC0 imported=0 destroy=0  (ok)
+       *   bo_free handle=1 exclusive_vm=0000000000000000 imported=1 destroy=1  (!!)
+       * An IMPORTED BO carries the VM's sync handle yet is registered with
+       * exclusive_vm=NULL (pan_kmod_bo_init(..., NULL, ...) on the import path),
+       * so the guard concluded it owned handle 1 and destroyed it - FOUR times.
+       * dwm then signalled the dead handle 79 times and stopped compositing for
+       * the whole boot: frozen desktop, no taskbar, dead input, StatSrcChg=0.
+       *
+       * "Has no exclusive_vm" and "minted its own syncobj" are NOT the same
+       * predicate. Record the fact instead of re-deriving it. */
+      bool     owns_handle;
+      /* ⛔★★★★★ THE HANDLE **WE MINTED** - NOT the same thing as sync.handle.
+       *
+       * MEASURED 2026-08-18: an imported BO mints handle 18, and after the
+       * first submit panthor_kmod_bo_attach_sync_point() (below) OVERWRITES
+       * sync.handle with the VM's handle (1), because for a BO with no
+       * exclusive_vm it "tracks the external handle directly". bo_free then
+       * destroyed sync.handle - i.e. the VM's shared handle, killing dwm for
+       * the whole boot - AND leaked the handle it had actually minted.
+       *
+       * sync.handle answers "what do I sync against right now?" and can be
+       * someone else's. THIS answers "what must I free?" and is only ever
+       * ours. They were one variable serving two meanings; that is the bug.
+       * 0 = we minted nothing and must free nothing. */
+      uint32_t owned_handle;
+      /* ⛔ DOUBLE-FREE TRIPWIRE. The log shows FOUR bo_free calls each reporting
+       * handle=1, but the KMD handle allocator is a boot-unique monotonic
+       * counter that can mint a given handle only ONCE per boot
+       * (WinMaliSync.c: g_WinMaliSyncHandleNext), and this function is the only
+       * importer - so "four BOs that each minted handle 1" is IMPOSSIBLE.
+       * The surviving explanations are one BO freed four times, or a BO whose
+       * sync.handle was never assigned. `bo=%p` separates them at a glance:
+       * the same pointer four times means a refcount bug, four pointers means
+       * the handle came from somewhere this code does not know about. */
+      uint32_t freed_magic;
    } sync;
 
    /* Phase 1: if non-zero this BO is backed by a dxgk allocation the WDDM
@@ -502,6 +542,68 @@ winmali_use_dxgk_fences(void)
    return s_use != 0;
 }
 
+/* ⛔★★★★★ LIVE VM SYNC-HANDLE REGISTRY - THE DESKTOP-SAVING GUARD.
+ *
+ * MEASURED 2026-08-18 (dwm, clean boot): dwm creates VM id=1 with sync
+ * handle=1, then bo_free destroys "handle 1" FOUR times, after which every
+ * submit returns err=-2 (ENOENT) - 79 of them - and dwm stops compositing for
+ * the entire boot. Frozen desktop, no taskbar, dead input.
+ *
+ * The VM's sync handle is shared by construction: csf_submit re-reads
+ * panthor_kmod_vm_sync_handle(dev->kmod.vm) on EVERY submit. So ANY path that
+ * destroys it takes the whole session down, permanently, from one call.
+ * A shared handle with many potential destroyers needs a single owner, and the
+ * VM is it.
+ *
+ * This registry makes that ownership enforceable rather than assumed: the VM
+ * registers its handle at create and unregisters at destroy, and syncobj_destroy
+ * refuses any handle currently owned by a live VM. Leaking a handle is a
+ * bounded, silent cost; destroying this one costs the entire desktop.
+ *
+ * ⚠ This is a GUARD, not the diagnosis - it names the culprit in the log
+ * (WMSYNCGUARD1 + caller RA) instead of hiding it. Keep reading that line even
+ * once the desktop is stable. */
+#define WINMALI_MAX_VM_SYNC 16
+static uint32_t g_vm_sync_handles[WINMALI_MAX_VM_SYNC];
+
+static void
+winmali_vm_sync_register(uint32_t h)
+{
+   if (!h)
+      return;
+   for (unsigned i = 0; i < WINMALI_MAX_VM_SYNC; i++) {
+      if (g_vm_sync_handles[i] == 0) {
+         g_vm_sync_handles[i] = h;
+         return;
+      }
+   }
+   mesa_loge("wm: WMSYNCGUARD0 VM sync registry FULL (%u slots) - handle=%u is "
+             "UNPROTECTED; a stray bo_free can now kill this VM",
+             WINMALI_MAX_VM_SYNC, h);
+}
+
+static void
+winmali_vm_sync_unregister(uint32_t h)
+{
+   for (unsigned i = 0; i < WINMALI_MAX_VM_SYNC; i++) {
+      if (g_vm_sync_handles[i] == h) {
+         g_vm_sync_handles[i] = 0;
+         return;
+      }
+   }
+}
+
+static bool
+winmali_vm_sync_is_live(uint32_t h)
+{
+   if (!h)
+      return false;
+   for (unsigned i = 0; i < WINMALI_MAX_VM_SYNC; i++)
+      if (g_vm_sync_handles[i] == h)
+         return true;
+   return false;
+}
+
 static int
 syncobj_create_timeline(uint32_t *out_handle)
 {
@@ -516,12 +618,64 @@ syncobj_create_timeline(uint32_t *out_handle)
    if (err)
       return err;
    *out_handle = req.Handle;
+   /* ⛔ WMSYNCMINT1 - "WAS THIS HANDLE MINTED, OR COPIED?"
+    *
+    * The KMD allocator is a boot-unique monotonic counter that NEVER recycles
+    * (WinMaliSync.c: g_WinMaliSyncHandleNext), so a given handle can be minted
+    * at most ONCE per boot. Yet dwm's log shows FOUR distinct imported BOs each
+    * holding handle=1 - which that allocator cannot produce. Either the counter
+    * is not what it claims, or those BOs never minted and got handle 1 by copy.
+    *
+    * Printing every mint with its return address separates the two in one boot,
+    * instead of a fifth round of reasoning about who could have copied it. */
+   mesa_loge("wm: WMSYNCMINT1 syncobj_create_timeline -> handle=%u caller_ra=%p",
+             *out_handle, _ReturnAddress());
    return 0;
 }
 
 static int
 syncobj_destroy(uint32_t handle)
 {
+   /* ⛔★★★★★ THE REAL CHOKE POINT - THERE ARE **TWO** ESCAPE SENDERS.
+    *
+    * I first instrumented winmali_d3dkmt_syncobj_destroy (the d3dkmt helper the
+    * drmSyncobjDestroy compat shim calls) and it logged ZERO destroys, while the
+    * KMD ledger still recorded handle=1 being destroyed by an explicit
+    * SyncObjDestroy escape from dwm's pid. Reason: THIS function builds the
+    * escape itself via escape_simple() and never goes through that helper. Right
+    * instinct, wrong function.
+    *
+    * ⇒ When instrumenting a "choke point", first PROVE it is the only one. Two
+    * senders for the same escape op is exactly how a funnel stops being a funnel.
+    *
+    * Context: dwm's VM sync handle=1 is destroyed and then signalled 79 times
+    * until dwm stops compositing for the whole boot. All three suspected callers
+    * (vm_destroy x2 instrumented and never firing, bo_create+exclusive_vm,
+    * bo_import which mints its own handle) checked out CORRECT - so the caller
+    * is something not yet considered. _ReturnAddress() names it without symbols;
+    * distinct RAs group the call sites. */
+   mesa_loge("wm: WMSYNCDESTROY2 syncobj_destroy(handle=%u) caller_ra=%p dxgk=%d",
+             handle, _ReturnAddress(),
+             (winmali_use_dxgk_fences() && g_wddm_ops.fence_destroy != NULL) ? 1 : 0);
+
+   /* ⛔★★★★★ REFUSE TO DESTROY A LIVE VM'S SYNC HANDLE.
+    *
+    * This one destroy costs the whole desktop: csf_submit re-reads the VM sync
+    * handle every frame, so once it is gone EVERY submit returns ENOENT and dwm
+    * stops compositing for the rest of the boot (measured: 79 consecutive).
+    * Leaking a syncobj is bounded and silent; this is neither.
+    *
+    * The log names the caller (RA) so the guard reports the bug instead of
+    * burying it - if this line ever fires, there is still a real ownership bug
+    * upstream to fix. */
+   if (winmali_vm_sync_is_live(handle)) {
+      mesa_loge("wm: WMSYNCGUARD1 REFUSED destroy of handle=%u - it belongs to a "
+                "LIVE VM and is shared by every submit. caller_ra=%p. This is a "
+                "REAL ownership bug upstream; the guard only stops it taking the "
+                "desktop down.", handle, _ReturnAddress());
+      return 0;
+   }
+
    if (winmali_use_dxgk_fences() && g_wddm_ops.fence_destroy != NULL) {
       g_wddm_ops.fence_destroy(g_wddm_ops.cookie, handle);
       return 0;
@@ -742,6 +896,8 @@ winmali_kmod_bo_alloc(struct pan_kmod_dev *dev,
     * timeline so unrelated work doesn't block reads. */
    if (exclusive_vm) {
       wbo->sync.handle = to_winmali_vm(exclusive_vm)->sync.handle;
+      wbo->sync.owns_handle = false;   /* SHARED - the VM owns it, never free it here */
+      wbo->sync.owned_handle = 0;
    } else {
       uint32_t h = 0;
       int serr = syncobj_create_timeline(&h);
@@ -757,6 +913,8 @@ winmali_kmod_bo_alloc(struct pan_kmod_dev *dev,
          return NULL;
       }
       wbo->sync.handle = h;
+      wbo->sync.owns_handle = true;    /* we minted it, so we free it */
+      wbo->sync.owned_handle = h;      /* remember WHICH one, sync.handle can be replaced */
    }
    wbo->sync.read_point  = 0;
    wbo->sync.write_point = 0;
@@ -862,9 +1020,45 @@ winmali_kmod_bo_free(struct pan_kmod_bo *bo)
 {
    struct winmali_kmod_bo *wbo = to_winmali_bo(bo);
 
-   /* If the BO owns its sync handle (no exclusive_vm), tear it down. */
-   if (!bo->exclusive_vm)
-      syncobj_destroy(wbo->sync.handle);
+   /* ⛔★★★★★ THIS IS WHERE dwm's VM SYNC HANDLE DIES - FOUR TIMES OVER.
+    *
+    * MEASURED: dwm creates VM id=1 with sync handle=1, then
+    *   syncobj_destroy(handle=1) x4, ALL from this one return address,
+    * after which every submit fails ENOENT and dwm stops compositing for the
+    * whole boot. A handle freed FOUR times is a SHARED handle being released by
+    * multiple owners - `bo->exclusive_vm` is evidently NULL on BOs that carry
+    * `vm->sync.handle`, so this guard does not protect it.
+    *
+    * The guard and the assignment use DIFFERENT predicates, which is the bug
+    * shape: bo_create copies the VM's handle when `exclusive_vm` is non-NULL,
+    * but ownership is later judged by `bo->exclusive_vm` as stored by
+    * pan_kmod_bo_init - and the import path passes NULL there explicitly.
+    *
+    * Log the discriminator rather than reason about it a fourth time: print the
+    * handle, the stored exclusive_vm, and whether the BO is IMPORTED. */
+   mesa_loge("wm: WMBOFREE1 bo_free bo=%p handle=%u owned=%u exclusive_vm=%p "
+             "imported=%d%s",
+             (void *)wbo, wbo->sync.handle, wbo->sync.owned_handle,
+             (void *)bo->exclusive_vm,
+             (bo->flags & PAN_KMOD_BO_FLAG_IMPORTED) ? 1 : 0,
+             (wbo->sync.freed_magic == 0xDEADBE1Fu)
+                ? "  *** DOUBLE FREE - THIS BO WAS ALREADY FREED ***" : "");
+   wbo->sync.freed_magic = 0xDEADBE1Fu;
+
+   /* Free the handle WE MINTED - never sync.handle, which
+      panthor_kmod_bo_attach_sync_point may have replaced with somebody else's
+      (measured: the VM's handle 1, destroyed 4x, desktop dead for the boot). */
+   if (wbo->sync.owned_handle != 0) {
+      if (wbo->sync.owned_handle != wbo->sync.handle) {
+         mesa_loge("wm: WMBOFREE2 bo=%p freeing MINTED handle=%u while "
+                   "sync.handle=%u (it was retargeted by attach_sync_point) - "
+                   "freeing the right one",
+                   (void *)wbo, wbo->sync.owned_handle, wbo->sync.handle);
+      }
+      syncobj_destroy(wbo->sync.owned_handle);
+      wbo->sync.owned_handle = 0;
+      wbo->sync.owns_handle  = false;
+   }
 
    /* Destroy the KMD BO whenever the handle is KMD-issued. This is no longer
       an either/or with the dxgk backing: an IMPORT now has BOTH a KMT handle
@@ -939,13 +1133,92 @@ winmali_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 static int
 winmali_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 {
-   (void)dev;
-   /* pan_kmod tracks pending deferred BO syncs in dev->pending_bo_syncs;
-    * panthor walks that list and emits one BO_SYNC ioctl. With user-mode
-    * mappings unavailable on Windows (mmap is served by the KMD anyway),
-    * there's nothing for the user side to flush. The KMD performs cache
-    * maintenance synchronously inside BoCreate / BoMmapOffset. */
-   return 0;
+   /* ⛔★★★★★ THIS USED TO `return 0`, AND THAT LOSES EVERY CPU WRITE.
+    *
+    * The old comment claimed "the KMD performs cache maintenance synchronously
+    * inside BoCreate / BoMmapOffset", so nothing needed flushing here. Those run
+    * ONCE - at allocation and at mapping - never after the app WRITES. And we report
+    * MEMORY_ARCHITECTURE UMA=TRUE **CacheCoherent=FALSE**, so a CPU write sits in the
+    * CPU cache until something cleans it.
+    *
+    * MEASURED (WMMAPW, 1.1.19.9): DirectWrite writes glyph runs into A8 textures and
+    * the data is provably present at unmap - Explorer 442x66 with 25438/28288
+    * non-zero at full range. Those glyphs never reach the panel, while everything the
+    * GPU itself draws (A8 shape masks, the BGRA wallpaper) is perfect. That is the
+    * signature of unflushed CPU writes: the GPU samples stale memory.
+    * ⚠ A CPU-side read-back CANNOT detect this - it reads the same cached view the
+    * writer used. Verify on the PANEL, not with a read-back.
+    *
+    * The KMD already implements the operation (escape op 15 BoSync, ForDevice =
+    * "flush caches before GPU access") and pan_kmod already queues the ranges; this
+    * backend simply never called it. Walk the list panthor walks and emit one escape;
+    * the template is panthor_kmod_flush_bo_map_syncs().
+    *
+    * ⛔ handle_is_kmd IS MANDATORY, NOT DEFENSIVE: a synthetic id would aim the flush
+    * at an UNRELATED BoTable BO. BoSetLabel skips those because a mislabel is merely
+    * cosmetic - here it would corrupt another BO's coherency state, so skipping is
+    * the only safe answer. */
+   unsigned n = util_dynarray_num_elements(&dev->pending_bo_syncs.array,
+                                           struct pan_kmod_deferred_bo_sync);
+   if (n == 0)
+      return 0;
+
+   const size_t header = sizeof(WINMALI_ESCAPE_HEADER);
+   const size_t ops_off = header + sizeof(WINMALI_BO_SYNC);
+   size_t total = WINMALI_ALIGN_UP(ops_off + (size_t)n * sizeof(WINMALI_BO_SYNC_OP),
+                                   WINMALI_TAIL_ALIGN);
+
+   uint8_t *buf = (uint8_t *)calloc(1, total);
+   if (!buf)
+      return -ENOMEM;
+
+   WINMALI_ESCAPE_HEADER *hdr = (WINMALI_ESCAPE_HEADER *)buf;
+   WINMALI_BO_SYNC *args = (WINMALI_BO_SYNC *)(buf + header);
+   WINMALI_BO_SYNC_OP *ops = (WINMALI_BO_SYNC_OP *)(buf + ops_off);
+
+   uint32_t count = 0;
+   util_dynarray_foreach(&dev->pending_bo_syncs.array,
+                         struct pan_kmod_deferred_bo_sync, sync) {
+      if (sync->bo == NULL || !to_winmali_bo(sync->bo)->handle_is_kmd)
+         continue;
+      ops[count].Handle = sync->bo->handle;
+      /* The escape carries one direction per op. The direction that matters for
+         correctness here is ForDevice (make CPU writes visible to the GPU), so ask
+         for that in both cases rather than silently doing nothing for the
+         FLUSH_AND_INVALIDATE flavour. */
+      ops[count].Type = WinMaliBoSyncForDevice;
+      ops[count].Offset = sync->start;
+      ops[count].Size = sync->size;
+      count++;
+   }
+
+   if (count == 0) {
+      free(buf);
+      return 0;
+   }
+
+   hdr->Magic = WINMALI_ESCAPE_MAGIC;
+   hdr->AbiMajor = WINMALI_ABI_MAJOR;
+   hdr->AbiMinor = WINMALI_ABI_MINOR;
+   hdr->Op = WinMaliEscapeOp_BoSync;
+   hdr->PayloadSize = (uint32_t)total;
+   args->OpsCount = count;
+   args->OpsOffset = (uint32_t)ops_off;
+
+   int err = winmali_d3dkmt_escape(buf, total);
+   if (err) {
+      static unsigned s_warned = 0;
+      if ((s_warned++ % 64u) == 0u)
+         mesa_loge("wm: WMBOSYNC1 BoSync escape failed err=%d for %u op(s) - CPU "
+                   "writes may not be visible to the GPU", err, count);
+   } else {
+      static unsigned s_ok = 0;
+      if ((s_ok++ % 256u) == 0u)
+         mesa_loge("wm: WMBOSYNC2 flushed %u BO range(s) for device access "
+                   "(call #%u)", count, s_ok);
+   }
+   free(buf);
+   return err;
 }
 
 static bool
@@ -1004,8 +1277,17 @@ winmali_kmod_bo_set_label(struct pan_kmod_dev *dev,
 void *
 winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
 {
-   if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP)
+   if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP) {
+      /* "mapping src-texture failed" is emitted by util_resource_copy_region and
+       * names neither the BO nor the reason. Three different refusals below all
+       * surface as that one line, so say which one fired. Rate-limited: this is
+       * on a per-frame path. */
+      static unsigned s_nommap = 0;
+      if ((s_nommap++ % 128) == 0)
+         mesa_loge("wm: bo_map_cpu REFUSED bo=%u size=%llu - NO_MMAP flag (seen %u)",
+                   bo->handle, (unsigned long long)bo->size, s_nommap);
       return MAP_FAILED;
+   }
 
    /* dxgk-native BOs are already CPU-mapped for their lifetime via pfnLockCb
     * (captured at alloc). Hand back that persistent VA - no escape. */
@@ -1030,6 +1312,16 @@ winmali_kmod_bo_map_cpu(struct pan_kmod_bo *bo, int prot)
     * memory that had already passed a NULL check (pan_cmdstream.h:277,
     * pan_texture.c:420). Fail cleanly and let the caller handle it. */
    if (wbo->wddm_kmt_handle) {
+      /* An IMPORTED surface that did not adopt a CPU VA. Since the adoption fix
+       * this should be rare - when it fires, the UMD never registered that kmt
+       * (or the size guard rejected it), which is a different bug from NO_MMAP
+       * and from an escape failure. Name it. */
+      static unsigned s_nova = 0;
+      if ((s_nova++ % 64) == 0)
+         mesa_loge("wm: bo_map_cpu REFUSED bo=%u kmt=0x%x size=%llu - imported "
+                   "with NO adopted CPU VA (seen %u)",
+                   bo->handle, wbo->wddm_kmt_handle,
+                   (unsigned long long)bo->size, s_nova);
       errno = ENXIO;
       return MAP_FAILED;
    }
@@ -1232,7 +1524,7 @@ static struct {
    uint32_t      count;
    uint32_t      cap;
    struct { uint32_t kmt; uint32_t id; uint32_t id_hi;
-            void *cpu; uint64_t size; } *ent;
+            void *cpu; uint64_t size; uint32_t pitch; } *ent;
 } g_kmt_alloc_ids = { SIMPLE_MTX_INITIALIZER, 0, 0, NULL };
 
 /* ★ The locked CPU VA of a dxgk allocation, from pfnLockCb(LockEntire).
@@ -1244,7 +1536,7 @@ static struct {
  * escape submission, because dxgk never learns the surface is needed and so
  * never pages it in (measured: 0x92 returns -EAGAIN forever, even on re-import). */
 static void
-winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
+winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size, uint32_t pitch)
 {
    if (kmt == 0 || cpu == NULL || size == 0)
       return;
@@ -1252,8 +1544,9 @@ winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
    simple_mtx_lock(&g_kmt_alloc_ids.lock);
    for (uint32_t i = 0; i < g_kmt_alloc_ids.count; i++) {
       if (g_kmt_alloc_ids.ent[i].kmt == kmt) {
-         g_kmt_alloc_ids.ent[i].cpu  = cpu;
-         g_kmt_alloc_ids.ent[i].size = size;
+         g_kmt_alloc_ids.ent[i].cpu   = cpu;
+         g_kmt_alloc_ids.ent[i].size  = size;
+         if (pitch) g_kmt_alloc_ids.ent[i].pitch = pitch;
          simple_mtx_unlock(&g_kmt_alloc_ids.lock);
          return;
       }
@@ -1270,25 +1563,29 @@ winmali_record_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
    g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].kmt  = kmt;
    g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].cpu  = cpu;
    g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].size = size;
+   g_kmt_alloc_ids.ent[g_kmt_alloc_ids.count].pitch = pitch;
    g_kmt_alloc_ids.count++;
    simple_mtx_unlock(&g_kmt_alloc_ids.lock);
 }
 
 void
-winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size)
+winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size,
+                                uint32_t pitch)
 {
-   winmali_record_alloc_cpu(kmt, cpu, size);
+   winmali_record_alloc_cpu(kmt, cpu, size, pitch);
 }
 
 static void
-winmali_alloc_cpu_for_kmt(uint32_t kmt, void **cpu, uint64_t *size)
+winmali_alloc_cpu_for_kmt(uint32_t kmt, void **cpu, uint64_t *size,
+                          uint32_t *pitch)
 {
-   *cpu = NULL; *size = 0;
+   *cpu = NULL; *size = 0; if (pitch) *pitch = 0;
    simple_mtx_lock(&g_kmt_alloc_ids.lock);
    for (uint32_t i = 0; i < g_kmt_alloc_ids.count; i++) {
       if (g_kmt_alloc_ids.ent[i].kmt == kmt) {
          *cpu  = g_kmt_alloc_ids.ent[i].cpu;
          *size = g_kmt_alloc_ids.ent[i].size;
+         if (pitch) *pitch = g_kmt_alloc_ids.ent[i].pitch;
          break;
       }
    }
@@ -1495,10 +1792,75 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
       return NULL;
    }
    wbo->sync.handle = h;
+   wbo->sync.owns_handle = true;    /* we minted it, so we free it */
+   wbo->sync.owned_handle = h;      /* remember WHICH one, sync.handle can be replaced */
    wbo->sync.read_point  = 0;
    wbo->sync.write_point = 0;
    wbo->wddm_kmt_handle  = kmt_allocation_handle;
-   wbo->wddm_cpu_va      = NULL;   /* GPU-only: DWM composites it, not the CPU. */
+
+   /* ⛔ THIS USED TO BE A HARD `NULL` WITH THE COMMENT "GPU-only: DWM composites
+    * it, not the CPU" - AND THAT ASSUMPTION IS NOW THE THING BLOCKING PIXELS.
+    *
+    * Measured 2026-08-16, clean boot, real traffic: the GPU completes every
+    * submit (CsSubmits 886 / CsOk 886 / CsTimeouts 0) and the surface the present
+    * worker scans holds a full desktop (StatSrcNonBlack 646/646, 639 edges) - but
+    * its change counter is FLAT. Rendering lands in panfrost's own GPU BOs;
+    * delivery into this imported primary is a CPU copy
+    * (panfrost_resource_copy_region), and that copy dies here: with
+    * wddm_cpu_va == NULL, winmali_kmod_bo_map_cpu() refuses every KMT-imported
+    * destination (it must - the escape addresses BOs by a handle meaningless for
+    * an imported surface), so `mapping dst-texture failed` and the frame is
+    * dropped. The scanned pages therefore keep whatever was in them at logon.
+    *
+    * The premise no longer holds: since escape 0x93 the UMD locks these surfaces
+    * and registers the resulting user VA, and the KMD wraps THOSE EXACT PAGES as
+    * the scanout source. So the CPU VA is both known and precisely the memory the
+    * panel reads. Hand it back.
+    *
+    * ⚠ Only when the registered extent covers the whole BO. A short mapping here
+    * is a heap corruptor that passes every `if (!ptr)` check - the same trap
+    * bo_map_cpu already guards with its MappedBytes contract check. */
+   {
+      void *reg_cpu = NULL;
+      uint64_t reg_size = 0;
+      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &reg_cpu, &reg_size, NULL);
+      /* ⛔★★★★★ COMPARE PAGE-GRANULAR, NOT BYTE-EXACT.
+       *
+       * `size` is the BO size, which the allocator PAGE-ROUNDS. `reg_size` is the
+       * registered extent, which is the real pixel data (stride * height). For a
+       * surface whose data is not a whole number of pages these differ by up to
+       * one page, and a byte-exact `reg_size >= size` then rejects a surface
+       * every byte of which IS registered.
+       *
+       * MEASURED 2026-08-17, dwm's own log:
+       *   kmt=0xc0005740 NO usable CPU VA (reg_size=1483776 bo_size=1486848)
+       *   OpenResource: OPENED shared surface 2944x126 stride=11776
+       *   126 * 11776 == 1483776 exactly; the BO is 3072 B (< 1 page) larger.
+       * That surface is 2944x126 - a full-width 126px strip, i.e. THE TASKBAR,
+       * the one element that never appears on the panel. Every other import
+       * adopted its VA and only this one was refused.
+       *
+       * Rounding UP is safe here specifically because the VA comes from a
+       * probe-locked MDL and MDLs lock WHOLE PAGES: the bytes between reg_size
+       * and the page boundary are really mapped, so a copy that runs to the end
+       * of the final page cannot leave the locked region. This is NOT the "short
+       * mapping" hazard the comment above warns about - that is a mapping which
+       * ends before the real data does, which this still refuses. */
+      const uint64_t reg_pages = (reg_size + 4095ull) & ~4095ull;
+      if (reg_cpu != NULL && reg_pages >= size) {
+         wbo->wddm_cpu_va = reg_cpu;
+         mesa_loge("wm: imported kmt=0x%x ADOPTS registered CPU VA %p (%llu >= %llu)"
+                   " - CPU delivery into the scanout source is now possible",
+                   kmt_allocation_handle, reg_cpu,
+                   (unsigned long long)reg_size, (unsigned long long)size);
+      } else {
+         wbo->wddm_cpu_va = NULL;
+         mesa_loge("wm: imported kmt=0x%x has NO usable CPU VA (cpu=%p reg_size=%llu"
+                   " bo_size=%llu) - CPU delivery will be refused for it",
+                   kmt_allocation_handle, reg_cpu,
+                   (unsigned long long)reg_size, (unsigned long long)size);
+      }
+   }
 
    /* ★★★ THE COLLISION FIX ★★★
     *
@@ -1620,13 +1982,19 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
        * PFNs with no paging operation at all. */
       void    *lock_cpu  = NULL;
       uint64_t lock_size = 0;
-      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &lock_cpu, &lock_size);
+      uint32_t lock_pitch = 0;
+      winmali_alloc_cpu_for_kmt(kmt_allocation_handle, &lock_cpu, &lock_size,
+                                &lock_pitch);
       if (lock_cpu != NULL && lock_size != 0) {
          WINMALI_BO_FROM_USER_VA fv;
          memset(&fv, 0, sizeof fv);
          fv.UserVa = (uint64_t)(uintptr_t)lock_cpu;
          fv.Size   = lock_size;
          fv.Flags  = flags & 0xff;
+         /* ★ TELL THE KERNEL THE SHAPE. Without this the present worker copies
+            every candidate at the panel pitch, which turns any surface with a
+            different stride into a squashed partial frame. */
+         fv.SrcPitch = lock_pitch;
 
          int verr = escape_simple(WinMaliEscapeOp_BoFromUserVa, &fv, sizeof fv);
          if (verr == 0 && fv.BoHandle != 0) {
@@ -1635,9 +2003,9 @@ winmali_kmod_bo_from_allocation(struct pan_kmod_dev *dev,
             cerr = 0;
             used_real_pages = true;
             mesa_loge("wm: import kmt=0x%x va=%p -> bo=%u size=%llu "
-                      "(REAL PAGES via 0x93)",
+                      "(REAL PAGES via 0x93) pitch=%u",
                       kmt_allocation_handle, lock_cpu, fv.BoHandle,
-                      (unsigned long long)fv.MappedBytes);
+                      (unsigned long long)fv.MappedBytes, lock_pitch);
          } else {
             mesa_loge("wm: 0x93 BoFromUserVa va=%p size=%llu failed (%d)",
                       lock_cpu, (unsigned long long)lock_size, verr);
@@ -1802,8 +2170,36 @@ winmali_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
          return NULL;
       }
       wvm->sync.handle = h;
+      winmali_vm_sync_register(h);   /* protect it from any stray syncobj_destroy */
       wvm->sync.point  = 0;
       simple_mtx_init(&wvm->sync.lock, mtx_plain);
+      mesa_loge("wm: WMVMSYNC1 vm_create id=%u TRACK_ACTIVITY -> sync handle=%u "
+                "(flags=0x%x)", req.Id, h, flags);
+   } else {
+      /* ⛔★★★★★ NO TRACK_ACTIVITY => sync.handle IS NEVER ASSIGNED HERE.
+       *
+       * But csf_submit signals it unconditionally (pan_csf.c: `.handle =
+       * vm_sync_handle, .timeline_value = cur_point + 1`), and the guard in
+       * panthor_kmod_vm_sync_handle() is an assert() - COMPILED OUT in release.
+       * So a VM created without this flag hands the submit path whatever
+       * sync.handle happens to contain.
+       *
+       * That matches the measured failure precisely: dwm signals `handle=1` at
+       * `point=10`; the KMD reports it NOT IN TABLE with 39-41 live objects; it
+       * is never created OR destroyed in a 2300-line capture; and the KMD table
+       * is initialised ONCE per boot and never torn down (SyncTblInits=1,
+       * SyncTblTears=0) - so nothing removed it, nothing ever added it.
+       * Deterministic: exactly 79 failures every boot. WAITs succeed (real
+       * per-context handles); only the SIGNAL carries this one.
+       *
+       * ⚠ Zero it so the value is at least DEFINED, and log the branch. This is
+       * diagnosis, not the fix - the fix is either to always create the VM sync
+       * object, or to make csf_submit skip the VM signal when there is none. */
+      wvm->sync.handle = 0;
+      wvm->sync.point  = 0;
+      mesa_loge("wm: WMVMSYNC1 vm_create id=%u WITHOUT TRACK_ACTIVITY "
+                "(flags=0x%x) - NO VM sync object exists; anything signalling "
+                "vm_sync_handle will hit ENOENT", req.Id, flags);
    }
 
    pan_kmod_vm_init(&wvm->base, dev, req.Id, flags,
@@ -1837,6 +2233,13 @@ winmali_kmod_vm_destroy(struct pan_kmod_vm *vm)
    struct winmali_kmod_vm *wvm = to_winmali_vm(vm);
 
    if (vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY) {
+      /* Unregister BEFORE destroying: the VM is the handle's legitimate owner,
+         so it must lift its own guard to free it (and the guard must not be
+         left standing over a dead handle). */
+      winmali_vm_sync_unregister(wvm->sync.handle);
+      mesa_loge("wm: WMVMSYNC2 vm_destroy id=%u releasing sync handle=%u - every "
+                "submit still holding this VM is now dead",
+                wvm->vm_id, wvm->sync.handle);
       syncobj_destroy(wvm->sync.handle);
       simple_mtx_destroy(&wvm->sync.lock);
    }
@@ -2667,6 +3070,14 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo,
        * primitive on WinMali; the simplest model is to track the
        * external handle/point directly. Sync waits then use whichever
        * handle was last attached. */
+      /* ⛔★★★★★ THIS RETARGETS sync.handle TO SOMEBODY ELSE'S HANDLE.
+       *
+       * The caller passes the VM's sync handle after a submit, so an imported
+       * BO that minted handle 18 silently starts pointing at handle 1. That is
+       * INTENDED for waiting - but it means sync.handle is NOT an ownership
+       * record, and bo_free must never free it. It frees sync.owned_handle
+       * instead. Measured cost of getting this wrong: dwm's handle 1 destroyed
+       * 4x per boot, 79 ENOENT submits, no compositing for the whole session. */
       wbo->sync.handle = sync_handle;
    }
 

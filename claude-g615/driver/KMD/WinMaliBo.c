@@ -443,6 +443,12 @@ typedef struct _WINMALI_UVSRC_ENT {
     ULONG   Pitch;
 } WINMALI_UVSRC_ENT;
 
+/* The handle AcquireBest chose last time. dwm's flip chain offers several equally
+   valid full-screen buffers holding DIFFERENT frames, so a fresh contest every sweep
+   shuffles between them - which is exactly the flashing the user sees. Keeping the
+   previous winner while it still qualifies turns that shuffle back into video. */
+ULONG g_WinMaliUvStickyHandle = 0;
+
 /* Monotonic scan counter, the timebase for LastChangeTick. */
 static ULONG g_WinMaliUvSrcTick = 0;
 
@@ -1541,21 +1547,88 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
                 eligible = bestEligible = FALSE;
             }
 
+            /* â›”â˜…â˜…â˜…â˜…â˜… A SURFACE CHANGING DURING **THIS** SCAN IS MID-COMPOSITION.
+             * The tiers below used to prefer `lastTick > bestTick` - the most
+             * recently changed surface - which is precisely the one dwm is writing
+             * right now. MEASURED: the taskbar and window chrome appear and
+             * disappear while the app animates in both states, from ONE stable
+             * surface (StatUvSrcBo 63 -> 63). We were reading a frame dwm had not
+             * finished drawing.
+             * A surface whose last change was on an EARLIER tick has gone quiet and
+             * is therefore complete. Prefer it, at the cost of one scan of latency.
+             * â›” This is a MITIGATION. A miniport cannot know when dwm finishes a
+             * frame - token-only presents make zero driver calls - so it improves
+             * the odds, it does not guarantee coherence. */
+            BOOLEAN settled     = FALSE;
+            BOOLEAN bestSettled = FALSE;
+            if (g_WinMaliUvPreferSettled != 0) {
+                settled     = (BOOLEAN)(lastTick != g_WinMaliUvSrcTick);
+                bestSettled = (BOOLEAN)(bestTick != g_WinMaliUvSrcTick);
+            }
+
+            /* â›”â˜…â˜…â˜…â˜…â˜… HYSTERESIS BEATS A BETTER SCORE HERE.
+             * dwm keeps FOUR full-screen buffers (StatUvQual=4) holding frames N,
+             * N-1, N-2. They are ALL eligible and ALL live, so any per-sweep contest
+             * picks a different one as ticks shift - MEASURED across six FrameThumb
+             * captures: bo 63,63,63,63,64,62. Showing N then N-2 then N-1 IS the
+             * flashing. Follow ONE buffer over time and it is video.
+             * Only applies while the incumbent still qualifies (eligible AND live);
+             * the moment it stops being written, the contest runs normally again. */
+            /* â›”â˜…â˜…â˜…â˜…â˜… "STILL LIVE" MUST MEAN "CHANGED RECENTLY", NOT "EVER CHANGED".
+             * `changes` is CUMULATIVE, so `live = (changes > 0)` is true for ever
+             * once a surface has been written even once. Using it to hold the
+             * incumbent pinned us to ONE buffer permanently - USER-OBSERVED as a
+             * frozen taskbar, a clock that never ticks, missing tray icons and a
+             * glitchy mouse, all while the flashing "stopped". A permanent latch is
+             * not stability, it is a stale frame.
+             * Hold the incumbent only while its LAST CHANGE is within the window. */
+            BOOLEAN sticky     = FALSE;
+            BOOLEAN bestSticky = FALSE;
+            if (g_WinMaliUvSticky != 0 && g_WinMaliUvStickyHandle != 0) {
+                ULONG win = g_WinMaliUvStickyTicks;
+                BOOLEAN fresh     = (BOOLEAN)(lastTick + win >= g_WinMaliUvSrcTick);
+                BOOLEAN bestFresh = (BOOLEAN)(bestTick + win >= g_WinMaliUvSrcTick);
+                sticky = (BOOLEAN)(g_WinMaliUvSrc[i].Handle ==
+                                   g_WinMaliUvStickyHandle && eligible && live &&
+                                   fresh);
+                bestSticky = (BOOLEAN)(*OutHandle == g_WinMaliUvStickyHandle &&
+                                       bestEligible && bestLive && bestFresh);
+            }
+            /* â›” THE INCUMBENT IS NOT DISPLACED BY A TIE, AND A RANKING CLAUSE
+             * CANNOT EXPRESS THAT. Adding "prefer sticky" as one more tier still
+             * lets a challenger win on a LOWER tier (coverage bucket, lastTick,
+             * hits), which is precisely how the shuffle happens. Short-circuit
+             * instead: while the incumbent still qualifies, no sibling buffer is
+             * even considered. It is released the moment it stops being live. */
+            if (bestSticky && !sticky) {
+                continue;
+            }
+
             better =
                 (bestVa == NULL) ||
                 /* full-screen-ness first: a partial render is never the desktop */
                 (eligible && !bestEligible) ||
                 /* then liveness, among equally plausible screens */
                 (eligible == bestEligible && live && !bestLive) ||
-                /* then the original order, untouched */
+                /* then STAY PUT: the incumbent wins any tie with a sibling buffer */
                 (eligible == bestEligible && live == bestLive &&
-                 covBucket > bestCovBucket) ||
+                 sticky && !bestSticky) ||
+                /* then FINISHED-ness: never take a frame still being drawn */
                 (eligible == bestEligible && live == bestLive &&
+                 settled && !bestSettled) ||
+                /* then the original order, untouched - now qualified by settledness
+                   so the new tier cannot silently reorder these */
+                (eligible == bestEligible && live == bestLive &&
+                 settled == bestSettled && covBucket > bestCovBucket) ||
+                (eligible == bestEligible && live == bestLive &&
+                 settled == bestSettled &&
                  covBucket == bestCovBucket && lastTick > bestTick) ||
                 (eligible == bestEligible && live == bestLive &&
+                 settled == bestSettled &&
                  covBucket == bestCovBucket && lastTick == bestTick &&
                  hits > bestHits) ||
                 (eligible == bestEligible && live == bestLive &&
+                 settled == bestSettled &&
                  covBucket == bestCovBucket && lastTick == bestTick &&
                  hits == bestHits && g_WinMaliUvSrc[i].Size < bestSize);
             if (!better) { continue; }
@@ -1587,6 +1660,9 @@ WinMaliUvSrcAcquireBest(_In_ SIZE_T NeedBytes,
         (VOID)InterlockedExchange(&g_WinMaliUvCandPages[i], 0);
         (VOID)InterlockedExchange(&g_WinMaliUvCandBox[i], 0);
     }
+    /* Remember who won, so the next sweep can stay with it. Recorded even when the
+       knob is off, so turning it on mid-session has a sane incumbent immediately. */
+    g_WinMaliUvStickyHandle = *OutHandle;
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcChg, (LONG)bestChg);
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcPid,   (LONG)bestPid);
     (VOID)InterlockedExchange(&g_WinMaliStatUvSrcPages,

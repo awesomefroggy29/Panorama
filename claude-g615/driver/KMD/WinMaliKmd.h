@@ -406,6 +406,24 @@ extern PVOID  g_WinMaliOvlRegsVa;        /* OVL0 register block, or NULL */
 /* Parameters\OvlFlipRender - drive the dual-pipe OVL hardware flip from the PRESENT
    WORKER so RENDER mode gets real page flips instead of a CPU blit. Requires
    OvlFlip=2. Default 0 = today's behaviour exactly. */
+/* Parameters\UvPreferSettled - prefer a source surface dwm has FINISHED writing (last
+   changed before this scan) over one it is writing during this scan. Reduces tearing
+   at the cost of one scan of latency. Default 0 = the old ranking exactly. */
+/* Parameters\UvSticky - keep the PREVIOUS source surface while it is still eligible
+   and still live, instead of re-running the contest every sweep. dwm's flip chain
+   holds several equally-valid buffers with DIFFERENT frames, so a per-sweep contest
+   alternates between them and that alternation IS the flashing. Default 0. */
+extern ULONG  g_WinMaliUvSticky;
+extern ULONG  g_WinMaliUvStickyTicks;
+extern ULONG  g_WinMaliCropX;
+extern ULONG  g_WinMaliCropY;
+extern ULONG  g_WinMaliCropW;
+extern ULONG  g_WinMaliCropH;
+extern ULONG  g_WinMaliCropEvery;
+VOID WinMaliPublishCrop_(_In_opt_ PUCHAR SrcVa, _In_ ULONG MaxRows,
+                         _In_ ULONG RowPitch, _In_ ULONG RowBytes,
+                         _In_ ULONG Which);
+extern ULONG  g_WinMaliUvPreferSettled;
 extern ULONG  g_WinMaliOvlFlipRender;
 BOOLEAN WinMaliOvlFlipDual_(VOID);
 extern LONG64 g_WinMaliOvlFrontPa;

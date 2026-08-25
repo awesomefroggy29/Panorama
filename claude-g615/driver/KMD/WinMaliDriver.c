@@ -531,6 +531,12 @@ ULONG g_WinMaliMonModeAdd = 0;
 #define WINMALI_DEF_PRESENTHZ     0u   /* DOD is driven by PresentDisplayOnly  */
 #define WINMALI_DEF_CHILDCFG      7u   /* VOT_DISPLAYPORT_EMBEDDED             */
 #define WINMALI_DEF_VIDPNSOURCES  1u
+/* Follow ONE of dwm's flip-chain buffers instead of re-running the contest every
+   sweep. The buffers hold DIFFERENT frames, so a per-sweep contest alternates and
+   that alternation IS the flashing the user sees. Paired with the freshness window
+   below, which releases the incumbent once it stops being written. */
+#define WINMALI_DEF_UVSTICKY      1u
+#define WINMALI_DEF_UVSTICKYTICKS 4u   /* scans an incumbent may go unchanged */
 /*
  * Parameters\HotReplugMs - ms after StartDevice at which to indicate a monitor
  * DISCONNECT and then, 200 ms later, a RECONNECT. 0 = off.
@@ -649,6 +655,124 @@ ULONG g_WinMaliOvlFlip = 0;
 PVOID g_WinMaliOvlRegsVa = NULL;
 /* Which carveout frame the overlay is currently scanning, and the back buffer
    VA we compose into when OvlFlip=2. */
+ULONG  g_WinMaliUvSticky = WINMALI_DEF_UVSTICKY;
+ULONG  g_WinMaliUvStickyTicks = WINMALI_DEF_UVSTICKYTICKS;
+/* 1:1 framebuffer crop region - diagnostic eyes on the panel at full resolution.
+   Defaults target the clock/tray corner of the taskbar. */
+ULONG  g_WinMaliCropX = 2208;
+ULONG  g_WinMaliCropY = 1696;
+ULONG  g_WinMaliCropW = 736;
+ULONG  g_WinMaliCropH = 144;
+/* Sweeps between crop publishes. Live-tunable so a measurement can raise the sample
+   rate to resolve fast events (the taskbar flash) and drop it back afterwards. */
+ULONG  g_WinMaliCropEvery = 64;
+
+/* Publish a 1:1 BGR crop of the surface about to reach the panel.
+ *
+ * Shared by BOTH present paths so display-only and render can be compared with the
+ * same code over the same region - the control the render-only version lacked.
+ * `Which` is recorded as FrameCropSrc (1=render worker, 2=DOD present) and every
+ * publish bumps FrameCropSeq, so a reader can distinguish a fresh crop from one
+ * left in the registry by a previous boot.
+ *
+ * Fail-closed: a short surface truncates the crop; it never reads past the bound. */
+VOID
+WinMaliPublishCrop_(_In_opt_ PUCHAR SrcVa,
+                    _In_ ULONG MaxRows,
+                    _In_ ULONG RowPitch,
+                    _In_ ULONG RowBytes,
+                    _In_ ULONG Which)
+{
+    static PUCHAR s_crop = NULL;
+    static ULONG  s_tick = 0;
+    static ULONG  s_seq  = 0;
+    const ULONG   CROPMAX = 1572864u;          /* 1.5 MB ceiling */
+    ULONG cw, ch, cx, cy, cols, ry, rx;
+
+    if (SrcVa == NULL || RowPitch == 0u || RowBytes == 0u) { return; }
+    if (g_WinMaliRegPath.Length == 0) { return; }
+    /* â›” THE THROTTLE ALIASES FAST EVENTS. At 1-in-64 (~5.3 s) a taskbar that
+     * alternates faster is sampled at arbitrary phase - three captures 30 s apart
+     * read as a steady empty state while the panel was visibly flashing. Live so a
+     * burst can resolve it and then be turned back down. */
+    {
+        ULONG every = g_WinMaliCropEvery;
+        (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropEvery", every, &every);
+        if (every < 4u) { every = 4u; }        /* never per-sweep: registry hammer */
+        g_WinMaliCropEvery = every;
+        if ((s_tick++ % every) != 0u) { return; }
+    }
+
+    /* Refresh the LIVE-TUNABLE SELECTOR KNOBS here, piggybacking this throttle.
+     * The selector itself runs per candidate per scan - far too hot for a registry
+     * read - but it only needs these to be roughly current. Making them live turns
+     * a sticky-on/sticky-off A/B from two 5-8 minute boots into two captures in one
+     * boot, which is the difference between running the experiment and guessing. */
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"UvSticky",
+                                 g_WinMaliUvSticky, &g_WinMaliUvSticky);
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"UvStickyTicks",
+                                 g_WinMaliUvStickyTicks, &g_WinMaliUvStickyTicks);
+    if (g_WinMaliUvStickyTicks == 0u) { g_WinMaliUvStickyTicks = 4u; }
+    /* Publish what is ACTUALLY in force, so a capture can be attributed to a
+       setting instead of to whatever the arm step intended. */
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"LiveUvSticky",
+                                  g_WinMaliUvSticky);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"LiveUvStickyTicks",
+                                  g_WinMaliUvStickyTicks);
+
+    cx = g_WinMaliCropX; cy = g_WinMaliCropY;
+    cw = g_WinMaliCropW; ch = g_WinMaliCropH;
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropX", cx, &cx);
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropY", cy, &cy);
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropW", cw, &cw);
+    (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropH", ch, &ch);
+
+    cols = RowBytes / 4u;
+    if (cx >= cols)    { cx = 0u; }
+    if (cy >= MaxRows) { cy = 0u; }
+    if (cx + cw > cols)    { cw = cols - cx; }
+    if (cy + ch > MaxRows) { ch = MaxRows - cy; }
+    while (cw != 0u && ch != 0u && (SIZE_T)cw * ch * 3u > CROPMAX) { ch /= 2u; }
+    if (cw == 0u || ch == 0u) { return; }
+
+    if (s_crop == NULL) {
+        s_crop = (PUCHAR)ExAllocatePoolWithTag(NonPagedPoolNx, CROPMAX, 'cCmW');
+    }
+    if (s_crop == NULL) { return; }
+
+    for (ry = 0; ry < ch; ++ry) {
+        const UCHAR *srow = (const UCHAR *)
+            WinMaliSrcRow_(SrcVa, MaxRows, RowPitch, cy + ry);
+        if (srow == NULL) { ch = ry; break; }   /* fail closed - truncate */
+        for (rx = 0; rx < cw; ++rx) {
+            const UCHAR *px = srow + (SIZE_T)(cx + rx) * 4u;
+            PUCHAR o = s_crop + ((SIZE_T)ry * cw + rx) * 3u;
+            o[0] = px[0]; o[1] = px[1]; o[2] = px[2];
+        }
+    }
+    if (ch == 0u) { return; }
+
+    (VOID)WinMaliWriteParamsBinary(&g_WinMaliRegPath, L"FrameCrop",
+                                   s_crop, (ULONG)((SIZE_T)cw * ch * 3u));
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropW", cw);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropH", ch);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropX", cx);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropY", cy);
+    /* Freshness and provenance - a blob alone cannot say which boot or which path
+       produced it, and one stale crop was already misread as a control. */
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropSrc", Which);
+    /* â›” WHICH BUFFER THIS IMAGE CAME FROM. The `bo=` a reader prints beside a
+       capture is sampled LIVE while the image comes from the throttled publish, so
+       the two do not describe the same instant - that mismatch has produced a wrong
+       conclusion twice. Stamp the buffer INTO the publish. */
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropBo",
+                                  (ULONG)InterlockedCompareExchange(
+                                      &g_WinMaliStatUvSrcBo, 0, 0));
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropEvery",
+                                  g_WinMaliCropEvery);
+    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"FrameCropSeq", ++s_seq);
+}
+ULONG  g_WinMaliUvPreferSettled = 0;
 ULONG  g_WinMaliOvlFlipRender = 0;
 
 /* Where the present worker composes. With OvlFlipRender armed it composes into the
@@ -739,6 +863,47 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
        when running with kernel debugging off (see WinMaliLog.h). */
     (VOID)WinMaliSerialInit();
 
+    /* ⛔★★★★★ SNAPSHOT THE **PREVIOUS BOOT'S** RING BEFORE WE OVERWRITE IT.
+     *
+     * The ring lives in EDK2-reserved physical memory and SURVIVES a warm reboot, so
+     * at this instant it still holds the tail of the boot that just died. Every line
+     * this driver is about to emit pushes that history out.
+     *
+     * This exists because render mode has hard-locked several times (user-confirmed)
+     * and the trace was never readable afterwards: `TraceTail` is republished by the
+     * present timer ~57 s into the NEW boot while WinRM only arrives ~70 s in, so the
+     * evidence is gone before anything can read it. MEASURED exactly that today - a
+     * post-hang read returned the new boot's DOD presents, not the lock.
+     *
+     * Same shape as the existing triggered snapshots: capture NOW, into a SEPARATE
+     * value the timer-published TraceTail cannot clobber.
+     *
+     * ⚠ The tail is only as complete as the registry flush that preceded the lock; a
+     * hard lock loses whatever had not committed. Absence of a smoking gun here is
+     * NOT evidence of a clean shutdown. */
+    {
+        /* ⛔ 256 KB = THE WHOLE RING, not a quarter of it.
+         * MEASURED with 64 KB: the capture came back holding only THIS boot's
+         * FIRMWARE log (SCPBOOT bringup, MtkUfs, LVTS, mtkwifi) and our own banner -
+         * EDK2 re-inits the ring and fills it before our driver ever loads, so the
+         * most-recent 64 KB is always the firmware, never the session that died.
+         * The previous Windows tail, if it survives at all, is further back. Take
+         * the lot. */
+        const ULONG kPrevBytes = 262144u;
+        PUCHAR prev = (PUCHAR)ExAllocatePoolWithTag(NonPagedPoolNx, kPrevBytes,
+                                                    (ULONG)'pTmW');
+        if (prev != NULL) {
+            ULONG got = WinMaliSerialSnapshot(prev, kPrevBytes);
+            if (got != 0 && RegistryPath != NULL) {
+                (VOID)WinMaliWriteParamsBinary(RegistryPath, L"TracePrevBoot",
+                                               prev, got);
+                (VOID)WinMaliWriteParamsDword(RegistryPath, L"TracePrevBootBytes",
+                                              got);
+            }
+            ExFreePoolWithTag(prev, (ULONG)'pTmW');
+        }
+    }
+
     DbgPrint("[WinMali] >> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR "\n",
              WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
 
@@ -784,6 +949,31 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                  &g_WinMaliIndicateConnMs);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"OvlFlipRender", 0,
                                  &g_WinMaliOvlFlipRender);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"UvPreferSettled", 0,
+                                 &g_WinMaliUvPreferSettled);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"UvSticky", WINMALI_DEF_UVSTICKY,
+                                 &g_WinMaliUvSticky);
+    /* How many scans an incumbent may go unchanged before it is released. 0 uses the
+       compiled default of 4. â›” NOT unbounded: `changes` is cumulative, so "has ever
+       changed" would pin us to one buffer for ever - which is exactly the bug this
+       fixes. */
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"UvStickyTicks", 4,
+                                 &g_WinMaliUvStickyTicks);
+    /* Crop region. Knob-driven so the region can be moved with four registry writes
+       instead of a rebuild - at 5-8 minutes a boot, a baked region is unaffordable
+       for something whose entire purpose is to be aimed repeatedly. */
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"CropX", 2208, &g_WinMaliCropX);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"CropY", 1696, &g_WinMaliCropY);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"CropW",  736, &g_WinMaliCropW);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"CropH",  144, &g_WinMaliCropH);
+    if (g_WinMaliUvStickyTicks == 0) { g_WinMaliUvStickyTicks = 4; }
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffUvSticky",
+                                  0x8000u | ((g_WinMaliUvSticky & 0xFu) << 8)
+                                          | (g_WinMaliUvStickyTicks & 0xFFu));
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffUvSticky",
+                                  0x8000u | (g_WinMaliUvSticky & 0xFFu));
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffUvPreferSettled",
+                                  0x8000u | (g_WinMaliUvPreferSettled & 0xFFu));
     (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffOvlFlipRender",
                                   0x8000u | (g_WinMaliOvlFlipRender & 0xFFu));
     (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffIndicateConn",
@@ -890,7 +1080,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                  &g_WinMaliKnobFuse);
     /* Marker string so the PACKAGED binary can be proved to contain this change.
        â›” Never verify a deploy by hash - signing changes it. Grep for a string. */
-    DbgPrint("[WinMali]    BAKED DEFAULTS v7 FLIPSTATS: dod=%u ovl=%u xform=%u mon=%u "
+    DbgPrint("[WinMali]    BAKED DEFAULTS v36 REVERT: dod=%u ovl=%u xform=%u mon=%u "
              "uv=%u hz=%u cfg=%u src=%u\n",
              (unsigned)WINMALI_DEF_DODMODE, (unsigned)WINMALI_DEF_OVLFLIP,
              (unsigned)WINMALI_DEF_PATHXFORM, (unsigned)WINMALI_DEF_MONMODEADD,
@@ -984,6 +1174,20 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
            cost exactly one boot, like every other lever. */
         if (g_WinMaliOvlFlipRender != 0) {
             (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"OvlFlipRender", 0);
+        }
+        if (g_WinMaliUvPreferSettled != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"UvPreferSettled", 0);
+        }
+        if (g_WinMaliUvSticky != WINMALI_DEF_UVSTICKY) {
+            /* â›” burn to the value we WANT, not to a bare 0 - with the live
+               re-read in place, burning 0 here switches stickiness off a few
+               seconds into every boot and brings the flashing back. */
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"UvSticky",
+                                                 WINMALI_DEF_UVSTICKY);
+        }
+        if (g_WinMaliUvStickyTicks != WINMALI_DEF_UVSTICKYTICKS) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"UvStickyTicks",
+                                                 WINMALI_DEF_UVSTICKYTICKS);
         }
         if (g_WinMaliIndicateConnMs != 0) {
             (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"IndicateConnMs", 0);
@@ -2124,16 +2328,9 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
            from "nobody wrote the number down". Publish them from the worker, which does
            run in render. Same names, so no new value is created on a key that is at its
            127-name cap. */
-        if (g_WinMaliOvlFlip != 0) {
-            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlip2N",
-                                          (ULONG)g_WinMaliStatOvlFlip2N);
-            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlip2Rej",
-                                          (ULONG)g_WinMaliStatOvlFlip2Rej);
-            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlipBack",
-                                          (ULONG)g_WinMaliStatOvlFlipBack);
-            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlipRight",
-                                          (ULONG)g_WinMaliStatOvlFlipRight);
-        }
+        /* â›” The flip counters were published HERE, which is DxgkDdiStopDevice - it
+           runs only at teardown, so they read stale for three whole builds. Moved to
+           the live worker publish (search StatScanoutBlits with a->ScanoutBltCount). */
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatScanoutSkipped",
                                       (ULONG)adapter->ScanoutBltSkipped);
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatSourceVisibleEver",
@@ -3514,6 +3711,29 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                 /* Blits vs Skipped is how a silent early-out becomes visible. */
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatScanoutBlits",      (ULONG)a->ScanoutBltCount);
+                /* â›” THE FLIP COUNTERS BELONG HERE, NOT IN StopDevice. This block
+                   demonstrably runs - StatScanoutBlits climbs 12-15/s - whereas the
+                   teardown copy never ran during operation and made the flip path
+                   unobservable for three builds.
+                   StatOvlFlipN  = how many times the flip gate was EVALUATED
+                   StatOvlFlipRej= the gate's outcome (1=BackVa NULL 2=OvlFlip!=2
+                                   3=FlipRender off 4=gate PASSED)
+                   â›” StatOvlStep is NOT touched: the mode-1 path already writes it,
+                   and one value name must have exactly ONE writer. */
+                if (g_WinMaliOvlFlip != 0) {
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlipN",    (ULONG)g_WinMaliStatOvlFlipN);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlipRej",  (ULONG)g_WinMaliStatOvlFlipRej);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlip2N",   (ULONG)g_WinMaliStatOvlFlip2N);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlip2Rej", (ULONG)g_WinMaliStatOvlFlip2Rej);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlipBack", (ULONG)g_WinMaliStatOvlFlipBack);
+                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
+                            L"StatOvlFlipRight",(ULONG)g_WinMaliStatOvlFlipRight);
+                }
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                         L"StatScanoutSkipped",    (ULONG)a->ScanoutBltSkipped);
                 (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
@@ -5134,9 +5354,22 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                          * OvlFlipRender is armed, which keeps display-only - where
                          * the flip already happens in PresentDisplayOnly - untouched
                          * and avoids flipping twice for one frame. */
-                        if (g_WinMaliOvlFlipRender != 0 && g_WinMaliOvlFlip == 2 &&
-                            g_WinMaliOvlBackVa != NULL) {
-                            (VOID)WinMaliOvlFlipDual_();
+                        /* â›” INSTRUMENT THE GATE ITSELF. Every input is recorded before
+                         * the branch, so "the helper was not called" can name its own
+                         * reason instead of being inferred. Reuses three names that are
+                         * dead in mode 2 - the key is at its 127-value cap. */
+                        {
+                            ULONG gcode;
+                            if (g_WinMaliOvlFlipRender == 0)      { gcode = 3; }
+                            else if (g_WinMaliOvlFlip != 2)       { gcode = 2; }
+                            else if (g_WinMaliOvlBackVa == NULL)  { gcode = 1; }
+                            else                                  { gcode = 4; }
+                            (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlipN);
+                            (VOID)InterlockedExchange(&g_WinMaliStatOvlFlipRej,
+                                                      (LONG)gcode);
+                            if (gcode == 4) {
+                                (VOID)WinMaliOvlFlipDual_();
+                            }
                         }
                     }
                     /* ⛔★★★★★ SHIP A THUMBNAIL OF WHAT WE ACTUALLY SCAN OUT.
@@ -5198,6 +5431,83 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             }
                         }
                     }
+                    /* â›”â˜…â˜…â˜…â˜…â˜… A 1:1 CROP - THE THUMBNAIL IS 8x DECIMATED AND CANNOT
+                     * SHOW A GLYPH. The user reports the taskbar clock and tray
+                     * icons missing; at 8x the whole taskbar is 18 px tall, so every
+                     * judgement I made from FrameThumb about TEXT was made from an
+                     * image that could not contain text. Publish real pixels.
+                     *
+                     * Region comes from registry so it can be re-aimed without a
+                     * rebuild. Bounds clamped against the same srcRowBytes/maxRows
+                     * the thumbnail had to learn to respect. */
+                    WinMaliPublishCrop_(srcVa, maxRows, effPitch, srcRowBytes, 1u);
+#if 0  /* superseded by WinMaliPublishCrop_ */
+                    {
+                        static PUCHAR s_crop = NULL;
+                        static ULONG  s_cropTick = 0;
+                        const ULONG   CROPMAX = 1572864u;   /* 1.5 MB ceiling */
+                        ULONG cw = g_WinMaliCropW, ch = g_WinMaliCropH;
+                        if (srcVa != NULL && effPitch != 0 &&
+                            (s_cropTick++ % 64u) == 0u) {
+                            ULONG cols = srcRowBytes / 4u;
+                            ULONG cx = g_WinMaliCropX, cy = g_WinMaliCropY;
+                            /* â›”â˜… RE-AIM WITHOUT A REBOOT. Reading these only at init
+                             * meant every new region cost a 5-8 minute boot, so the
+                             * crop would in practice stay wherever it was first
+                             * aimed. Same live-read pattern the worker already uses
+                             * for VsyncFreeRun, on the same 1-in-64 throttle as the
+                             * publish. A zeroed region falls through the existing
+                             * `if (cw != 0u && ch != 0u)` below and publishes
+                             * nothing - no new control flow needed. */
+                            (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropX", cx, &cx);
+                            (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropY", cy, &cy);
+                            (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropW", cw, &cw);
+                            (VOID)WinMaliReadParamsDword(&g_WinMaliRegPath, L"CropH", ch, &ch);
+                            /* clamp the window into the real surface */
+                            if (cx >= cols) { cx = 0u; }
+                            if (cy >= maxRows) { cy = 0u; }
+                            if (cx + cw > cols)    { cw = cols - cx; }
+                            if (cy + ch > maxRows) { ch = maxRows - cy; }
+                            while (cw != 0u && ch != 0u &&
+                                   (SIZE_T)cw * ch * 3u > CROPMAX) { ch /= 2u; }
+                            if (cw != 0u && ch != 0u) {
+                                if (s_crop == NULL) {
+                                    s_crop = (PUCHAR)ExAllocatePoolWithTag(
+                                        NonPagedPoolNx, CROPMAX, 'cCmW');
+                                }
+                                if (s_crop != NULL) {
+                                    ULONG ry, rx;
+                                    for (ry = 0; ry < ch; ++ry) {
+                                        const UCHAR *srow = (const UCHAR *)
+                                            WinMaliSrcRow_(srcVa, maxRows, effPitch,
+                                                           cy + ry);
+                                        if (srow == NULL) { ch = ry; break; }
+                                        for (rx = 0; rx < cw; ++rx) {
+                                            const UCHAR *px =
+                                                srow + (SIZE_T)(cx + rx) * 4u;
+                                            PUCHAR o = s_crop +
+                                                ((SIZE_T)ry * cw + rx) * 3u;
+                                            o[0] = px[0]; o[1] = px[1]; o[2] = px[2];
+                                        }
+                                    }
+                                    if (ch != 0u) {
+                                        (VOID)WinMaliWriteParamsBinary(
+                                            &g_WinMaliRegPath, L"FrameCrop",
+                                            s_crop, (ULONG)((SIZE_T)cw * ch * 3u));
+                                        (VOID)WinMaliWriteParamsDword(
+                                            &g_WinMaliRegPath, L"FrameCropW", cw);
+                                        (VOID)WinMaliWriteParamsDword(
+                                            &g_WinMaliRegPath, L"FrameCropH", ch);
+                                        (VOID)WinMaliWriteParamsDword(
+                                            &g_WinMaliRegPath, L"FrameCropX", cx);
+                                        (VOID)WinMaliWriteParamsDword(
+                                            &g_WinMaliRegPath, L"FrameCropY", cy);
+                                    }
+                                }
+                            }
+                        }
+                    }
+#endif
                     (VOID)InterlockedExchange(&g_WinMaliStatCopyDone,
                                               (LONG)(done >> 10));   /* KB copied */
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,

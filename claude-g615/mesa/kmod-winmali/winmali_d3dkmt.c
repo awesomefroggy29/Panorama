@@ -17,6 +17,7 @@
 #include "util/log.h"
 
 #include <windows.h>
+#include <intrin.h>   /* _ReturnAddress - names the caller at the destroy choke point */
 
 #ifndef NTSTATUS
 typedef LONG NTSTATUS;
@@ -118,8 +119,10 @@ winmali_d3dkmt_open(void)
       return 0;
 
    g_wm.gdi32 = LoadLibraryW(L"gdi32.dll");
-   if (!g_wm.gdi32)
+   if (!g_wm.gdi32) {
+      mesa_loge("wm: WMKMTOPEN1 LoadLibrary(gdi32) FAILED - no D3DKMT at all");
       return -ENOENT;
+   }
 
 #define RESOLVE(slot, sym, pfn_type) do {                                    \
    g_wm.slot = (pfn_type)GetProcAddress(g_wm.gdi32, "D3DKMT" #sym);          \
@@ -138,6 +141,8 @@ winmali_d3dkmt_open(void)
    /* First call: probe required buffer size. */
    NTSTATUS st = g_wm.enum_adapters2(&info);
    if (st != STATUS_SUCCESS && info.NumAdapters == 0) {
+      mesa_loge("wm: WMKMTOPEN2 EnumAdapters2 probe FAILED st=0x%08x NumAdapters=0",
+                (unsigned)st);
       winmali_d3dkmt_close();
       return -ENODEV;
    }
@@ -153,29 +158,47 @@ winmali_d3dkmt_open(void)
    info.NumAdapters += 4;
    st = g_wm.enum_adapters2(&info);
    if (st != STATUS_SUCCESS) {
+      mesa_loge("wm: WMKMTOPEN3 EnumAdapters2 fill FAILED st=0x%08x n=%u",
+                (unsigned)st, (unsigned)info.NumAdapters);
       free(adapters);
       winmali_d3dkmt_close();
       return -ENODEV;
    }
+   mesa_loge("wm: WMKMTOPEN4 EnumAdapters2 -> %u adapter(s) to probe",
+             (unsigned)info.NumAdapters);
 
    int last_err = -ENODEV;
    for (UINT i = 0; i < info.NumAdapters; ++i) {
       D3DKMT_OPENADAPTERFROMLUID oa;
       memset(&oa, 0, sizeof(oa));
       oa.AdapterLuid = adapters[i].AdapterLuid;
-      if (g_wm.open_adapter(&oa) != STATUS_SUCCESS)
+      NTSTATUS ost = g_wm.open_adapter(&oa);
+      if (ost != STATUS_SUCCESS) {
+         mesa_loge("wm: WMKMTOPEN5 adapter[%u] OpenAdapterFromLuid FAILED 0x%08x",
+                   (unsigned)i, (unsigned)ost);
          continue;
+      }
 
       D3DKMT_CREATEDEVICE cd;
       memset(&cd, 0, sizeof(cd));
       cd.hAdapter = oa.hAdapter;
-      if (g_wm.create_device(&cd) != STATUS_SUCCESS) {
+      NTSTATUS cst = g_wm.create_device(&cd);
+      if (cst != STATUS_SUCCESS) {
+         /* ★ THE SUSPECT. D3DKMTCreateDevice is the step that needs a real
+            graphics context; a process the OS will not grant one to fails
+            HERE, silently, and every layer above reports only
+            E_OUTOFMEMORY -> "no DDI for the requested feature levels". */
+         mesa_loge("wm: WMKMTOPEN6 adapter[%u] D3DKMTCreateDevice FAILED 0x%08x "
+                   "- adapter opened but no device could be created",
+                   (unsigned)i, (unsigned)cst);
          D3DKMT_CLOSEADAPTER ca = { oa.hAdapter };
          g_wm.close_adapter(&ca);
          continue;
       }
 
       int err = probe(oa.hAdapter, cd.hDevice);
+      mesa_loge("wm: WMKMTOPEN7 adapter[%u] probe -> %d (0 = this is our GPU)",
+                (unsigned)i, err);
       if (err == 0) {
          /* Match. Don't free the handle pair. */
          free(adapters);
@@ -297,6 +320,40 @@ winmali_log_sink(enum mesa_log_level level, const char *tag, const char *msg)
    (void)level;
    (void)tag;
    winmali_d3dkmt_log("%s", msg);
+
+   /* ⛔ THE KMD RING IS FILL-ONCE AND FILLS DURING BOOT. Post-boot diagnostics
+      sent only there are invisible: a whole build of ttn instrumentation
+      produced not one line, and the absence looked exactly like "the code did
+      not run". A dead channel is not evidence - so provide a live one.
+      Opt-in via WINMALI_UMD_LOG=<path>, so normal clients pay nothing. */
+   {
+      static int checked = 0;
+      static char path[512];
+      if (!checked) {
+         char base[400];
+         DWORD n = GetEnvironmentVariableA("WINMALI_UMD_LOG", base, sizeof(base));
+         if (n == 0 || n >= sizeof(base)) {
+            path[0] = 0;
+         } else {
+            /* ⛔ ONE FILE PER PROCESS. Set machine-wide, this sink is live in
+               EVERY GPU client at once - dwm, explorer, the shell hosts. A
+               single shared file would serialise nine processes on one handle
+               and interleave their lines into nonsense. Per-pid files cost
+               nothing and keep each client readable on its own. */
+            _snprintf(path, sizeof(path) - 1, "%s.%lu.log", base,
+                      (unsigned long)GetCurrentProcessId());
+            path[sizeof(path) - 1] = 0;
+         }
+         checked = 1;
+      }
+      if (path[0] != 0) {
+         FILE *f = fopen(path, "a");
+         if (f != NULL) {
+            fprintf(f, "[pid=%lu] %s\n", (unsigned long)GetCurrentProcessId(), msg);
+            fclose(f);
+         }
+      }
+   }
 }
 
 /* ---- abort() tracer ---------------------------------------------------
@@ -606,6 +663,30 @@ winmali_d3dkmt_syncobj_destroy(uint32_t handle)
       WINMALI_ESCAPE_HEADER hdr;
       WINMALI_SYNC_OBJ_DESTROY body;
    } buf;
+
+   /* ⛔★★★★★ THE CHOKE POINT. LOG HERE, NOT AT THE CALL SITES.
+    *
+    * dwm's VM sync handle=1 is destroyed by dwm's OWN pid via an explicit
+    * SyncObjDestroy escape (KMD destroy-ledger), then signalled 79 times until
+    * dwm stops compositing for the whole boot.
+    *
+    * I then tested the individual callers one at a time and ALL THREE came back
+    * CORRECT - `vm_destroy` (instrumented twice, never fires in dwm),
+    * `bo_create`+exclusive_vm (correctly skips the shared handle), and
+    * `bo_import` (mints its own handle, so freeing it is right). Three theories,
+    * three builds, three refutations.
+    *
+    * EVERY destroy in the process funnels through THIS function - including the
+    * ones that bypass the kmod backend entirely (`drmSyncobjDestroy` called
+    * directly from pan_context.c and pan_fence.c, which the shim routes here).
+    * Logging the funnel names the culprit in one run instead of one guess per
+    * build. ⇒ WHEN PER-SITE GUESSES KEEP FAILING, INSTRUMENT THE CHOKE POINT.
+    *
+    * _ReturnAddress() gives the caller's code address; the RVA is enough to tell
+    * the call sites apart even without symbols, and the surrounding lines in the
+    * per-process mesa log identify the phase. */
+   mesa_loge("wm: WMSYNCDESTROY1 syncobj_destroy(handle=%u) caller_ra=%p",
+             handle, _ReturnAddress());
 
    if (!g_wm.open)
       return -ENODEV;

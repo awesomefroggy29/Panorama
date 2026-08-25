@@ -16,7 +16,7 @@
 #pragma once
 
 #define WINMALI_KMD_VERSION      1,1,3,6
-#define WINMALI_KMD_VERSION_STR  "1.1.17.2"
+#define WINMALI_KMD_VERSION_STR  "1.1.20.6"
 
 
 

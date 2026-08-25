@@ -60,7 +60,11 @@ void winmali_kmod_register_alloc_id(uint32_t kmt, uint32_t id, uint32_t id_hi);
  * aperture-maps the surface and 0x81/0x92 therefore cannot see its pages.
  * Call it wherever the allocation is locked, and pass the same size the lock
  * covers. Safe to call repeatedly; the newest pointer wins. */
-void winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size);
+/* pitch = the allocation's row stride in bytes. The KMD's present worker has
+ * no other way to learn the shape of the surface it copies - 0x93 used to carry
+ * only VA+size, so it assumed the PANEL pitch for everything. */
+void winmali_kmod_register_alloc_cpu(uint32_t kmt, void *cpu, uint64_t size,
+                                     uint32_t pitch);
 
 struct pan_kmod_bo *winmali_kmod_bo_from_allocation(
    struct pan_kmod_dev *dev, uint32_t kmt_allocation_handle,
