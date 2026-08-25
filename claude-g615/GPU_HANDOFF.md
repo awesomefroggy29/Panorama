@@ -269,11 +269,32 @@ glyphs render perfectly). The refined statement is narrower and about transport:
   #257 through #4865, while `WMCSOFF` shows it still issuing `draws=4` per stream.
   Only the very first calls (#5 `1024x1024`, #8 `64x320`) bind a real target.
 
-⚠ **Do not bank this as a fault yet.** The census samples every 256th call, 256 is a
-power of two, and Explorer's workload is periodic — a sampling alias that always lands
-on the unbind would look identical. **Re-run with an unsampled or prime-strided census
-before believing it.** If it survives that, "Explorer draws into a NULL render target"
-becomes the primary lead.
+#### ⛔ …and that second lead is now REFUTED — it was the sampling alias
+
+1.1.21.2 replaced the sampled look with an **unsampled census** — every
+`SetRenderTargets` call is counted, and the totals are printed on the existing line
+(`CENSUS real=… null=… zeroSlots=…`). Counters only; no new dereference, no array
+indexing.
+
+Measured on a render-mode boot:
+
+```
+wm.dwm.exe.log       CENSUS real=174  null=60  zeroSlots=23
+wm.Explorer.EXE.log  CENSUS real=2    null=2   zeroSlots=4
+wm.LogonUI.exe.log   CENSUS real=2    null=3   zeroSlots=3
+```
+
+**Explorer binds real render targets.** It is *not* persistently drawing into NULL —
+the every-256th sample was simply landing on the unbind every time, exactly the alias
+flagged above. ⇒ Do not re-chase this. The lesson is the general one:
+
+> A periodic sampler against a periodic workload can manufacture a perfect,
+> completely false correlation. When a census shows the *same* value on every
+> sample, suspect the sampler before the subject.
+
+⚠ Explorer's totals are small because an idle desktop barely renders — those are the
+first-8 unconditional prints. A busier steady-state read is still worth taking, but the
+"always NULL" claim is dead either way.
 
 ⚠ `0x00304507` (BGRA) vs `0x00004507` (A8/R8) in `CheckFormatSupport` differ only by
 `0x00300000` = the two multisample bits. Already refuted as a cause; not a lead.
