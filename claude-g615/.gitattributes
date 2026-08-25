@@ -1,0 +1,20 @@
+# Line-ending policy for claude-g615.
+#
+# WHY THIS EXISTS: these are Windows driver sources and they live as CRLF in the
+# build tree on C:. Without this file git stored them verbatim, so a sync that
+# changed ONE line produced a 6,672-line diff - WinMaliDriver.c once showed
+# 13,344 changed lines for a single version-banner edit, and WinMaliBo.c showed
+# 344 changed lines for no content change at all. That makes review worthless
+# for a collaborator.
+#
+# text=auto  -> git NORMALISES to LF in the repository, so diffs show real changes.
+# eol=crlf   -> but CHECKS OUT as CRLF, so the working copy still byte-matches the
+#               build tree and sync_g615.sh's `cmp -s` keeps working.
+* text=auto eol=crlf
+
+# Docs are read on both platforms and have no build-tree counterpart.
+*.md   text eol=lf
+*.json text eol=lf
+
+*.png binary
+*.bin binary
