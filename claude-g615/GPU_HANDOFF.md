@@ -171,6 +171,113 @@ StatTilerOom = 3     StatTilerOomFail = 0   (serviced correctly)
 Every submit completes. The hardware draws exactly what it is asked to draw. **What it
 is asked is wrong.** Do not go hunting GPU faults.
 
+### 4.5 THE UMD LOG IS THE RIGHT INSTRUMENT — AND IT NARROWS THIS SHARPLY
+
+`MESA_LOG_FILE = C:\umdlog\wm` is already set machine-wide on the tablet, and
+`C:\umdlog` holds ~506 per-process logs (`wm.<proc>.<pid>.log`). **This is the proven
+UMD channel** — `mesa_loge` goes to `OutputDebugStringA` *and* this file.
+
+⛔ `mesa_loge` output does **NOT** reach the KMD's EDK2 trace ring. Grepping
+`TraceTail`/`TracePrevBoot` for UMD strings returns zero because the channel is not
+live there, not because nothing fired. (Fifth instance of the calibration trap.)
+
+**Measured from `wm.dwm.exe.<pid>.log` on a render-mode boot:**
+
+- **Every `OpenResource` SUCCEEDS**, with correct strides — no `WSI pitch too small`,
+  no `WSI pitch not properly aligned`, no `KMT import FAILED`. dwm opens, among others:
+  - `fmt=87` (BGRA8): `2944x1840 stride=11776` (primary), `2976x1856 stride=11904`,
+    `2944x144 stride=11776` (**the taskbar strip**), `1024x1024 stride=4096` (atlases)
+  - `fmt=65` (**A8 — the glyph atlases**): `704x704 stride=704`, `1984x1248 stride=1984`,
+    `1984x1344 stride=1984`, `32x32 stride=64`
+  ⇒ The import path is **clean**, and the A8 glyph atlases *are* reaching dwm.
+- **dwm really is compositing:** `WMCSOFF` shows a repeating command-stream pattern of
+  `draws=1`, `draws=2`, `draws=59`. It is not a no-draw case.
+- **`CCR CENSUS: calls=17857 toPrimary(dstBO>=16MB)=17755`** — ~99% of
+  `ResourceCopyRegion` calls target the 21,667,840-byte primary.
+- **`WMDIRTY`**: `_Present1 calls=8897 withRects=8877 maxRects=1 surfaces=1 dst=0x0`.
+- **`WMGAPMAX`**: max render-to-render gap **1375 ms**.
+
+⛔ `WMPRESPATH redirected-copy=0 kernel-present=8897` is **NOT a fault** — the
+redirected branch only runs when `hDstResource` is non-zero, and dwm always passes 0,
+which the source already records as measured. Do not "fix" this.
+
+#### The hypothesis this points at — NOT yet proven
+
+Two routes carry pixels to the primary, and they appear to differ in correctness:
+
+| Route | Mechanism | Observed |
+|---|---|---|
+| `ResourceCopyRegion` → primary | a **copy** | wallpaper, desktop icons, labels — **correct** |
+| dwm draw sampling an **imported** shared surface | a **texture fetch** | client areas, tray glyphs — **constant colour** |
+
+⇒ Working theory: **sampling an imported shared surface returns a constant**, while
+copying the same memory is fine. That fits every observation at once — client rects
+solid, A8 glyph content missing or blown out, and dwm's own chrome and icons correct
+because dwm rasterises those itself rather than sampling an import.
+
+**⇒ The thing to inspect is the texture/sampler-view descriptor built for an imported
+BO** — its base address, row stride and format — not the import call, which is proven
+to succeed.
+
+⚠ Status: the routing split is **measured**; the "sampling returns a constant" step is
+**inferred**. Prove it before building on it. The `.5 kmt=` / `WMRTID` / `bo_from_allocation`
+lines in the same log give the addresses to check against.
+
+✅ The 0-byte client logs on the hung boot are **not** evidence that clients skipped the
+GPU. Calibrated: across ~506 logs, **every** client normally logs — Explorer 32/32
+non-empty (largest 191 KB), WindowsTerminal 34/34 (331 KB), StartMenuExperienceHost
+33/33. The empty files are stdio buffering lost when the box hard-hung.
+
+### 4.6 THE TRANSPORT IS AN ATLAS, AND THE A8 ONE IS WHERE IT BREAKS
+
+Comparing `Explorer` and `dwm` on the same render-mode boot separates the two roles
+cleanly.
+
+**Explorer never presents a window-sized surface.** Every present source it has:
+
+| count | present source | bytes/px |
+|---|---|---|
+| 36× | `704x704 stride=704` | **1 → A8** |
+| 3× | `1024x1024 stride=4096` | 4 → BGRA |
+| 1× | `1024x1024 stride=4096` | 4 → BGRA |
+
+**dwm presents exactly one thing, 279×:** `2944x1840 stride=11776` — the full screen.
+
+⇒ Explorer's taskbar/tray content reaches dwm **as atlases**, not as a window surface:
+a **704×704 A8 alpha/glyph atlas** plus 1024×1024 BGRA colour atlases. dwm then *opens*
+those very surfaces (`kmt=0x40001080 704x704 stride=704 fmt=65` appears in dwm's
+`OpenResource` list) and samples them in its `draws=59` composition stream.
+
+**This lines the symptom up exactly.** Everything sourced from a **BGRA** atlas renders
+correctly — pinned icons, wallpaper, window chrome. Everything sourced from the **A8**
+atlas is wrong in the specific way an alpha mask goes wrong when its coverage reads as
+1.0 or 0.0: the Start logo is **solid white**, the search magnifier is a **solid white
+blob**, and the clock, date, chevron and network glyphs are **absent**.
+
+⚠ This is NOT the old "text doesn't render" or "A8 format unsupported" claim — both are
+refuted and stay refuted (`A8_UNORM` reports `0x4507`, SAMPLE+RT, and desktop label
+glyphs render perfectly). The refined statement is narrower and about transport:
+**an A8 atlas written in one process and sampled in another comes back wrong.**
+
+#### A second, independent oddity in the same log
+
+`SetRenderTargets` census, sampled every 256 calls:
+
+- **dwm** binds `rt0=2944x1840` on essentially every sampled call — healthy.
+- **Explorer** binds `NumRTVs=1` with **`rt0=0x0`** (a NULL resource — the format string
+  is `rt0=%ux%u` and prints `0x0` when the pointer is NULL) on **every** sample from
+  #257 through #4865, while `WMCSOFF` shows it still issuing `draws=4` per stream.
+  Only the very first calls (#5 `1024x1024`, #8 `64x320`) bind a real target.
+
+⚠ **Do not bank this as a fault yet.** The census samples every 256th call, 256 is a
+power of two, and Explorer's workload is periodic — a sampling alias that always lands
+on the unbind would look identical. **Re-run with an unsampled or prime-strided census
+before believing it.** If it survives that, "Explorer draws into a NULL render target"
+becomes the primary lead.
+
+⚠ `0x00304507` (BGRA) vs `0x00004507` (A8/R8) in `CheckFormatSupport` differ only by
+`0x00300000` = the two multisample bits. Already refuted as a cause; not a lead.
+
 ---
 
 ## 5. Solved — root causes worth remembering
