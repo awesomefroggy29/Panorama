@@ -649,6 +649,43 @@ ULONG g_WinMaliOvlFlip = 0;
 PVOID g_WinMaliOvlRegsVa = NULL;
 /* Which carveout frame the overlay is currently scanning, and the back buffer
    VA we compose into when OvlFlip=2. */
+ULONG  g_WinMaliOvlFlipRender = 0;
+
+/* Where the present worker composes. With OvlFlipRender armed it composes into the
+   OVL BACK frame and the sweep-completion path flips to it; otherwise it writes
+   straight into the scanout the firmware is already displaying, exactly as before.
+   â›” Returning ScanoutVa unless the knob is on is what keeps the shipped display-only
+   configuration byte-for-byte unchanged. */
+static PVOID
+WinMaliWorkerDst_(_In_ PWINMALI_ADAPTER a)
+{
+    if (g_WinMaliOvlFlipRender != 0 && g_WinMaliOvlFlip == 2) {
+        /* â›”â˜…â˜…â˜…â˜…â˜… THE VA MUST MATCH THE **CURRENT** BACK PA.
+         * g_WinMaliOvlBackVa is a fixed mapping of FRAME2, but the flip SWAPS
+         * g_WinMaliOvlBackPa between FRAME1 and FRAME2. Returning the FRAME2 VA
+         * unconditionally meant that from the first flip onward we composed into
+         * FRAME2 while `back` said FRAME1 - so we flipped to a buffer nobody had
+         * written, and the panel alternated between two different-age frames.
+         * MEASURED 1.1.17.0: 8 flips, then silence, and a window showing the
+         * wallpaper. */
+        LONG64 back = InterlockedCompareExchange64(&g_WinMaliOvlBackPa, 0, 0);
+        if (back == (LONG64)WINMALI_FB_FRAME2_PA && g_WinMaliOvlBackVa != NULL) {
+            return g_WinMaliOvlBackVa;
+        }
+        /* FRAME1 is the live scanout EDK2 lit, so it is already mapped - no second
+           MmMapIoSpaceEx, and no new failure mode. */
+        if (back == (LONG64)WINMALI_FB_FRAME1_PA && a != NULL &&
+            a->ScanoutVa != NULL) {
+            return a->ScanoutVa;
+        }
+        /* Neither known frame: degrade to the plain blit (which gives a live
+           desktop today) rather than composing into a buffer we cannot name.
+           Counted on the SAME counter as a refused flip so it can never be a
+           silent path. */
+        (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlip2Rej);
+    }
+    return (a != NULL) ? a->ScanoutVa : NULL;
+}
 LONG64 g_WinMaliOvlFrontPa = 0;
 PVOID  g_WinMaliOvlBackVa  = NULL;
 LONG64 g_WinMaliOvlBackPa  = 0;
@@ -745,6 +782,10 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     (VOID)WinMaliReadParamsDword(RegistryPath, L"QaiWddmVer", 0, &g_WinMaliQaiWddmVer);
     (VOID)WinMaliReadParamsDword(RegistryPath, L"IndicateConnMs", 0,
                                  &g_WinMaliIndicateConnMs);
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"OvlFlipRender", 0,
+                                 &g_WinMaliOvlFlipRender);
+    (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffOvlFlipRender",
+                                  0x8000u | (g_WinMaliOvlFlipRender & 0xFFu));
     (VOID)WinMaliWriteParamsDword(RegistryPath, L"EffIndicateConn",
                                   0x80000000u | (g_WinMaliIndicateConnMs & 0xFFFFu));
     /* Published with the usual 0x8000 sentinel so "ran as 0" and "never read"
@@ -849,7 +890,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                  &g_WinMaliKnobFuse);
     /* Marker string so the PACKAGED binary can be proved to contain this change.
        â›” Never verify a deploy by hash - signing changes it. Grep for a string. */
-    DbgPrint("[WinMali]    BAKED DEFAULTS v4 MPOFUSED: dod=%u ovl=%u xform=%u mon=%u "
+    DbgPrint("[WinMali]    BAKED DEFAULTS v7 FLIPSTATS: dod=%u ovl=%u xform=%u mon=%u "
              "uv=%u hz=%u cfg=%u src=%u\n",
              (unsigned)WINMALI_DEF_DODMODE, (unsigned)WINMALI_DEF_OVLFLIP,
              (unsigned)WINMALI_DEF_PATHXFORM, (unsigned)WINMALI_DEF_MONMODEADD,
@@ -938,6 +979,11 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         }
         if (g_WinMaliQaiDirectFlip != 0) {
             (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"QaiDirectFlip", 0);
+        }
+        /* Programs the DISPLAY CONTROLLER from the worker thread. A bad boot must
+           cost exactly one boot, like every other lever. */
+        if (g_WinMaliOvlFlipRender != 0) {
+            (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"OvlFlipRender", 0);
         }
         if (g_WinMaliIndicateConnMs != 0) {
             (VOID)WinMaliWriteParamsDwordFlushed(RegistryPath, L"IndicateConnMs", 0);
@@ -2072,6 +2118,22 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
          adapter->SourceVisibleEver != 0)) {
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatScanoutBlits",
                                       (ULONG)adapter->ScanoutBltCount);
+        /* â›” THE OVL FLIP COUNTERS ARE OTHERWISE DOD-ONLY. They are published from
+           WinMaliDodPresentRect, which render mode never reaches, so on a render boot
+           they show a stale value for ever and "the flips stopped" is indistinguishable
+           from "nobody wrote the number down". Publish them from the worker, which does
+           run in render. Same names, so no new value is created on a key that is at its
+           127-name cap. */
+        if (g_WinMaliOvlFlip != 0) {
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlip2N",
+                                          (ULONG)g_WinMaliStatOvlFlip2N);
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlip2Rej",
+                                          (ULONG)g_WinMaliStatOvlFlip2Rej);
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlipBack",
+                                          (ULONG)g_WinMaliStatOvlFlipBack);
+            (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatOvlFlipRight",
+                                          (ULONG)g_WinMaliStatOvlFlipRight);
+        }
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatScanoutSkipped",
                                       (ULONG)adapter->ScanoutBltSkipped);
         (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath, L"StatSourceVisibleEver",
@@ -4984,7 +5046,8 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                                 (VOID)InterlockedIncrement(&g_WinMaliStatCopyAbort);
                                 break;
                             }
-                            RtlCopyMemory((PUCHAR)a->ScanoutVa + (SIZE_T)r * dstPitch,
+                            RtlCopyMemory((PUCHAR)WinMaliWorkerDst_(a) +
+                                              (SIZE_T)r * dstPitch,
                                           srcRow, rowBytes);
                         }
                         doneRows++;
@@ -5049,10 +5112,12 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                                                 WINMALI_FB_STRIDE, WINMALI_FB_HEIGHT,
                                                 &stripBo, &stripRows);
                             if (stripVa != NULL && stripRows != 0 &&
-                                stripRows < WINMALI_FB_HEIGHT && a->ScanoutVa != NULL) {
+                                stripRows < WINMALI_FB_HEIGHT &&
+                                WinMaliWorkerDst_(a) != NULL) {
                                 ULONG dstTop = WINMALI_FB_HEIGHT - stripRows;
                                 RtlCopyMemory(
-                                    (PUCHAR)a->ScanoutVa + (SIZE_T)dstTop * WINMALI_FB_STRIDE,
+                                    (PUCHAR)WinMaliWorkerDst_(a) +
+                                        (SIZE_T)dstTop * WINMALI_FB_STRIDE,
                                     stripVa,
                                     (SIZE_T)stripRows * WINMALI_FB_STRIDE);
                                 (VOID)InterlockedIncrement(&g_WinMaliStatStripBlits);
@@ -5060,6 +5125,18 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             if (stripBo != 0) {
                                 WinMaliUvSrcEndUse(stripBo);
                             }
+                        }
+
+                        /* â˜…â˜…â˜… THE FRAME IS COMPLETE - FLIP THE PANEL TO IT.
+                         * Issued HERE and only here: the sweep-completion point is
+                         * the one moment a WHOLE frame exists in the back buffer, so
+                         * we can never flip to a half-composed image. Off unless
+                         * OvlFlipRender is armed, which keeps display-only - where
+                         * the flip already happens in PresentDisplayOnly - untouched
+                         * and avoids flipping twice for one frame. */
+                        if (g_WinMaliOvlFlipRender != 0 && g_WinMaliOvlFlip == 2 &&
+                            g_WinMaliOvlBackVa != NULL) {
+                            (VOID)WinMaliOvlFlipDual_();
                         }
                     }
                     /* ⛔★★★★★ SHIP A THUMBNAIL OF WHAT WE ACTUALLY SCAN OUT.

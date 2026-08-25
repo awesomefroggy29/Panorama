@@ -1377,6 +1377,80 @@ WinMaliKmdRecommendMonitorModes(_In_ CONST HANDLE hAdapter,
 }
 
 /* ======================================================================
+ * WinMaliOvlFlipDual_ - POINT BOTH HALVES OF THE PANEL AT THE BACK FRAME.
+ *
+ * Extracted from the mode-2 block in PresentDisplayOnly so the PRESENT WORKER can
+ * call it too: that block is inside the KMDOD DDI, so RENDER mode - which has a live
+ * composited desktop as of 2026-08-25 - could never reach it and fell back to a CPU
+ * blit at ~15 fps.
+ *
+ * Self-contained: reads the live OVL0 address itself rather than taking it from the
+ * caller, so it is safe from either path.
+ *
+ * â›” WHITELIST BOTH PIPES. This writes a physical address into a display controller.
+ * Only the three known EDK2 carveout frames are ever programmed; anything else means
+ * our idea of the scanout has drifted from the hardware's and we must refuse, not
+ * guess. A wrong address here shows garbage on the glass or hangs the display bus.
+ * â›” The caller must have composed a COMPLETE frame into g_WinMaliOvlBackVa first.
+ * ====================================================================== */
+BOOLEAN
+WinMaliOvlFlipDual_(VOID)
+{
+    volatile ULONG *l0, *r0;
+    ULONG cur, curR, back;
+    BOOLEAN okL, okR;
+
+    /* â›” EVERY NON-FLIP PATH MUST BE COUNTED. 1.1.17.0 had two silent early returns
+       here, so "8 flips then nothing, and Rej=0" was undiagnosable - the one thing
+       this driver's own comments warn about repeatedly. */
+    if (g_WinMaliOvlRegsVa == NULL || g_WinMaliOvl4RegsVa == NULL) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlip2Rej);
+        return FALSE;
+    }
+    back = (ULONG)InterlockedCompareExchange64(&g_WinMaliOvlBackPa, 0, 0);
+    if (back != (ULONG)WINMALI_FB_FRAME1_PA &&
+        back != (ULONG)WINMALI_FB_FRAME2_PA) {
+        /* Includes the back==0 case. Whitelisted on the way OUT as well as on the
+           way in: we never program an address we cannot name. */
+        (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlip2Rej);
+        return FALSE;
+    }
+
+    l0 = (volatile ULONG *)((PUCHAR)g_WinMaliOvlRegsVa  + WINMALI_OVL0_L0_ADDR);
+    r0 = (volatile ULONG *)((PUCHAR)g_WinMaliOvl4RegsVa + WINMALI_OVL0_L0_ADDR);
+    cur  = READ_REGISTER_ULONG(l0);
+    curR = READ_REGISTER_ULONG(r0);
+
+    okL = (cur == (ULONG)WINMALI_FB_FRAME0_PA) ||
+          (cur == (ULONG)WINMALI_FB_FRAME1_PA) ||
+          (cur == (ULONG)WINMALI_FB_FRAME2_PA);
+    okR = (curR == (ULONG)(WINMALI_FB_FRAME0_PA + WINMALI_OVL_RIGHT_OFF)) ||
+          (curR == (ULONG)(WINMALI_FB_FRAME1_PA + WINMALI_OVL_RIGHT_OFF)) ||
+          (curR == (ULONG)(WINMALI_FB_FRAME2_PA + WINMALI_OVL_RIGHT_OFF));
+
+    if (!okL || !okR || back == cur) {
+        (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlip2Rej);
+        return FALSE;
+    }
+
+    WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)g_WinMaliOvlRegsVa +
+                         WINMALI_OVL0_L0_ADDR_MSB), 0);
+    WRITE_REGISTER_ULONG(l0, back);
+    WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)g_WinMaliOvl4RegsVa +
+                         WINMALI_OVL0_L0_ADDR_MSB), 0);
+    WRITE_REGISTER_ULONG(r0, back + WINMALI_OVL_RIGHT_OFF);
+
+    (VOID)InterlockedExchange(&g_WinMaliStatOvlFlipBack,
+                              (LONG)READ_REGISTER_ULONG(l0));
+    (VOID)InterlockedExchange(&g_WinMaliStatOvlFlipRight,
+                              (LONG)READ_REGISTER_ULONG(r0));
+    (VOID)InterlockedExchange64(&g_WinMaliOvlBackPa, (LONG64)g_WinMaliOvlFrontPa);
+    (VOID)InterlockedExchange64(&g_WinMaliOvlFrontPa, (LONG64)back);
+    (VOID)InterlockedIncrement(&g_WinMaliStatOvlFlip2N);
+    return TRUE;
+}
+
+/* ======================================================================
  * DxgkDdiPresentDisplayOnly - THE DISPLAY-ONLY PRESENT PATH.
  *
  * dxgk gives us the finished desktop in SYSTEM MEMORY:

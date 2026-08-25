@@ -403,6 +403,11 @@ extern UNICODE_STRING g_WinMaliRegPath;
 extern ULONG  g_WinMaliQaiWddmVer;       /* 0 = compiled default; else reported verbatim */
 extern ULONG  g_WinMaliOvlFlip;          /* 0=off 1=no-op writeback 2=inert */
 extern PVOID  g_WinMaliOvlRegsVa;        /* OVL0 register block, or NULL */
+/* Parameters\OvlFlipRender - drive the dual-pipe OVL hardware flip from the PRESENT
+   WORKER so RENDER mode gets real page flips instead of a CPU blit. Requires
+   OvlFlip=2. Default 0 = today's behaviour exactly. */
+extern ULONG  g_WinMaliOvlFlipRender;
+BOOLEAN WinMaliOvlFlipDual_(VOID);
 extern LONG64 g_WinMaliOvlFrontPa;
 extern PVOID  g_WinMaliOvlBackVa;        /* not wired yet - see apply141 note */
 extern LONG64 g_WinMaliOvlBackPa;
