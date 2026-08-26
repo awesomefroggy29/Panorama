@@ -374,6 +374,51 @@ carries KMD lines across a driver reload *within* a live boot session.
 ✅ The **UMD logs in `C:\umdlog` are files on disk and do survive** — that is how the
 signature above was recovered. Go there first after a hang.
 
+### 4.8 THE A8 LAYOUT IS CLEAN — measured, and it narrows the suspect list
+
+1.1.21.4 prints `row_stride_B` beside `blocksize_B` at sampler-view creation:
+
+```
+A8    704x704   row_stride_B=704   blocksize_B=1  data_size_B=495616   modifier=0x0
+A8     32x32    row_stride_B=64    blocksize_B=1  data_size_B=2048     modifier=0x0
+BGRA 1024x1024  row_stride_B=4096  blocksize_B=4  data_size_B=4194304  modifier=0x0
+```
+
+704 × 704 × 1 = 495,616 **exactly**. Stride = width × 1. Modifier `0x0` = linear.
+
+⇒ **The A8 atlas's stride, size and modifier are all correct and self-consistent at one
+byte per pixel.** That kills the stride-mismatch and wrong-modifier variants outright —
+the layout side is not the bug.
+
+⇒ **What survives:** the arch ≥ 9 texture-descriptor mapping at `pan_format.c:598`,
+`FMT(A8_UNORM, RGBA8_UNORM, 000A, …)`. Layout says 1 bpp; the descriptor declares a
+4-bpp hardware format. **Next instrument: print the packed `.hw` word for A8 on arch 11
+and see what texel size it encodes.**
+
+★ The format was identified **by provenance, not enum arithmetic**: `pipe_fmt=315` was
+matched to A8 via dwm's `OpenResource` line for the same surface (`704x704 stride=704
+fmt=65`; DXGI 65 = `A8_UNORM`). Counting enum members is a recorded trap here —
+`u_format_gen.h` alias entries consume no slot and once gave three different answers.
+
+### 4.9 The fifth hang — cause unknown, and the instruments were both dead
+
+User-observed: the colour-cycling `PresentMarker` square **disappeared**, taskbar gone,
+WinRM dead, fully hung. Per `WinMaliDriver.c:5633` that square exists precisely to
+settle this: *marker present + cycling* = the image on screen is ours; *desktop but no
+marker* = **stale buffer, not us**. Marker **gone rather than frozen** ⇒ the panel
+stopped showing our blits altogether.
+
+⛔ **Do not record a cause for this one.** Both channels were dead:
+
+- dwm's UMD log for that boot is **0 bytes** — stdio buffering lost to the hang again;
+- the new flushed `CsfLastStatus` latch reads 0, but **has never once fired**, so a zero
+  from it is an uncalibrated instrument, not evidence.
+
+★ **To calibrate the latch, force one failure deliberately** and confirm a non-zero
+`CsfLastStatus` survives a power cycle. Until that is done it proves nothing — and a
+tooling script that concludes "no failure found → different mechanism" from an empty log
+is making exactly the error this document keeps warning about.
+
 ---
 
 ## 5. Solved — root causes worth remembering
