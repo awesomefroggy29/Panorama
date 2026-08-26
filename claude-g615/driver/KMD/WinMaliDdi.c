@@ -1101,11 +1101,55 @@ WinMaliKmdSubmitCommandVirtual(
                     }
                 }
                 if (asSlot < WINMALI_AS_SLOT_MAX) {
+                    NTSTATUS subSt;
+                    static LONG s_ddiCalib = 0;
+
                     WinMaliBoFlushVm(adapter, cs->VmId, TRUE);   /* CPU->DRAM */
-                    (VOID)WinMaliCsfSubmitGroupStream(adapter, asSlot,
-                                                      cs->StreamGpuVa, cs->StreamSize,
-                                                      0u, 500u);
+                    subSt = WinMaliCsfSubmitGroupStream(adapter, asSlot,
+                                                        cs->StreamGpuVa, cs->StreamSize,
+                                                        0u, 500u);
                     WinMaliBoFlushVm(adapter, cs->VmId, FALSE);  /* DRAM->CPU */
+
+                    /* ★★ THIS STATUS WAS CAST TO (VOID). THAT IS WHY FIVE
+                     * RENDER-MODE HANGS CAME BACK WITH NO RECORDED CAUSE.
+                     *
+                     * This is the HOT submit path - dxgk DMA buffers, i.e. dwm's
+                     * actual rendering. Its result was discarded, so a failing
+                     * submit here left no counter, no log and no latch. The
+                     * escape path (WinMaliEscape.c) DOES latch its failures, but
+                     * it is not the path doing the work.
+                     *
+                     * PROVEN, not assumed: 1.1.21.5 stamped a sentinel on the
+                     * escape path's first success. After 2110 successful submits
+                     * the sentinel had never fired - so the escape path was
+                     * essentially idle while rendering went through here.
+                     *
+                     * ⛔ Latch into GLOBALS only - no registry write here. We
+                     * hold AsSchedLock (a KMUTEX) and a FLUSHED write is disk
+                     * I/O; stalling GPU scheduling on a disk flush would make a
+                     * bad moment worse. WinMaliDriver.c's publish writes these
+                     * out with the flushed writer at ~12 Hz, which is well
+                     * inside the seconds a wedge takes.
+                     *
+                     * Sentinel 0xC0FFEE02 marks THIS path live, distinct from
+                     * the escape path's 0xC0FFEE01, so a zero can never again be
+                     * misread as "no failure". */
+                    if (!NT_SUCCESS(subSt)) {
+                        (VOID)InterlockedExchange(&g_WinMaliStatCsfLastStatus,
+                                                  (LONG)subSt);
+                        (VOID)InterlockedExchange(&g_WinMaliStatCsfLastAs,
+                                                  (LONG)asSlot);
+                        (VOID)InterlockedExchange(&g_WinMaliStatCsfLastSize,
+                                                  (LONG)cs->StreamSize);
+                        (VOID)InterlockedIncrement(&g_WinMaliStatCsfFailCount);
+                        WINMALI_WARN("SubmitCommandVirtual: CSF submit FAILED "
+                                     "0x%08x (as=%u va=0x%llx size=%u)",
+                                     subSt, asSlot,
+                                     (ULONGLONG)cs->StreamGpuVa, cs->StreamSize);
+                    } else if (InterlockedCompareExchange(&s_ddiCalib, 1, 0) == 0) {
+                        (VOID)InterlockedExchange(&g_WinMaliStatCsfLastStatus,
+                                                  (LONG)0xC0FFEE02u);
+                    }
                 } else {
                     WINMALI_WARN("SubmitCommandVirtual: CS desc vm=%u -> no AS slot",
                                  cs->VmId);

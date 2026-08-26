@@ -3599,12 +3599,45 @@ WinMaliPresentWorker_(_In_ PVOID Context)
                             L"McuFaultSt",   (ULONG)g_WinMaliStatMcuFaultSt);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"GpuFaultSt",   (ULONG)g_WinMaliStatGpuFaultSt);
-                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                            L"CsfLastStatus", (ULONG)g_WinMaliStatCsfLastStatus);
-                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                            L"CsfLastAs",     (ULONG)g_WinMaliStatCsfLastAs);
-                    (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
-                            L"CsfLastSize",   (ULONG)g_WinMaliStatCsfLastSize);
+                    /* ⛔ FLUSH ONLY ON CHANGE.
+                     *
+                     * These name WHY the GPU stopped, and the machine is usually
+                     * seconds from a wedge when they change - a lazily-flushed
+                     * hive loses them to the power cycle every time, which is
+                     * why five render-mode hangs came back reading
+                     * CsfLastStatus=0.
+                     *
+                     * ⛔ But this worker ticks at 12 Hz and RegFlushKey writes
+                     * the WHOLE hive. Flushing unconditionally here would be
+                     * ~36 hive flushes per second - a performance fault bad
+                     * enough to be mistaken for the very stalls being chased.
+                     * So flush only when the value actually moved: nil cost in
+                     * the steady state, durable exactly when it matters.
+                     *
+                     * The submit paths deliberately only touch the globals -
+                     * they run under AsSchedLock and must not do disk I/O. This
+                     * PASSIVE-level worker is the right place to pay. */
+                    {
+                        static LONG s_pubStatus = 0, s_pubAs = 0, s_pubSize = 0;
+                        LONG st = g_WinMaliStatCsfLastStatus;
+                        LONG as = g_WinMaliStatCsfLastAs;
+                        LONG sz = g_WinMaliStatCsfLastSize;
+                        if (st != s_pubStatus) {
+                            s_pubStatus = st;
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"CsfLastStatus", (ULONG)st);
+                        }
+                        if (as != s_pubAs) {
+                            s_pubAs = as;
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"CsfLastAs", (ULONG)as);
+                        }
+                        if (sz != s_pubSize) {
+                            s_pubSize = sz;
+                            (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                                    L"CsfLastSize", (ULONG)sz);
+                        }
+                    }
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,
                             L"CsfLastVaLo",   (ULONG)g_WinMaliStatCsfLastVaLo);
                     (VOID)WinMaliWriteParamsDword(&g_WinMaliRegPath,

@@ -768,23 +768,20 @@ typedef struct _WINMALI_BO_FROM_USER_VA {
     uint32_t Flags;             /* WINMALI_BO_FLAG_* (subset valid)   */
     /* ⛔★★★★★ THE SOURCE'S ROW PITCH IN BYTES. 0 = unknown/not supplied.
      *
-     * ⚠ THIS HEADER EXISTS TWICE: winmali\Shared and rk3588-GPU\Shared. The KMD
-     * compiles against the first, mesa against the second (its meson include
-     * path is ..\..\rk3588-GPU\Shared). They are the SAME WIRE FORMAT and must
-     * be edited together - changing only one gives a UMD and a KMD that disagree
-     * about the payload, silently.
-     *
      * The KMD had no idea what SHAPE these buffers are: 0x93 carried only
-     * UserVa+Size, and the present worker's only gate was `Size >= frameBytes`,
-     * so it copied every candidate as a flat block at the PANEL pitch (11776).
-     * MEASURED: DWM/LogonUI register surfaces whose stride is NOT the panel's,
-     * which clears a byte-size gate while being a different shape - and copied
-     * flat, the image is squeezed into part of the panel. That is the ~50% fill
-     * measured as StatSrcLastRow=984 of 1840.
+     * UserVa+Size, and the present worker's only gate was `Size >= frameBytes`.
+     * So it copied every candidate as a flat block at the PANEL pitch (11776).
      *
-     * Reuses the old `Pad` slot on purpose: sizeof() is unchanged, so a UMD
-     * built before this field sends 0 and the KMD falls back to the old linear
-     * copy. No ABI break between mismatched UMD/KMD versions. */
+     * MEASURED, from the UMD's own log: the surfaces DWM/LogonUI register are
+     *     2946x1842, stride 24576, size 22,093,824
+     * which sails through a byte-size gate (22.09 MB >= 21.67 MB) while being a
+     * completely different shape. Copied linearly at 11776, that image is
+     * squeezed into the top half of the panel - exactly the ~50% fill seen on
+     * the glass all session and measured as StatSrcLastRow=984 of 1840.
+     *
+     * ⚠ REUSES THE OLD `Pad` SLOT DELIBERATELY: sizeof() is unchanged, so a UMD
+     * built before this field sends 0 here and the KMD falls back to the old
+     * linear copy. No ABI break and no flag day between UMD and KMD versions. */
     uint32_t SrcPitch;
     /* out */
     uint32_t BoHandle;

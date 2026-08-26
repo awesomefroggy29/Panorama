@@ -419,6 +419,47 @@ stopped showing our blits altogether.
 tooling script that concludes "no failure found → different mechanism" from an empty log
 is making exactly the error this document keeps warning about.
 
+### 4.10 RESOLVED: the instrument was overwriting itself
+
+Calibrated across 1.1.21.5 → 1.1.21.6 with a self-stamping sentinel. `CsfLastStatus`
+had **two writers**:
+
+1. the failure/sentinel site, writing the registry directly and **flushed**; and
+2. the present worker, publishing the **global** `g_WinMaliStatCsfLastStatus`
+   **unconditionally every tick** with the **lazy** writer — at 12 Hz.
+
+⇒ Anything written directly was **stomped within ~83 ms** by a stale global, and
+anything the worker wrote was never flushed, so a hard power cycle lost it. **That is
+why five hangs came back reading zero.**
+
+✅ Fixed: the worker now publishes **only on change**, and **flushed** when it does.
+
+⛔ It must **not** flush unconditionally — `RegFlushKey` writes the *whole hive*, and at
+12 Hz × 3 values that is ~36 hive flushes per second: a performance fault easily
+mistaken for the very stalls being chased. **Flush on change, never on tick.** I nearly
+shipped the unconditional version.
+
+**Two of my own earlier claims are corrected by this:**
+
+- ⛔ *"the 1.1.21.5 sentinel never fired, so the escape path is idle"* — **wrong**, and
+  it was the instrument's fault. The sentinel wrote only the registry, never the global,
+  so the worker erased it before I read it. On 1.1.21.6 the same sentinel **survives**
+  (`CsfLastStatus = 0xC0FFEE01`). The escape path is live and its latch works.
+- ⛔ *"rendering goes through the DDI path, not the escape"* — **not established**; it
+  was inferred from the false premise above. Evidence now points the other way: the DDI
+  sentinel `0xC0FFEE02` never appeared while the escape sentinel did.
+
+**Still a real defect, and still fixed:** `SubmitCommandVirtual` called
+`(VOID)WinMaliCsfSubmitGroupStream(...)` — the NTSTATUS was explicitly discarded, so a
+failure on that path left no counter, no log and no latch. Now captured and latched.
+⛔ Latch into **globals only** there — it runs under `AsSchedLock` (a `KMUTEX`) and a
+flushed write is disk I/O; stalling GPU scheduling on a hive flush would make a bad
+moment worse.
+
+> ★★ **An instrument with two writers is not an instrument.** A zero said "the code
+> never ran" when the truth was "something else overwrote it 83 ms later". Before
+> trusting any latched value, ask *who else writes this name*.
+
 ---
 
 ## 5. Solved — root causes worth remembering

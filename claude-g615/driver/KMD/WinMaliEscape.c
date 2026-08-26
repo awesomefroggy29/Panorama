@@ -1692,6 +1692,32 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                           "(as=%u stream_va=0x%llx size=%u syncs=%u)",
                           args->GroupHandle, qs->QueueIndex, asSlot,
                           (ULONGLONG)qs->StreamAddr, qs->StreamSize, qs->SyncsCount);
+
+            /* ★★ SELF-CALIBRATING LATCH.
+             *
+             * The failure branch above writes the real reason with the FLUSHED
+             * writer. But an instrument that has only ever read ZERO cannot
+             * tell "no failure happened" from "that code never ran" - and after
+             * the 5th hang I had exactly that ambiguity and had to record the
+             * cause as unknown.
+             *
+             * So stamp a distinctive SENTINEL through the SAME function, from
+             * the SAME context, on the first successful submit of each load.
+             * CsfLastStatus then reads three-ways:
+             *
+             *   0xC0FFEE01  -> channel PROVEN live this boot, and no failure
+             *   an NTSTATUS -> a real submit failure, and this is it
+             *   0           -> the write never ran at all; distrust everything
+             *
+             * One flushed write per driver load, so the cost is nil, and a real
+             * failure simply overwrites the sentinel. */
+            {
+                static LONG s_calibrated = 0;
+                if (InterlockedCompareExchange(&s_calibrated, 1, 0) == 0) {
+                    (VOID)WinMaliWriteParamsDwordFlushed(&g_WinMaliRegPath,
+                            L"CsfLastStatus", 0xC0FFEE01u);
+                }
+            }
         }
 
         if (syncs != NULL) {
