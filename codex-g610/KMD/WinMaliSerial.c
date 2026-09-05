@@ -167,6 +167,7 @@ WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...)
 
     DbgPrint("%s", buf);      /* real DbgPrint - kd path when attached */
     WinMaliSerialWrite(buf);  /* UART path when not */
+    WinMaliFileLogWrite(buf); /* nonblocking ring; worker owns file I/O */
     return 0;
 }
 
@@ -185,5 +186,6 @@ WinMaliLifecycleLogPrint(
 
     DbgPrint("%s", buf);
     WinMaliSerialWrite(buf);
+    WinMaliFileLogWrite(buf);
     return 0;
 }

@@ -1,6 +1,6 @@
 /*
- * WinMaliLog.h - route every driver print to BOTH DbgPrint and the
- * RK3588 debug UART (UART2 @ 0xFEB50000, the same wire kd uses).
+ * WinMaliLog.h - route every driver print to DbgPrint and optional
+ * low-level sinks (the RK3588 debug UART and the asynchronous file log).
  *
  * Why: with bcdedit /debug on the box stalls at boot-debugger breaks
  * unless kd is attached and pumping 'g' - useless for unattended
@@ -28,6 +28,12 @@
  * Flip + rebuild; nothing else changes. */
 #define WINMALI_LOG_TO_UART 0
 
+/* Keep the file recorder compiled into diagnostic builds. Whether it runs is
+ * controlled by Services\WinMaliKmd\Parameters\FileLogging (default 1 in the
+ * INF). Producers only copy into a fixed nonpaged ring; a dedicated
+ * PASSIVE_LEVEL worker performs all filesystem I/O. */
+#define WINMALI_LOG_TO_FILE 1
+
 /* Map the UART MMIO + program 115200-8n1 (only when no debugger owns
    it). Call once, early in DriverEntry, before the first print.
    No-op when WINMALI_LOG_TO_UART == 0. */
@@ -37,6 +43,12 @@ VOID     WinMaliSerialTeardown(VOID);
 /* Raw text writer: polled TX, bounded spins, any IRQL. */
 VOID     WinMaliSerialWrite(_In_z_ const char* Text);
 
+/* Asynchronous C:\gpu.log flight recorder. Initialization failure is
+ * deliberately non-fatal and logging never changes a graphics DDI result. */
+NTSTATUS WinMaliFileLogInitialize(_In_ BOOLEAN Enabled);
+VOID     WinMaliFileLogTeardown(VOID);
+VOID     WinMaliFileLogWrite(_In_z_ const char* Text);
+
 /* printf-shim: formats once, forwards to real DbgPrint + the UART. */
 ULONG    WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...);
 
@@ -45,7 +57,7 @@ ULONG    WinMaliLogPrint(_In_z_ _Printf_format_string_ const char* Format, ...);
 ULONG    WinMaliLifecycleLogPrint(
              _In_z_ _Printf_format_string_ const char* Format, ...);
 
-#if WINMALI_LOG_TO_UART && !defined(WINMALI_LOG_NO_REDIRECT)
+#if (WINMALI_LOG_TO_UART || WINMALI_LOG_TO_FILE) && !defined(WINMALI_LOG_NO_REDIRECT)
 #undef  DbgPrint
 #define DbgPrint WinMaliLogPrint
 #endif

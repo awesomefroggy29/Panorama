@@ -103,6 +103,15 @@
     <WinMaliLogProfile Condition="'$(WinMaliLogProfile)' == ''">Verbose</WinMaliLogProfile>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Focused'">WINMALI_LOG_FOCUSED=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Lifecycle'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Glyph'">WINMALI_LOG_GLYPH=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'ShaderCapture'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Reject'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'GlyphPipeline'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'AttributeProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'LookupProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'FragWProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'LdVarProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'IdvsProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -173,6 +182,7 @@
     <ClCompile Include="WinMaliDxgkStubs.c" />
     <ClCompile Include="WinMaliEscape.c" />
     <ClCompile Include="WinMaliFw.c" />
+    <ClCompile Include="WinMaliFileLog.c" />
     <ClCompile Include="WinMaliGroup.c" />
     <ClCompile Include="WinMaliKillSwitch.c" />
     <ClCompile Include="WinMaliMmu.c" />

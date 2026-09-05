@@ -65,8 +65,26 @@ param(
     # noisy adapter-enumeration dump while retaining failures and the render,
     # synchronization, and DXGI presentation breadcrumbs used for bring-up.
     # Lifecycle disables Mesa and UMD logging completely; only KMD lifecycle
-    # messages remain visible.
-    [ValidateSet("Verbose","Focused","Lifecycle")]
+    # messages remain visible. Glyph retains only the focused
+    # [WinMaliText] dual-source text-rendering trace. ShaderCapture writes the
+    # one-run DXBC/TGSI/NIR comparison bundle and emits only its compact index.
+    # Reject emits only bounded final Valhall draw/attribute/rejection state;
+    # unlike ShaderCapture it does not read back surfaces or write dump files.
+    # GlyphPipeline replaces the recognized glyph fragment shader with opaque
+    # red and its exact captured vertex shader with vertex-ID-generated
+    # full-screen geometry, isolating indexed IDVS from vertex/instance fetch.
+    # AttributeProbe splits that exact draw into four visual paths to distinguish
+    # launch/indexing, slot 0, slots 1/2, and the original combined position.
+    # LookupProbe visualizes the real R8 metadata result, the real atlas alpha,
+    # and an independent fixed-coordinate atlas fetch in RGB, respectively.
+    # FragWProbe replaces FRAG_W with 1.0 only in the exact captured XAML glyph
+    # fragment shader, leaving every other shader and capability unchanged.
+    # LdVarProbe forces only that shader onto the descriptor-backed generic
+    # LD_VAR fallback instead of the layout-specific LD_VAR_BUF instruction.
+    # IdvsProbe leaves rendering untouched and records the exact position /
+    # secondary-varying program handoff plus the linked varying descriptors
+    # and fragment resource-table entry for the captured XAML glyph pipeline.
+    [ValidateSet("Verbose","Focused","Lifecycle","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe")]
     [string]$DriverLogProfile = "Verbose",
 
     # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
@@ -534,6 +552,44 @@ if ($DriverLogProfile -eq "Focused") {
 elseif ($DriverLogProfile -eq "Lifecycle") {
     $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_LIFECYCLE=1"
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_LIFECYCLE=1"
+}
+elseif ($DriverLogProfile -eq "Glyph") {
+    # Retain focused-mode compile-time suppression for older diagnostics while
+    # allowing the dedicated [WinMaliText] trace through the runtime filters.
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_GLYPH=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_GLYPH=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "ShaderCapture") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_SHADER_CAPTURE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_SHADER_CAPTURE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "Reject") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_REJECT_CAPTURE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_REJECT_CAPTURE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "GlyphPipeline") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_GLYPH_PIPELINE_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_GLYPH_PIPELINE_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "AttributeProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_ATTRIBUTE_PATH_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_ATTRIBUTE_PATH_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "LookupProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOOKUP_SPLIT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOOKUP_SPLIT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "FragWProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_FRAG_W_BYPASS_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_FRAG_W_BYPASS_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "LdVarProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LD_VAR_FALLBACK_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LD_VAR_FALLBACK_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "IdvsProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_IDVS_HANDOFF_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_IDVS_HANDOFF_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
 }
 
 # MSYS2 flex emits POSIX names even for Windows scanners.  Force-include a

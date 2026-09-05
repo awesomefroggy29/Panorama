@@ -2193,6 +2193,8 @@ WinMaliCsfSubmitStreamCall_(
     ULONG              ringMask;
     UINT64             ringInsert;
     UINT64             ringExtract;
+    UINT64             ringWriteOffset;
+    UINT64             ringUsed;
     UINT64             callInstrs[WINMALI_CSF_NUM_INSTRS_PER_SLOT];
     volatile WINMALI_PANTHOR_SYNCOBJ64* sync;
     volatile UINT64*   tagSlot;
@@ -2290,15 +2292,38 @@ WinMaliCsfSubmitStreamCall_(
     callInstrs[14] = 0ull; // explicit NOP
     callInstrs[15] = (47ull << 56);
 
-    ringMask    = (ULONG)(WINMALI_CSF_RING_BYTES - 1u);
-    ringInsert  = Fw->QRingIn->Insert & (UINT64)ringMask;
-    ringExtract = Fw->QRingOut->Extract;
+    ringMask        = (ULONG)(WINMALI_CSF_RING_BYTES - 1u);
+    ringInsert      = Fw->QRingIn->Insert;
+    ringExtract     = Fw->QRingOut->Extract;
+    ringWriteOffset = ringInsert & (UINT64)ringMask;
+    ringUsed        = ringInsert - ringExtract;
 
-    if (ringInsert + sizeof(callInstrs) > WINMALI_CSF_RING_BYTES) {
+    /* Insert and Extract are monotonic firmware counters.  Mask Insert only
+       when deriving the byte offset into the circular host allocation.  In
+       particular, publishing the masked offset moves Insert backwards at the
+       first 64-KiB wrap (submission 513 for this 128-byte trampoline), making
+       the firmware see an empty/invalid queue and never execute the CALL. */
+    if (ringUsed > ((UINT64)WINMALI_CSF_RING_BYTES - sizeof(callInstrs))) {
+        WINMALI_WARN(
+            "CSF ring full/corrupt: insert=%llu extract=%llu used=%llu need=%llu",
+            (ULONGLONG)ringInsert, (ULONGLONG)ringExtract,
+            (ULONGLONG)ringUsed, (ULONGLONG)sizeof(callInstrs));
+        return STATUS_DEVICE_BUSY;
+    }
+    if (ringWriteOffset + sizeof(callInstrs) > WINMALI_CSF_RING_BYTES) {
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    RtlCopyMemory((PUCHAR)Fw->HostRingVa + (SIZE_T)ringInsert, callInstrs, sizeof(callInstrs));
+    if (ringInsert != 0ull && ringWriteOffset == 0ull) {
+        WINMALI_DIAG(
+            "CSF ring wrap: insert=%llu extract=%llu writeOffset=%llu next=%llu",
+            (ULONGLONG)ringInsert, (ULONGLONG)ringExtract,
+            (ULONGLONG)ringWriteOffset,
+            (ULONGLONG)(ringInsert + sizeof(callInstrs)));
+    }
+
+    RtlCopyMemory((PUCHAR)Fw->HostRingVa + (SIZE_T)ringWriteOffset,
+                  callInstrs, sizeof(callInstrs));
     KeMemoryBarrier();
 
     Fw->QRingIn->Extract = ringExtract;

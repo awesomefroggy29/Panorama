@@ -162,6 +162,10 @@ AddReg         = WinMaliKmd.Service.AddReg
 ; surfaces presented by applications. Set this to 0 as a recovery escape
 ; hatch if compositor device creation must be disabled for diagnosis.
 HKR, Parameters, AllowDwm, %REG_DWORD%, 1
+; Asynchronous KMD flight recorder. Producers never perform file I/O; a
+; PASSIVE_LEVEL worker appends to C:\gpu.log. Set to 0 for production-style
+; performance testing without rebuilding the package.
+HKR, Parameters, FileLogging, %REG_DWORD%, 1
 
 [WinMaliKmd.EventLog]
 AddReg = WinMaliKmd.EventLog.AddReg

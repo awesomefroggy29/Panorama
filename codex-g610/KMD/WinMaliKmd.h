@@ -19,10 +19,23 @@
 #include "WinMaliGroup.h"
 #include "WinMaliDiag.h"
 
-/* Driver-wide trace shim. Lifecycle builds retain only the explicit lifecycle
-   channel below. Suppress raw DbgPrint and direct UART-mirror call sites too,
-   so an old diagnostic cannot accidentally become a high-frequency sink. */
-#if defined(WINMALI_LOG_LIFECYCLE)
+/* Driver-wide trace shim. Glyph builds retain lifecycle plus warnings/errors:
+   enough to correlate a UMD failure with a KMD fault without restoring the
+   high-frequency scheduler/MMU trace. Lifecycle builds retain only lifecycle. */
+#if defined(WINMALI_LOG_GLYPH)
+#undef DbgPrint
+#define DbgPrint(...)             (0UL)
+#define WinMaliLogPrint(...)      (0UL)
+#define WINMALI_TRACE(fmt, ...)   ((void)0)
+#define WINMALI_DIAG(fmt, ...)    ((void)0)
+#define WINMALI_ROUTINE(fmt, ...) ((void)0)
+#define WINMALI_WARN(fmt, ...) \
+    WinMaliLifecycleLogPrint("[WinMali] WARN " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_ERROR(fmt, ...) \
+    WinMaliLifecycleLogPrint("[WinMali] ERR  " fmt "\n", ##__VA_ARGS__)
+#define WINMALI_LIFECYCLE(fmt, ...) \
+    WinMaliLifecycleLogPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#elif defined(WINMALI_LOG_LIFECYCLE)
 #undef DbgPrint
 #define DbgPrint(...)             (0UL)
 #define WinMaliLogPrint(...)      (0UL)

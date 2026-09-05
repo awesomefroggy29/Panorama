@@ -50,6 +50,14 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     DRIVER_INITIALIZATION_DATA init;
     NTSTATUS                   status;
+    ULONG                      fileLogging = 1;
+
+    /* The file logger is deliberately best-effort: a missing/unwritable C:
+       must never prevent the display miniport from loading. No filesystem I/O
+       occurs on this thread or in any graphics/interrupt callback. */
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"FileLogging", 1,
+                                 &fileLogging);
+    (VOID)WinMaliFileLogInitialize(fileLogging != 0);
 
     /* UART2 serial log mirror FIRST so even this banner reaches the wire
        when running with kernel debugging off (see WinMaliLog.h). */
@@ -76,6 +84,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DbgPrint("[WinMali]    DxgkInitialize returned 0x%08x\n", status);
     if (!NT_SUCCESS(status)) {
         WINMALI_LIFECYCLE("<< DriverEntry DxgkInitialize=0x%08x", status);
+        WinMaliFileLogTeardown();
         return status;
     }
 
@@ -99,6 +108,7 @@ WinMaliKmdDxgkUnload(VOID)
 {
     WINMALI_LIFECYCLE(">> DxgkUnload");
     WINMALI_LIFECYCLE("<< DxgkUnload");
+    WinMaliFileLogTeardown(); /* drains the final lifecycle records */
     WinMaliSerialTeardown();   /* after the last print */
 }
 

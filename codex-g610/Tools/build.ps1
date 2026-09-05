@@ -14,6 +14,15 @@
         .\Tools\build.ps1 -SkipMesa                # KMD + UMD, no mesa
         .\Tools\build.ps1 -DriverLogProfile Focused # concise bring-up logs
         .\Tools\build.ps1 -DriverLogProfile Lifecycle # load/start/stop only
+        .\Tools\build.ps1 -DriverLogProfile Glyph     # text/dual-source trace
+        .\Tools\build.ps1 -DriverLogProfile ShaderCapture # one-run shader capture
+        .\Tools\build.ps1 -DriverLogProfile Reject    # final glyph draw rejection state
+        .\Tools\build.ps1 -DriverLogProfile GlyphPipeline # constant-output glyph probe
+        .\Tools\build.ps1 -DriverLogProfile AttributeProbe # four-way glyph attribute probe
+        .\Tools\build.ps1 -DriverLogProfile LookupProbe # R8/atlas split probe
+        .\Tools\build.ps1 -DriverLogProfile FragWProbe # exact glyph FRAG_W bypass
+        .\Tools\build.ps1 -DriverLogProfile LdVarProbe # exact glyph generic LD_VAR fallback
+        .\Tools\build.ps1 -DriverLogProfile IdvsProbe  # exact glyph IDVS handoff trace
         .\Tools\build.ps1 -Rebuild
 
     Exits non-zero if any step fails so CI can chain.
@@ -45,6 +54,35 @@
     scheduler/fence transitions, synchronization, and DXGI presentation logs.
     Lifecycle suppresses all KMD and Mesa/UMD output except KMD driver load,
     StartDevice, StopDevice, RemoveDevice, and unload messages.
+    Glyph keeps KMD lifecycle messages and only the UMD/Mesa events needed to
+    trace D3D dual-source glyph blending. Those lines use [WinMaliText].
+    ShaderCapture keeps KMD lifecycle messages and writes a compact, correlated
+    DXBC/TGSI/NIR/compiler capture to %TEMP%\WinMaliShaderCapture. DebugView
+    receives only [WinMaliCapture] index lines and unfiltered failures.
+    Reject keeps KMD lifecycle messages and emits only the bounded
+    [WinMaliReject] records needed to diagnose final Valhall glyph draw state.
+    It performs no render-target readbacks or capture-file writes.
+    GlyphPipeline keeps KMD lifecycle messages, replaces the recognized glyph
+    fragment shader with opaque red, and replaces its exact captured vertex
+    shader with vertex-ID-generated full-screen geometry. It isolates indexed
+    IDVS execution from vertex/instance fetch and is not a production profile.
+    AttributeProbe keeps KMD lifecycle messages and turns that exact glyph draw
+    into a four-path visual test of indexed launch, per-vertex input,
+    per-instance input, and the original combined position. It performs no
+    capture readbacks and is not a production profile.
+    LookupProbe keeps KMD lifecycle messages and encodes the exact glyph
+    shader's R8 metadata result, real atlas alpha, and fixed-coordinate atlas
+    result into RGB. It performs no readbacks or per-draw logging.
+    FragWProbe keeps focused logging and replaces FRAG_W with 1.0 only in the
+    exact captured DirectWrite/XAML glyph fragment shader. It is a narrow A/B
+    diagnostic and does not affect other shaders.
+    LdVarProbe keeps focused logging and forces only that exact glyph shader
+    from layout-specific LD_VAR_BUF onto Mesa's descriptor-backed LD_VAR
+    fallback. It does not change the VS, varying packet, or other shaders.
+    IdvsProbe keeps focused logging and records the compiled position and
+    secondary-varying programs, the linked VS/FS varying layouts, packed
+    fragment varying descriptors, fragment SRT entry, CSF program addresses,
+    and draw flag for that exact glyph pipeline. It does not alter rendering.
 
 .PARAMETER InfVerif
     Enable InfVerif. Off by default (frequent missing on dev boxes).
@@ -70,7 +108,7 @@ param(
     [ValidateSet("quiet","minimal","normal","detailed","diagnostic")]
     [string]$LogLevel = "minimal",
 
-    [ValidateSet("Verbose","Focused","Lifecycle")]
+    [ValidateSet("Verbose","Focused","Lifecycle","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe")]
     [string]$DriverLogProfile = "Verbose",
 
     [switch]$InfVerif,
