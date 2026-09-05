@@ -1,3 +1,3 @@
 # rk3588-GPU
 
-TODO ima just rewrite this when i add other models i guess.
+current driver being developed and tested on the mali g610. developed by a vibe coder
