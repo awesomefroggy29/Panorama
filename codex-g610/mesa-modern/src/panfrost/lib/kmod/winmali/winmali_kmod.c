@@ -765,6 +765,40 @@ winmali_kmod_bo_free(struct pan_kmod_bo *bo)
    struct winmali_kmod_bo *wbo = to_winmali_bo(bo);
    struct winmali_kmod_dev *wdev = to_winmali_dev(bo->dev);
    uint32_t local_handle = bo->handle;
+   uint64_t retire_point =
+      MAX2(wbo->sync.read_point, wbo->sync.write_point);
+   bool backing_quiesced = true;
+
+   /* The Linux panthor submit ioctl retains references to every GEM object in
+    * a job until that job retires.  WinMali submits an opaque GPUVA command
+    * stream through WDDM instead, so dxgkrnl does not have that GEM object list
+    * from which to provide the equivalent lifetime guarantee.  The sync point
+    * attached by csf_attach_sync_points() is therefore the last authority on
+    * whether this allocation can still be fetched by the GPU.
+    *
+    * Do this before destroying the BO's sync object or releasing either owned
+    * or imported WDDM storage.  -EIO is a terminal fence result: the KMD has
+    * failed the submission and stopped using its BOs, so retirement is still
+    * complete.  Any other error does not prove quiescence; retain the backing
+    * allocation in that exceptional case rather than create a GPU use-after-
+    * free. */
+   if (retire_point != 0) {
+      int wait_err =
+         syncobj_timeline_wait(wbo->sync.handle, retire_point, INT64_MAX);
+
+      backing_quiesced = wait_err == 0 || wait_err == -EIO;
+      if (!backing_quiesced) {
+         winmali_d3dkmt_log("[WinMaliSync] BO_FREE retaining backing "
+                            "local=%u kmt=%u sync=%u point=%llu err=%d",
+                            local_handle, wbo->wddm_kmt_handle,
+                            wbo->sync.handle,
+                            (unsigned long long)retire_point, wait_err);
+         mesa_loge("[WinMaliSync] BO_FREE retaining backing local=%u "
+                   "kmt=%u sync=%u point=%llu err=%d",
+                   local_handle, wbo->wddm_kmt_handle, wbo->sync.handle,
+                   (unsigned long long)retire_point, wait_err);
+      }
+   }
 
    /* If the BO owns its sync handle (no exclusive_vm), tear it down. */
    if (!bo->exclusive_vm)
@@ -774,7 +808,7 @@ winmali_kmod_bo_free(struct pan_kmod_bo *bo)
       /* dxgk-backed BO: no escape KMD BO to destroy. Release the dxgk
        * allocation ONLY if we created it - an IMPORTED backbuffer belongs to
        * the D3D runtime / DWM, so freeing it would tear down their surface. */
-      if (!(bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)) {
+      if (backing_quiesced && !(bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)) {
          winmali_d3dkmt_log("wm: BO_FREE dev=%p local=%u kmt=%u cookie=%p size=%llu",
                             (void *)bo->dev, local_handle,
                             wbo->wddm_kmt_handle, wbo->wddm_owner_cookie,
@@ -783,7 +817,7 @@ winmali_kmod_bo_free(struct pan_kmod_bo *bo)
             wbo->wddm_free(wbo->wddm_owner_cookie,
                            wbo->wddm_kmt_handle);
       }
-   } else {
+   } else if (backing_quiesced) {
       WINMALI_BO_DESTROY d = { .Handle = wbo->escape_handle };
       escape_simple(WinMaliEscapeOp_BoDestroy, &d, sizeof(d));
    }
@@ -1256,8 +1290,9 @@ winmali_vm_bind_dxgk(struct winmali_kmod_vm *wvm,
 }
 
 static int
-winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
-                     struct pan_kmod_vm_op *ops, uint32_t op_count)
+winmali_kmod_vm_bind_impl(struct pan_kmod_vm *vm,
+                          enum pan_kmod_vm_op_mode mode,
+                          struct pan_kmod_vm_op *ops, uint32_t op_count)
 {
    struct winmali_kmod_vm *wvm = to_winmali_vm(vm);
    struct winmali_kmod_dev *wdev = to_winmali_dev(vm->dev);
@@ -1424,6 +1459,57 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
    }
 
    return err;
+}
+
+static int
+winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
+                     struct pan_kmod_vm_op *ops, uint32_t op_count)
+{
+   if (mode != PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT)
+      return winmali_kmod_vm_bind_impl(vm, mode, ops, op_count);
+
+   if (!(vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY)) {
+      mesa_loge("PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT requires "
+                "PAN_KMOD_VM_FLAG_TRACK_ACTIVITY");
+      return -EINVAL;
+   }
+
+   if (op_count == 0)
+      return 0;
+
+   struct winmali_kmod_vm *wvm = to_winmali_vm(vm);
+
+   /* panthor implements DEFER_TO_NEXT_IDLE_POINT as an asynchronous bind that
+    * waits on the VM timeline point current when the bind is queued.  WDDM's
+    * MapGpuVirtualAddress callback is synchronous and has no equivalent wait
+    * list, so provide the same ordering by holding the VM submission lock,
+    * waiting for that captured point, and only then issuing the bind/unbind.
+    * Holding the lock prevents a new submission from entering the retiring VA
+    * range between the wait and the unmap.
+    *
+    * -EIO is a terminal completion for the captured point: the KMD has failed
+    * and retired that work.  Other errors do not establish an idle point and
+    * must leave the mapping intact. */
+   uint64_t idle_point = panthor_kmod_vm_sync_lock(vm);
+   int wait_err =
+      syncobj_timeline_wait(wvm->sync.handle, idle_point, INT64_MAX);
+   if (wait_err != 0 && wait_err != -EIO) {
+      panthor_kmod_vm_sync_unlock(vm, idle_point);
+      winmali_d3dkmt_log("[WinMaliSync] VM deferred bind blocked vm=%u "
+                         "sync=%u point=%llu err=%d",
+                         wvm->vm_id, wvm->sync.handle,
+                         (unsigned long long)idle_point, wait_err);
+      mesa_loge("[WinMaliSync] VM deferred bind blocked vm=%u sync=%u "
+                "point=%llu err=%d",
+                wvm->vm_id, wvm->sync.handle,
+                (unsigned long long)idle_point, wait_err);
+      return wait_err;
+   }
+
+   int ret = winmali_kmod_vm_bind_impl(
+      vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, op_count);
+   panthor_kmod_vm_sync_unlock(vm, idle_point);
+   return ret;
 }
 
 static enum pan_kmod_vm_state
