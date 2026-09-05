@@ -5,6 +5,7 @@
 
 #include "pan_nir.h"
 #include "nir_builder.h"
+#include "util/log.h"
 
 struct pan_nir_fs_outputs {
    bool has_pan_ops;
@@ -189,6 +190,12 @@ pan_nir_lower_fs_outputs(nir_shader *shader, bool skip_atest)
          nir_def *color1 = nir_load_var(b, color[1]);
          nir_alu_type color1_type =
             nir_get_nir_type_for_glsl_base_type(color[1]->type->base_type);
+
+#if defined(WINMALI_LOG_GLYPH)
+         mesa_logi("[WinMaliText] FsOutputLower mode=blend2 rt=%u "
+                   "color0Type=0x%x color1Type=0x%x coverage=%p",
+                   i, color0_type, color1_type, coverage);
+#endif
 
          nir_blend2_pan(b, coverage, desc, color0, color1,
                         .src_type = color0_type, .dest_type = color1_type,

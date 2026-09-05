@@ -163,6 +163,22 @@ struct panfrost_context {
     * it is disabled, just equal to plain vertex count */
    unsigned padded_count;
 
+#if defined(WINMALI_REJECT_CAPTURE)
+   /* Diagnostic-only marker for the XAML/DirectWrite glyph pipeline.  It is
+    * recomputed from the currently bound fragment sampler views immediately
+    * before each draw and never affects emitted GPU state. */
+   bool winmali_reject_probe;
+   unsigned winmali_reject_draw_count;
+   unsigned winmali_reject_active_seq;
+#endif
+
+#if defined(WINMALI_IDVS_HANDOFF_PROBE)
+   /* One bounded record per context is enough to prove the exact glyph draw's
+    * position/secondary-varying IDVS handoff without logging every UI draw. */
+   bool winmali_idvs_handoff_logged;
+   bool winmali_varying_handoff_logged;
+#endif
+
    struct panfrost_constant_buffer constant_buffer[MESA_SHADER_STAGES];
    struct panfrost_rasterizer *rasterizer;
    struct panfrost_vertex_state *vertex;

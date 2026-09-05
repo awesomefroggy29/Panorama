@@ -7,6 +7,7 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "panfrost/compiler/pan_compiler.h"
+#include "util/log.h"
 #include "util/u_qsort.h"
 
 #include "bifrost/bi_debug.h"
@@ -1769,6 +1770,12 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       if (instr->intrinsic == nir_intrinsic_blend2_pan) {
          rgba2 = bi_src_index(&instr->src[3]);
          T2 = nir_intrinsic_dest_type(instr);
+#if defined(WINMALI_LOG_GLYPH)
+         mesa_logi("[WinMaliText] BifrostBlend2 shader=%p src0Type=0x%x "
+                   "src1Type=0x%x semanticsLocation=%u",
+                   b->shader->nir, T, T2,
+                   nir_intrinsic_io_semantics(instr).location);
+#endif
       }
 
       unsigned size = nir_alu_type_get_type_size(T);

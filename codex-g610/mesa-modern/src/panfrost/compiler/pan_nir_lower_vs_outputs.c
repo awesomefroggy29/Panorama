@@ -75,13 +75,18 @@ build_attr_buf_write(struct nir_builder *b, nir_def *data, uint32_t idx,
    if (slot->section == PAN_VARYING_SECTION_ATTRIBS)
       index_offset += 4;
 
-   /* v9+ cache hints, generic varyings don't need caching while
-    * position/attribute varyings are reused by other units inside of the GPU.
-    * TODO: Do we really want ESTREAM on generic varyings?
+   /* v9+ cache hints.  The WinMali WDDM path needs the generic IDVS output
+    * stores to use the same input-stream visibility policy as the position
+    * and position-attribute stores consumed later in the draw.  Keep the
+    * established ESTREAM policy for native Mesa targets.
     */
+#ifdef HAVE_WINMALI_WDDM_KMOD
+   enum gl_access_qualifier access = ACCESS_ISTREAM_PAN;
+#else
    enum gl_access_qualifier access =
       slot->section == PAN_VARYING_SECTION_GENERIC ? ACCESS_ESTREAM_PAN :
                                                      ACCESS_ISTREAM_PAN;
+#endif
 
    index = nir_iadd_imm(b, index, index_offset);
    nir_def *addr = nir_lea_buf_pan(b, nir_imm_int(b, res), index);

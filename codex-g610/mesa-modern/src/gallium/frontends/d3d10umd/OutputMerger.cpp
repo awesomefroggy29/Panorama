@@ -38,7 +38,10 @@
 #include "Format.h"
 
 #include "util/u_framebuffer.h"
+#include "util/u_dual_blend.h"
 #include "util/format/u_format.h"
+
+static LONG g_nextTextBlendDiagnosticId;
 
 
 /*
@@ -617,6 +620,32 @@ CreateBlendState(D3D10DDI_HDEVICE hDevice,                     // IN
 
    state.alpha_to_coverage = pBlendDesc->AlphaToCoverageEnable;
 
+   pBlendState->diagnosticId =
+      (unsigned)InterlockedIncrement(&g_nextTextBlendDiagnosticId);
+   pBlendState->dualSource =
+      state.rt[0].blend_enable && util_blend_state_is_dual(&state, 0);
+   pBlendState->blendEnable = state.rt[0].blend_enable;
+   pBlendState->colorMask = state.rt[0].colormask;
+   pBlendState->rgbFunc = state.rt[0].rgb_func;
+   pBlendState->rgbSrcFactor = state.rt[0].rgb_src_factor;
+   pBlendState->rgbDstFactor = state.rt[0].rgb_dst_factor;
+   pBlendState->alphaFunc = state.rt[0].alpha_func;
+   pBlendState->alphaSrcFactor = state.rt[0].alpha_src_factor;
+   pBlendState->alphaDstFactor = state.rt[0].alpha_dst_factor;
+   if (pBlendState->dualSource) {
+      WINMALI_TEXT_TRACE("BlendCreate id=%u ddi=10 enable=%u mask=0x%x "
+                         "rgb=%u,%u,%u alpha=%u,%u,%u alphaToCoverage=%u",
+                         pBlendState->diagnosticId,
+                         state.rt[0].blend_enable, state.rt[0].colormask,
+                         state.rt[0].rgb_func,
+                         state.rt[0].rgb_src_factor,
+                         state.rt[0].rgb_dst_factor,
+                         state.rt[0].alpha_func,
+                         state.rt[0].alpha_src_factor,
+                         state.rt[0].alpha_dst_factor,
+                         state.alpha_to_coverage);
+   }
+
    pBlendState->handle = pipe->create_blend_state(pipe, &state);
 }
 
@@ -676,6 +705,34 @@ CreateBlendState1(D3D10DDI_HDEVICE hDevice,                     // IN
       }
    }
 
+   pBlendState->diagnosticId =
+      (unsigned)InterlockedIncrement(&g_nextTextBlendDiagnosticId);
+   pBlendState->dualSource =
+      state.rt[0].blend_enable && util_blend_state_is_dual(&state, 0);
+   pBlendState->blendEnable = state.rt[0].blend_enable;
+   pBlendState->colorMask = state.rt[0].colormask;
+   pBlendState->rgbFunc = state.rt[0].rgb_func;
+   pBlendState->rgbSrcFactor = state.rt[0].rgb_src_factor;
+   pBlendState->rgbDstFactor = state.rt[0].rgb_dst_factor;
+   pBlendState->alphaFunc = state.rt[0].alpha_func;
+   pBlendState->alphaSrcFactor = state.rt[0].alpha_src_factor;
+   pBlendState->alphaDstFactor = state.rt[0].alpha_dst_factor;
+   if (pBlendState->dualSource) {
+      WINMALI_TEXT_TRACE("BlendCreate id=%u ddi=10.1 enable=%u mask=0x%x "
+                         "rgb=%u,%u,%u alpha=%u,%u,%u independent=%u "
+                         "alphaToCoverage=%u",
+                         pBlendState->diagnosticId,
+                         state.rt[0].blend_enable, state.rt[0].colormask,
+                         state.rt[0].rgb_func,
+                         state.rt[0].rgb_src_factor,
+                         state.rt[0].rgb_dst_factor,
+                         state.rt[0].alpha_func,
+                         state.rt[0].alpha_src_factor,
+                         state.rt[0].alpha_dst_factor,
+                         state.independent_blend_enable,
+                         state.alpha_to_coverage);
+   }
+
    pBlendState->handle = pipe->create_blend_state(pipe, &state);
 }
 
@@ -724,7 +781,29 @@ SetBlendState(D3D10DDI_HDEVICE hDevice,      // IN
    LOG_ENTRYPOINT();
 
    struct pipe_context *pipe = CastPipeContext(hDevice);
+   BlendState *blendState = CastBlendState(hState);
    void *state = CastPipeBlendState(hState);
+
+#if defined(WINMALI_SHADER_CAPTURE)
+   Device *captureDevice = CastDevice(hDevice);
+   captureDevice->captureBoundBlend = blendState;
+   memcpy(captureDevice->captureBlendFactor, pBlendFactor,
+          sizeof(captureDevice->captureBlendFactor));
+   captureDevice->captureSampleMask = SampleMask;
+#endif
+
+#if defined(WINMALI_LOG_GLYPH)
+   Device *pDevice = CastDevice(hDevice);
+   pDevice->textBoundBlend = blendState;
+#endif
+
+   if (blendState && blendState->dualSource) {
+      WINMALI_TEXT_TRACE("BlendBind id=%u state=%p sampleMask=0x%x "
+                         "factor=%g,%g,%g,%g",
+                         blendState->diagnosticId, state, SampleMask,
+                         pBlendFactor[0], pBlendFactor[1],
+                         pBlendFactor[2], pBlendFactor[3]);
+   }
 
    pipe->bind_blend_state(pipe, state);
 

@@ -464,6 +464,18 @@ mesa_log_v(enum mesa_log_level level, const char *tag, const char *format,
    (void)va;
    return;
 #else
+#if defined(WINMALI_LOG_GLYPH)
+   static const char text_tag[] = "[WinMaliText]";
+   if (format == NULL ||
+       strncmp(format, text_tag, sizeof(text_tag) - 1) != 0)
+      return;
+#endif
+#if defined(WINMALI_SHADER_CAPTURE)
+   static const char capture_tag[] = "[WinMaliCapture]";
+   if (format == NULL ||
+       strncmp(format, capture_tag, sizeof(capture_tag) - 1) != 0)
+      return;
+#endif
 #if defined(WINMALI_LOG_FOCUSED)
    /* Successful-path diagnostics that overwhelm DbgView under DWM load.
     * Warnings, errors, CSF submit results, and sync failures are retained. */

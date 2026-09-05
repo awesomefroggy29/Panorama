@@ -40,6 +40,22 @@ void
 DebugPrintf(const char *format, ...);
 #endif
 
+#if defined(WINMALI_LOG_GLYPH)
+#define WINMALI_TEXT_TRACE(fmt, ...) \
+   DebugPrintf("[WinMaliText] " fmt "\n", ##__VA_ARGS__)
+#else
+#define WINMALI_TEXT_TRACE(...) ((void)0)
+#endif
+
+#if defined(WINMALI_SHADER_CAPTURE)
+#define WINMALI_CAPTURE_TRACE(fmt, ...) \
+   DebugPrintf("[WinMaliCapture] " fmt "\n", ##__VA_ARGS__)
+void WinMaliCaptureRecord(const char *format, ...);
+#else
+#define WINMALI_CAPTURE_TRACE(...) ((void)0)
+#define WinMaliCaptureRecord(...) ((void)0)
+#endif
+
 
 void
 CheckHResult(HRESULT hr, const char *function, unsigned line);

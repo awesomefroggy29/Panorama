@@ -1273,7 +1273,8 @@ expand_unary_to_scalarf(struct ureg_program *ureg, unary_ureg_func func,
 
 const struct tgsi_token *
 Shader_tgsi_translate(const unsigned *code,
-                      unsigned *output_mapping)
+                      unsigned *output_mapping,
+                      const enum Shader_input_type *input_types)
 {
    struct Shader_xlate sx;
    struct Shader_parser parser;
@@ -2035,6 +2036,11 @@ Shader_tgsi_translate(const unsigned *code,
                assert(opcode.dst[0].base.index_dim == 1);
                assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
 
+               WINMALI_TEXT_TRACE("ShaderOutput code=%p register=o%u mask=0x%x",
+                                  code, opcode.dst[0].base.index[0].imm,
+                                  opcode.dst[0].mask >>
+                                     D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT);
+
                dcl_base_output(&sx, ureg,
                                ureg_DECL_output(ureg,
                                                 TGSI_SEMANTIC_COLOR,
@@ -2302,6 +2308,42 @@ Shader_tgsi_translate(const unsigned *code,
 
    if (inside_sub) {
       ureg_ENDSUB(ureg);
+   }
+
+   /* DXBC MOV is bitwise and does not carry a numeric type.  TGSI MOV is
+    * likewise untyped, but tgsi_to_nir must choose a type for vertex-input
+    * loads.  Without a typed consumer, it historically defaults an input to
+    * float, which makes a pure SINT/UINT vertex format undergo numeric float
+    * conversion before a bitwise MOV.  Preserve the D3D input-layout type by
+    * adding dead, identity-valued typed consumers.  tgsi_to_nir scans these
+    * before NIR DCE, so they constrain load_input without changing results.
+    */
+   if (input_types && parser.header.type == D3D10_SB_VERTEX_SHADER) {
+      for (i = 0; i < SHADER_MAX_INPUTS; ++i) {
+         if (!sx.inputs[i].declared)
+            continue;
+
+         struct ureg_dst marker;
+         switch (input_types[i]) {
+         case SHADER_INPUT_TYPE_SINT:
+            marker = ureg_DECL_temporary(ureg);
+            ureg_IMAX(ureg, marker, sx.inputs[i].reg,
+                      ureg_imm4i(ureg, (-2147483647 - 1),
+                                (-2147483647 - 1),
+                                (-2147483647 - 1),
+                                (-2147483647 - 1)));
+            ureg_release_temporary(ureg, marker);
+            break;
+         case SHADER_INPUT_TYPE_UINT:
+            marker = ureg_DECL_temporary(ureg);
+            ureg_UMAX(ureg, marker, sx.inputs[i].reg,
+                      ureg_imm4u(ureg, 0, 0, 0, 0));
+            ureg_release_temporary(ureg, marker);
+            break;
+         default:
+            break;
+         }
+      }
    }
 
    ureg_END(ureg);

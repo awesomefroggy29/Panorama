@@ -32,6 +32,9 @@
 
 
 #include "Resource.h"
+#include <stdio.h>
+#include <string.h>
+
 #include "Format.h"
 #include "State.h"
 #include "Query.h"
@@ -39,6 +42,7 @@
 #include "Debug.h"
 
 #include "util/u_math.h"
+#include "util/u_inlines.h"
 #include "util/u_rect.h"
 #include "util/u_surface.h"
 #include "util/format/u_format.h"
@@ -228,6 +232,405 @@ WinMaliGlyphSampleHash(const void *data, unsigned rowPitch,
 
    return hash;
 }
+
+/* Diagnostic only: characterize small synchronized texture readbacks after
+ * Gallium has flushed and waited for the GPU writer.  Scan logical row bytes
+ * only (never row padding) and cap the total size so this does not turn normal
+ * desktop operation into another high-volume trace. */
+static void
+WinMaliLogSmallReadback(const struct pipe_resource *resource,
+                        const struct pipe_box *box, unsigned level,
+                        const void *data, unsigned rowPitch)
+{
+   if (!resource || !box || !data || resource->target == PIPE_BUFFER ||
+       box->width <= 0 || box->height <= 0 || box->depth != 1)
+      return;
+
+   const unsigned rowBytes =
+      util_format_get_stride(resource->format, box->width);
+   const unsigned rows =
+      util_format_get_nblocksy(resource->format, box->height);
+   const uint64_t logicalBytes = (uint64_t)rowBytes * rows;
+   if (!rowBytes || !rows || rowPitch < rowBytes ||
+       logicalBytes > 256u * 1024u)
+      return;
+
+   static LONG sequence;
+   const LONG seq = InterlockedIncrement(&sequence);
+   if (seq > 512)
+      return;
+
+   const uint8_t *bytes = (const uint8_t *)data;
+   uint32_t hash = 2166136261u;
+   uint64_t nonzero = 0;
+   uint64_t laneSum[4] = {0, 0, 0, 0};
+
+   for (unsigned y = 0; y < rows; ++y) {
+      const uint8_t *row = bytes + (size_t)y * rowPitch;
+      for (unsigned x = 0; x < rowBytes; ++x) {
+         const uint8_t value = row[x];
+         hash = (hash ^ value) * 16777619u;
+         nonzero += value != 0;
+         laneSum[x & 3] += value;
+      }
+   }
+
+   DebugPrintf("[WinMaliReadback] MapData seq=%ld resource=%p format=%s "
+               "level=%u box=%dx%dx%d rowPitch=%u rowBytes=%u bytes=%llu "
+               "hash=0x%08x nonzero=%llu lanes=%llu,%llu,%llu,%llu\n",
+               seq, resource, util_format_name(resource->format), level,
+               box->width, box->height, box->depth, rowPitch, rowBytes,
+               (unsigned long long)logicalBytes, hash,
+               (unsigned long long)nonzero,
+               (unsigned long long)laneSum[0],
+               (unsigned long long)laneSum[1],
+               (unsigned long long)laneSum[2],
+               (unsigned long long)laneSum[3]);
+}
+
+static void
+WinMaliDiagnosticProcessName(char *name, size_t nameSize)
+{
+   char path[MAX_PATH] = {0};
+   DWORD length = GetModuleFileNameA(NULL, path, ARRAY_SIZE(path));
+   const char *base = path;
+   if (length) {
+      const char *slash = strrchr(path, '\\');
+      if (slash)
+         base = slash + 1;
+   }
+   snprintf(name, nameSize, "%s", *base ? base : "unknown");
+   for (char *p = name; *p; ++p) {
+      if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+             (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+             *p == '.'))
+         *p = '_';
+   }
+}
+
+static bool
+WinMaliDiagnosticWriteBmp(const char *process, const char *stage,
+                          const void *data, unsigned width, unsigned height,
+                          unsigned rowPitch, char *writtenPath,
+                          size_t writtenPathSize)
+{
+   char temp[MAX_PATH] = {0};
+   char directory[MAX_PATH] = {0};
+   if (!GetTempPathA(ARRAY_SIZE(temp), temp))
+      return false;
+
+#if defined(WINMALI_SHADER_CAPTURE)
+   snprintf(directory, sizeof(directory), "%sWinMaliShaderCapture", temp);
+#else
+   snprintf(directory, sizeof(directory), "%sWinMaliCapture", temp);
+#endif
+   if (!CreateDirectoryA(directory, NULL) &&
+       GetLastError() != ERROR_ALREADY_EXISTS)
+      return false;
+
+   snprintf(writtenPath, writtenPathSize, "%s\\%s-%lu-%s-%ux%u.bmp",
+            directory, process, GetCurrentProcessId(), stage, width, height);
+   HANDLE file = CreateFileA(writtenPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return false;
+
+   BITMAPFILEHEADER fileHeader = {0};
+   BITMAPINFOHEADER infoHeader = {0};
+   const DWORD imageBytes = width * height * 4u;
+   fileHeader.bfType = 0x4d42;
+   fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(infoHeader);
+   fileHeader.bfSize = fileHeader.bfOffBits + imageBytes;
+   infoHeader.biSize = sizeof(infoHeader);
+   infoHeader.biWidth = (LONG)width;
+   infoHeader.biHeight = -(LONG)height; /* mapped data is top-down */
+   infoHeader.biPlanes = 1;
+   infoHeader.biBitCount = 32;
+   infoHeader.biCompression = BI_RGB;
+   infoHeader.biSizeImage = imageBytes;
+
+   DWORD written = 0;
+   bool ok = WriteFile(file, &fileHeader, sizeof(fileHeader), &written, NULL) &&
+             written == sizeof(fileHeader) &&
+             WriteFile(file, &infoHeader, sizeof(infoHeader), &written, NULL) &&
+             written == sizeof(infoHeader);
+   const uint8_t *bytes = (const uint8_t *)data;
+   const DWORD rowBytes = width * 4u;
+   for (unsigned y = 0; ok && y < height; ++y) {
+      ok = WriteFile(file, bytes + (size_t)y * rowPitch, rowBytes,
+                     &written, NULL) && written == rowBytes;
+   }
+   CloseHandle(file);
+   return ok;
+}
+
+bool
+WinMaliDiagnosticCaptureResource(struct pipe_context *pipe,
+                                 struct pipe_resource *resource,
+                                 const char *stage)
+{
+   if (!pipe || !resource || !stage || resource->target == PIPE_BUFFER ||
+       resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+       !resource->width0 || !resource->height0 || resource->depth0 != 1)
+      return false;
+
+   struct pipe_box box;
+   u_box_2d(0, 0, resource->width0, resource->height0, &box);
+   struct pipe_transfer *transfer = NULL;
+#if defined(WINMALI_SHADER_CAPTURE)
+   WINMALI_CAPTURE_TRACE("Pixel ENTER stage=%s resource=%p size=%ux%u",
+                         stage, resource, resource->width0, resource->height0);
+#else
+   DebugPrintf("[WinMaliPixel] Capture ENTER stage=%s resource=%p size=%ux%u\n",
+               stage, resource, resource->width0, resource->height0);
+#endif
+   void *map = pipe->texture_map(pipe, resource, 0, PIPE_MAP_READ, &box,
+                                 &transfer);
+   if (!map || !transfer) {
+#if defined(WINMALI_SHADER_CAPTURE)
+      WINMALI_CAPTURE_TRACE("Pixel EXIT stage=%s resource=%p result=map-failed",
+                            stage, resource);
+      WinMaliCaptureRecord("pixel stage=%s resource=%p result=map-failed",
+                           stage, resource);
+#else
+      DebugPrintf("[WinMaliPixel] Capture EXIT stage=%s resource=%p result=map-failed\n",
+                  stage, resource);
+#endif
+      return false;
+   }
+
+   const unsigned width = resource->width0;
+   const unsigned height = resource->height0;
+   uint32_t hash = 2166136261u;
+   uint64_t nonzeroBytes = 0, nonzeroPixels = 0, alphaPixels = 0;
+   uint64_t laneSum[4] = {0, 0, 0, 0};
+   const uint8_t *bytes = (const uint8_t *)map;
+   for (unsigned y = 0; y < height; ++y) {
+      const uint8_t *row = bytes + (size_t)y * transfer->stride;
+      for (unsigned x = 0; x < width; ++x) {
+         const uint8_t *pixel = row + x * 4u;
+         bool any = false;
+         for (unsigned lane = 0; lane < 4; ++lane) {
+            hash = (hash ^ pixel[lane]) * 16777619u;
+            nonzeroBytes += pixel[lane] != 0;
+            laneSum[lane] += pixel[lane];
+            any |= pixel[lane] != 0;
+         }
+         nonzeroPixels += any;
+         alphaPixels += pixel[3] != 0;
+      }
+   }
+
+   char process[MAX_PATH] = {0};
+   char path[MAX_PATH] = {0};
+   WinMaliDiagnosticProcessName(process, sizeof(process));
+   bool saved = WinMaliDiagnosticWriteBmp(process, stage, map, width, height,
+                                           transfer->stride, path,
+                                           sizeof(path));
+#if defined(WINMALI_SHADER_CAPTURE)
+   WINMALI_CAPTURE_TRACE("Pixel DATA stage=%s process=%s pid=%lu "
+                         "resource=%p size=%ux%u stride=%u hash=0x%08x "
+                         "nonzeroPixels=%llu alphaPixels=%llu bmp=%s saved=%u",
+                         stage, process, GetCurrentProcessId(), resource,
+                         width, height, transfer->stride, hash,
+                         (unsigned long long)nonzeroPixels,
+                         (unsigned long long)alphaPixels,
+                         saved ? path : "none", saved ? 1u : 0u);
+   WinMaliCaptureRecord("pixel stage=%s resource=%p size=%ux%u stride=%u "
+                        "hash=0x%08x nonzeroBytes=%llu nonzeroPixels=%llu "
+                        "alphaPixels=%llu lanes=%llu,%llu,%llu,%llu "
+                        "bmp=%s saved=%u",
+                        stage, resource, width, height, transfer->stride, hash,
+                        (unsigned long long)nonzeroBytes,
+                        (unsigned long long)nonzeroPixels,
+                        (unsigned long long)alphaPixels,
+                        (unsigned long long)laneSum[0],
+                        (unsigned long long)laneSum[1],
+                        (unsigned long long)laneSum[2],
+                        (unsigned long long)laneSum[3], saved ? path : "none",
+                        saved ? 1u : 0u);
+#else
+   DebugPrintf("[WinMaliPixel] Capture DATA stage=%s process=%s pid=%lu "
+               "resource=%p size=%ux%u stride=%u hash=0x%08x "
+               "nonzeroBytes=%llu nonzeroPixels=%llu alphaPixels=%llu "
+               "lanes=%llu,%llu,%llu,%llu bmp=%s saved=%u\n",
+               stage, process, GetCurrentProcessId(), resource, width, height,
+               transfer->stride, hash,
+               (unsigned long long)nonzeroBytes,
+               (unsigned long long)nonzeroPixels,
+               (unsigned long long)alphaPixels,
+               (unsigned long long)laneSum[0],
+               (unsigned long long)laneSum[1],
+               (unsigned long long)laneSum[2],
+               (unsigned long long)laneSum[3], saved ? path : "none",
+               saved ? 1u : 0u);
+#endif
+
+   pipe->texture_unmap(pipe, transfer);
+#if defined(WINMALI_SHADER_CAPTURE)
+   WINMALI_CAPTURE_TRACE("Pixel EXIT stage=%s resource=%p result=success",
+                         stage, resource);
+#else
+   DebugPrintf("[WinMaliPixel] Capture EXIT stage=%s resource=%p result=success\n",
+               stage, resource);
+#endif
+   return true;
+}
+
+#if defined(WINMALI_SHADER_CAPTURE)
+bool
+WinMaliCaptureShaderInput(struct pipe_context *pipe,
+                          struct pipe_sampler_view *view,
+                          const char *stage)
+{
+   if (!pipe || !view || !view->texture || !stage)
+      return false;
+
+   struct pipe_resource *resource = view->texture;
+   if (view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+       resource->target != PIPE_BUFFER)
+      return WinMaliDiagnosticCaptureResource(pipe, resource, stage);
+
+   if (view->format != PIPE_FORMAT_R8_UINT ||
+       resource->target != PIPE_BUFFER)
+      return false;
+
+   const unsigned offset = view->u.buf.offset;
+   unsigned size = view->u.buf.size;
+   if (offset >= resource->width0)
+      return false;
+   if (!size || size > resource->width0 - offset)
+      size = resource->width0 - offset;
+
+   struct pipe_transfer *transfer = NULL;
+   const uint8_t *map = (const uint8_t *)pipe_buffer_map_range(
+      pipe, resource, offset, size, PIPE_MAP_READ, &transfer);
+   if (!map || !transfer) {
+      WINMALI_CAPTURE_TRACE("Input EXIT stage=%s format=R8_UINT "
+                            "offset=%u size=%u result=map-failed",
+                            stage, offset, size);
+      WinMaliCaptureRecord("input stage=%s format=R8_UINT offset=%u "
+                           "size=%u result=map-failed",
+                           stage, offset, size);
+      return false;
+   }
+
+   uint64_t hash = UINT64_C(1469598103934665603);
+   uint64_t nonzero = 0, sum = 0;
+   for (unsigned i = 0; i < size; ++i) {
+      hash = (hash ^ map[i]) * UINT64_C(1099511628211);
+      nonzero += map[i] != 0;
+      sum += map[i];
+   }
+
+   char temp[MAX_PATH] = {0}, directory[MAX_PATH] = {0};
+   char process[MAX_PATH] = {0}, path[MAX_PATH] = {0};
+   bool saved = false;
+   if (GetTempPathA(ARRAY_SIZE(temp), temp)) {
+      snprintf(directory, sizeof(directory), "%sWinMaliShaderCapture", temp);
+      if (CreateDirectoryA(directory, NULL) ||
+          GetLastError() == ERROR_ALREADY_EXISTS) {
+         WinMaliDiagnosticProcessName(process, sizeof(process));
+         snprintf(path, sizeof(path), "%s\\%s-%lu-%s.bin", directory,
+                  process, GetCurrentProcessId(), stage);
+         HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+         if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            saved = size <= MAXDWORD &&
+                    WriteFile(file, map, (DWORD)size, &written, NULL) &&
+                    written == size;
+            CloseHandle(file);
+         }
+      }
+   }
+
+   pipe_buffer_unmap(pipe, transfer);
+   WINMALI_CAPTURE_TRACE("Input DATA stage=%s format=R8_UINT offset=%u "
+                         "size=%u hash=%016llx nonzero=%llu sum=%llu "
+                         "file=%s saved=%u",
+                         stage, offset, size, (unsigned long long)hash,
+                         (unsigned long long)nonzero, (unsigned long long)sum,
+                         saved ? path : "none", saved ? 1u : 0u);
+   WinMaliCaptureRecord("input stage=%s format=R8_UINT offset=%u size=%u "
+                        "hash=%016llx nonzero=%llu sum=%llu file=%s saved=%u",
+                        stage, offset, size, (unsigned long long)hash,
+                        (unsigned long long)nonzero, (unsigned long long)sum,
+                        saved ? path : "none", saved ? 1u : 0u);
+   return saved;
+}
+
+bool
+WinMaliCaptureBufferRange(struct pipe_context *pipe,
+                          struct pipe_resource *resource,
+                          unsigned offset, unsigned size,
+                          const char *stage)
+{
+   if (!pipe || !resource || resource->target != PIPE_BUFFER || !stage ||
+       offset >= resource->width0)
+      return false;
+
+   size = MIN2(size, resource->width0 - offset);
+   if (!size)
+      return false;
+
+   struct pipe_transfer *transfer = NULL;
+   const uint8_t *map = (const uint8_t *)pipe_buffer_map_range(
+      pipe, resource, offset, size, PIPE_MAP_READ, &transfer);
+   if (!map || !transfer) {
+      WINMALI_CAPTURE_TRACE("Buffer result=map-failed stage=%s resource=%p "
+                            "offset=%u size=%u", stage, resource, offset,
+                            size);
+      WinMaliCaptureRecord("buffer stage=%s resource=%p offset=%u size=%u "
+                           "result=map-failed", stage, resource, offset,
+                           size);
+      return false;
+   }
+
+   uint64_t hash = UINT64_C(1469598103934665603);
+   uint64_t nonzero = 0;
+   for (unsigned i = 0; i < size; ++i) {
+      hash = (hash ^ map[i]) * UINT64_C(1099511628211);
+      nonzero += map[i] != 0;
+   }
+
+   char temp[MAX_PATH] = {0}, directory[MAX_PATH] = {0};
+   char process[MAX_PATH] = {0}, path[MAX_PATH] = {0};
+   bool saved = false;
+   if (GetTempPathA(ARRAY_SIZE(temp), temp)) {
+      snprintf(directory, sizeof(directory), "%sWinMaliShaderCapture", temp);
+      if (CreateDirectoryA(directory, NULL) ||
+          GetLastError() == ERROR_ALREADY_EXISTS) {
+         WinMaliDiagnosticProcessName(process, sizeof(process));
+         snprintf(path, sizeof(path), "%s\\%s-%lu-%s.bin", directory,
+                  process, GetCurrentProcessId(), stage);
+         HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+         if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            saved = WriteFile(file, map, size, &written, NULL) &&
+                    written == size;
+            CloseHandle(file);
+         }
+      }
+   }
+
+   pipe_buffer_unmap(pipe, transfer);
+   WINMALI_CAPTURE_TRACE("Buffer stage=%s resource=%p offset=%u size=%u "
+                         "hash=%016llx nonzero=%llu file=%s saved=%u",
+                         stage, resource, offset, size,
+                         (unsigned long long)hash,
+                         (unsigned long long)nonzero,
+                         saved ? path : "none", saved ? 1u : 0u);
+   WinMaliCaptureRecord("buffer stage=%s resource=%p offset=%u size=%u "
+                        "hash=%016llx nonzero=%llu file=%s saved=%u",
+                        stage, resource, offset, size,
+                        (unsigned long long)hash,
+                        (unsigned long long)nonzero,
+                        saved ? path : "none", saved ? 1u : 0u);
+   return saved;
+}
+#endif
 
 void APIENTRY
 CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
@@ -1135,6 +1538,10 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
    pMappedSubResource->pData = map;
    pMappedSubResource->RowPitch = pResource->transfers[SubResource]->stride;
    pMappedSubResource->DepthPitch = pResource->transfers[SubResource]->layer_stride;
+   if (usage & PIPE_MAP_READ) {
+      WinMaliLogSmallReadback(resource, &box, level, map,
+                              pMappedSubResource->RowPitch);
+   }
    DebugPrintf("[WinMaliFlow] ResourceMap EXIT device=%p resource=%p data=%p rowPitch=%u depthPitch=%u\n",
                hDevice.pDrvPrivate, hResource.pDrvPrivate,
                pMappedSubResource->pData, pMappedSubResource->RowPitch,

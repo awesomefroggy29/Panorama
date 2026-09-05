@@ -5,6 +5,58 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(WINMALI_SHADER_CAPTURE)
+void
+WinMaliCaptureRecord(const char *format, ...)
+{
+   char temp[MAX_PATH] = {0}, directory[MAX_PATH], process[MAX_PATH] = {0};
+   if (!GetTempPathA(ARRAY_SIZE(temp), temp))
+      return;
+   snprintf(directory, sizeof(directory), "%sWinMaliShaderCapture", temp);
+   if (!CreateDirectoryA(directory, NULL) &&
+       GetLastError() != ERROR_ALREADY_EXISTS)
+      return;
+
+   GetModuleFileNameA(NULL, process, ARRAY_SIZE(process));
+   const char *base = strrchr(process, '\\');
+   if (base)
+      memmove(process, base + 1, strlen(base + 1) + 1);
+   for (char *p = process; *p; ++p) {
+      if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+             (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+             *p == '.'))
+         *p = '_';
+   }
+
+   char path[MAX_PATH];
+   snprintf(path, sizeof(path), "%s\\%s-%lu-index.log", directory, process,
+            GetCurrentProcessId());
+   HANDLE file = CreateFileA(path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return;
+
+   char line[2048];
+   va_list ap;
+   va_start(ap, format);
+   int length = vsnprintf(line, sizeof(line) - 3, format, ap);
+   va_end(ap);
+   if (length < 0) {
+      CloseHandle(file);
+      return;
+   }
+   size_t used = (size_t)length < sizeof(line) - 3
+                    ? (size_t)length : sizeof(line) - 3;
+   line[used++] = '\r';
+   line[used++] = '\n';
+   line[used] = '\0';
+   DWORD written;
+   WriteFile(file, line, (DWORD)used, &written, NULL);
+   CloseHandle(file);
+}
+#endif
+
 
 #if MESA_DEBUG
 
@@ -31,6 +83,18 @@ DebugPrintf(const char *format, ...)
 #if defined(WINMALI_LOG_LIFECYCLE)
     (void)format;
     return;
+#endif
+#if defined(WINMALI_LOG_GLYPH)
+    static const char text_tag[] = "[WinMaliText]";
+    if (format == NULL ||
+        strncmp(format, text_tag, sizeof(text_tag) - 1) != 0)
+        return;
+#endif
+#if defined(WINMALI_SHADER_CAPTURE)
+    static const char capture_tag[] = "[WinMaliCapture]";
+    if (format == NULL ||
+        strncmp(format, capture_tag, sizeof(capture_tag) - 1) != 0)
+        return;
 #endif
 #if defined(WINMALI_LOG_FOCUSED)
     /* Historical adapter/callback-table dumps are useful for ABI bring-up but

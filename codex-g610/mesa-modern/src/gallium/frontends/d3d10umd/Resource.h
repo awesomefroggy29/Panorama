@@ -85,6 +85,27 @@ BOOL APIENTRY ResourceIsStagingBusy(D3D10DDI_HDEVICE hDevice,
 void APIENTRY ResourceReadAfterWriteHazard(D3D10DDI_HDEVICE hDevice,
                                   D3D10DDI_HRESOURCE hResource);
 
+/* Temporary one-shot pixel-boundary diagnostic.  Performs a normal
+ * synchronized Gallium read map, logs content statistics, and attempts to
+ * write a BGRA BMP into the current process's temporary directory. */
+bool WinMaliDiagnosticCaptureResource(struct pipe_context *pipe,
+                                      struct pipe_resource *resource,
+                                      const char *stage);
+
+#if defined(WINMALI_SHADER_CAPTURE)
+/* Capture the exact range described by a bound shader view. Buffer views are
+ * saved as raw bytes; BGRA texture views use the BMP path above. */
+bool WinMaliCaptureShaderInput(struct pipe_context *pipe,
+                               struct pipe_sampler_view *view,
+                               const char *stage);
+/* Save an exact byte range from a Gallium buffer for deterministic replay of
+ * a captured draw. */
+bool WinMaliCaptureBufferRange(struct pipe_context *pipe,
+                               struct pipe_resource *resource,
+                               unsigned offset, unsigned size,
+                               const char *stage);
+#endif
+
 void APIENTRY ResourceUpdateSubResourceUP(
    D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
    UINT DstSubResource, __in_opt const D3D10_DDI_BOX *pDstBox,

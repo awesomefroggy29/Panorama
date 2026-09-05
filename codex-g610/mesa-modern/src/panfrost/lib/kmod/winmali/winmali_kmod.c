@@ -25,6 +25,7 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "util/list.h"
+#include "util/log.h"
 #include "util/os_mman.h"
 #include "util/simple_mtx.h"
 #include "util/u_idalloc.h"
@@ -852,7 +853,23 @@ winmali_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
                     : MAX2(wbo->sync.read_point, wbo->sync.write_point);
    if (point == 0)
       return true;
+
    int err = syncobj_timeline_wait(wbo->sync.handle, point, timeout_ns);
+   /* A zero-timeout poll commonly returns -ETIMEDOUT while work is still in
+    * flight; logging every such poll overwhelms DebugView and changes timing.
+    * Preserve only failures from waits that were actually expected to block. */
+   if (err && timeout_ns != 0) {
+      winmali_d3dkmt_log("[WinMaliSync] BoWait failed local=%u sync=%u "
+                         "chosen=%llu readOnly=%u timeout=%lld err=%d",
+                         bo->handle, wbo->sync.handle,
+                         (unsigned long long)point,
+                         for_read_only_access ? 1u : 0u,
+                         (long long)timeout_ns, err);
+      mesa_loge("[WinMaliSync] BoWait failed local=%u sync=%u chosen=%llu "
+                "readOnly=%u timeout=%lld err=%d",
+                bo->handle, wbo->sync.handle, (unsigned long long)point,
+                for_read_only_access ? 1u : 0u, (long long)timeout_ns, err);
+   }
    return err == 0;
 }
 

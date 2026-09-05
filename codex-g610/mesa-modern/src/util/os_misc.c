@@ -35,6 +35,7 @@
 #include "u_debug.h"
 
 #include <stdarg.h>
+#include <string.h>
 
 
 #if DETECT_OS_WINDOWS
@@ -89,6 +90,14 @@ os_log_message(const char *message)
    (void)message;
    return;
 #else
+#if defined(WINMALI_LOG_GLYPH)
+   if (message == NULL || strstr(message, "[WinMaliText]") == NULL)
+      return;
+#endif
+#if defined(WINMALI_SHADER_CAPTURE)
+   if (message == NULL || strstr(message, "[WinMaliCapture]") == NULL)
+      return;
+#endif
    /* If the GALLIUM_LOG_FILE environment variable is set to a valid filename,
     * write all messages to that file.
     */

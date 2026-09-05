@@ -35,11 +35,14 @@
 #include "ShaderParse.h"
 #include "State.h"
 #include "Query.h"
+#include "Resource.h"
 
 #include "Debug.h"
 #include "Format.h"
 
 #include "tgsi/tgsi_ureg.h"
+#include "tgsi/tgsi_dump.h"
+#include "tgsi/tgsi_parse.h"
 #include "util/u_gen_mipmap.h"
 #include "util/u_sampler.h"
 #include "util/format/u_format.h"
@@ -47,6 +50,147 @@
 /* Retain the focused TGSI translator trace without emitting the earlier,
  * high-volume per-shader breadcrumbs. */
 #define WM_SHADER_INIT_LOG(...) do { } while (0)
+
+#if defined(WINMALI_SHADER_CAPTURE)
+static uint64_t
+WinMaliCaptureHash(const void *data, size_t size)
+{
+   const uint8_t *bytes = (const uint8_t *)data;
+   uint64_t hash = UINT64_C(1469598103934665603);
+   for (size_t i = 0; i < size; ++i)
+      hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+   return hash;
+}
+
+static void
+WinMaliCaptureProcessName(char *name, size_t size)
+{
+   char path[MAX_PATH] = {0};
+   GetModuleFileNameA(NULL, path, ARRAY_SIZE(path));
+   const char *base = strrchr(path, '\\');
+   snprintf(name, size, "%s", base ? base + 1 : path);
+   for (char *p = name; *p; ++p) {
+      if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+             (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+             *p == '.'))
+         *p = '_';
+   }
+}
+
+static bool
+WinMaliCaptureTargetProcess(void)
+{
+   char name[MAX_PATH];
+   WinMaliCaptureProcessName(name, sizeof(name));
+   return _stricmp(name, "StartMenuExperienceHost.exe") == 0 ||
+          _stricmp(name, "SearchHost.exe") == 0 ||
+          _stricmp(name, "ShellExperienceHost.exe") == 0 ||
+          _stricmp(name, "ShellHost.exe") == 0 ||
+          _stricmp(name, "Explorer.exe") == 0 ||
+          _stricmp(name, "SystemSettings.exe") == 0;
+}
+
+static bool
+WinMaliCaptureDirectory(char *directory, size_t size)
+{
+   char temp[MAX_PATH] = {0};
+   if (!GetTempPathA(ARRAY_SIZE(temp), temp))
+      return false;
+   snprintf(directory, size, "%sWinMaliShaderCapture", temp);
+   return CreateDirectoryA(directory, NULL) ||
+          GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool
+WinMaliCaptureWriteBinary(const char *path, const void *data, size_t size)
+{
+   HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return GetLastError() == ERROR_FILE_EXISTS;
+
+   DWORD written = 0;
+   bool ok = size <= MAXDWORD &&
+             WriteFile(file, data, (DWORD)size, &written, NULL) &&
+             written == size;
+   CloseHandle(file);
+   return ok;
+}
+
+static void
+WinMaliCaptureAppendIndex(const char *directory, const char *process,
+                          const char *line)
+{
+   char path[MAX_PATH];
+   snprintf(path, sizeof(path), "%s\\%s-%lu-index.log", directory, process,
+            GetCurrentProcessId());
+   HANDLE file = CreateFileA(path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return;
+   DWORD written;
+   WriteFile(file, line, (DWORD)strlen(line), &written, NULL);
+   CloseHandle(file);
+}
+
+static void
+WinMaliCaptureShader(Shader *shader, const UINT *dxbc, const char *stage)
+{
+   if (!WinMaliCaptureTargetProcess() || !shader || !dxbc ||
+       !shader->state.tokens)
+      return;
+
+   const uint32_t dxbcDwords = dxbc[1];
+   const unsigned tgsiTokens = tgsi_num_tokens(shader->state.tokens);
+   if (dxbcDwords < 2 || dxbcDwords > (1u << 20) || !tgsiTokens)
+      return;
+
+   shader->captureDxbcHash =
+      WinMaliCaptureHash(dxbc, (size_t)dxbcDwords * sizeof(*dxbc));
+   shader->captureTgsiHash = WinMaliCaptureHash(
+      shader->state.tokens, (size_t)tgsiTokens * sizeof(*shader->state.tokens));
+
+   char directory[MAX_PATH], process[MAX_PATH], stem[MAX_PATH];
+   if (!WinMaliCaptureDirectory(directory, sizeof(directory)))
+      return;
+   WinMaliCaptureProcessName(process, sizeof(process));
+   snprintf(stem, sizeof(stem), "%s\\%s-%lu-%s-%016llx-%016llx",
+            directory, process, GetCurrentProcessId(), stage,
+            (unsigned long long)shader->captureDxbcHash,
+            (unsigned long long)shader->captureTgsiHash);
+
+   char path[MAX_PATH];
+   snprintf(path, sizeof(path), "%s.dxbc-tokens.bin", stem);
+   const bool dxbcOk = WinMaliCaptureWriteBinary(
+      path, dxbc, (size_t)dxbcDwords * sizeof(*dxbc));
+   snprintf(path, sizeof(path), "%s.tgsi.bin", stem);
+   const bool tgsiOk = WinMaliCaptureWriteBinary(
+      path, shader->state.tokens,
+      (size_t)tgsiTokens * sizeof(*shader->state.tokens));
+   snprintf(path, sizeof(path), "%s.tgsi.txt", stem);
+   FILE *tgsiFile = fopen(path, "w");
+   if (tgsiFile) {
+      tgsi_dump_to_file(shader->state.tokens, TGSI_DUMP_FLOAT_AS_HEX, tgsiFile);
+      fclose(tgsiFile);
+   }
+
+   char index[1024];
+   snprintf(index, sizeof(index),
+             "shader process=%s pid=%lu shaderStage=%s shader=%p dxbc=%016llx "
+            "dxbcDwords=%u tgsi=%016llx tgsiTokens=%u write=%u,%u stem=%s\r\n",
+             process, GetCurrentProcessId(), stage, shader,
+            (unsigned long long)shader->captureDxbcHash, dxbcDwords,
+            (unsigned long long)shader->captureTgsiHash, tgsiTokens,
+            dxbcOk, tgsiOk, stem);
+   WinMaliCaptureAppendIndex(directory, process, index);
+   WINMALI_CAPTURE_TRACE("Shader process=%s pid=%lu shaderStage=%s shader=%p "
+                         "dxbc=%016llx tgsi=%016llx dir=%s",
+                         process, GetCurrentProcessId(), stage, shader,
+                         (unsigned long long)shader->captureDxbcHash,
+                         (unsigned long long)shader->captureTgsiHash, directory);
+}
+#endif
 
 
 /*
@@ -175,6 +319,9 @@ SetConstantBuffers(mesa_shader_stage shader_type,    // IN
       cb.buffer = CastPipeResource(phBuffers[i]);
       cb.buffer_offset = 0;
       cb.buffer_size = cb.buffer ? cb.buffer->width0 : 0;
+#if defined(WINMALI_SHADER_CAPTURE)
+      pDevice->captureConstantBuffers[shader_type][StartBuffer + i] = cb;
+#endif
       pipe->set_constant_buffer(pipe,
                                 shader_type,
                                 StartBuffer + i,
@@ -240,6 +387,36 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
       ShaderResourceView *view =
             CastShaderResourceView(phShaderResourceViews[i]);
       struct pipe_sampler_view *sampler_view = view ? view->handle : NULL;
+      if (shader_type == MESA_SHADER_FRAGMENT && view && sampler_view &&
+          sampler_view->texture) {
+         struct pipe_resource *texture = sampler_view->texture;
+         static LONG glyphIntermediateCapture;
+         static LONG dwmImportCapture;
+
+         if (texture->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+             texture->width0 == 256 && texture->height0 == 80 &&
+             InterlockedCompareExchange(&glyphIntermediateCapture, 1, 0) == 0) {
+            if (!WinMaliDiagnosticCaptureResource(pipe, texture,
+                                                   "ps-256x80"))
+               InterlockedExchange(&glyphIntermediateCapture, 0);
+         }
+
+#if defined(_WIN32) && defined(HAVE_WINMALI_WDDM_KMOD)
+         /* StartMenu owns its 608x608 present allocation; DWM opens that
+          * allocation and later samples it.  Capture only the opened copy so
+          * this boundary is specifically the DWM handoff, not another local
+          * StartMenu render target. */
+         if (texture->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+             texture->width0 == 608 && texture->height0 == 608 &&
+             view->resource && view->resource->hKMAllocation &&
+             !view->resource->ownsKMAllocation &&
+             InterlockedCompareExchange(&dwmImportCapture, 1, 0) == 0) {
+            if (!WinMaliDiagnosticCaptureResource(pipe, texture,
+                                                   "dwm-import-608x608"))
+               InterlockedExchange(&dwmImportCapture, 0);
+         }
+#endif
+      }
       if (shader_type == MESA_SHADER_FRAGMENT && view && sampler_view &&
           !view->textureBindLogged) {
          view->textureBindLogged = true;
@@ -355,6 +532,75 @@ DestroyShader(D3D10DDI_HDEVICE hDevice,   // IN
    if (pShader->state.tokens) {
       ureg_free_tokens(pShader->state.tokens);
    }
+
+   if (pShader->type == MESA_SHADER_VERTEX && pShader->vertex_code) {
+      FREE(pShader->vertex_code);
+      pShader->vertex_code = NULL;
+   }
+}
+
+
+void
+ShaderResolveVertexInputTypes(Device *pDevice)
+{
+   Shader *shader = pDevice->bound_vs;
+   if (!shader || shader->type != MESA_SHADER_VERTEX ||
+       !shader->vertex_code || !shader->handle)
+      return;
+
+   enum Shader_input_type input_types[PIPE_MAX_ATTRIBS];
+   memset(input_types, 0, sizeof input_types);
+
+   if (pDevice->element_layout) {
+      const struct cso_velems_state *layout = &pDevice->element_layout->state;
+      for (unsigned i = 0; i < layout->count; ++i) {
+         const enum pipe_format format =
+            static_cast<enum pipe_format>(layout->velems[i].src_format);
+         if (util_format_is_pure_sint(format))
+            input_types[i] = SHADER_INPUT_TYPE_SINT;
+         else if (util_format_is_pure_uint(format))
+            input_types[i] = SHADER_INPUT_TYPE_UINT;
+         else
+            input_types[i] = SHADER_INPUT_TYPE_FLOAT;
+      }
+   }
+
+   bool type_signature_matches = true;
+   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; ++i) {
+      if (shader->vertex_input_types[i] != (unsigned char)input_types[i]) {
+         type_signature_matches = false;
+         break;
+      }
+   }
+   if (type_signature_matches)
+      return;
+
+   struct pipe_shader_state state = shader->state;
+   unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
+   memcpy(output_mapping, shader->output_mapping, sizeof output_mapping);
+   state.tokens = Shader_tgsi_translate(shader->vertex_code, output_mapping,
+                                        input_types);
+   if (!state.tokens) {
+      DebugPrintf("ShaderResolveVertexInputTypes: translation failed\n");
+      return;
+   }
+
+   void *handle = pDevice->pipe->create_vs_state(pDevice->pipe, &state);
+   if (!handle) {
+      DebugPrintf("ShaderResolveVertexInputTypes: create_vs_state failed\n");
+      ureg_free_tokens(state.tokens);
+      return;
+   }
+
+   /* Bind the replacement before releasing the old compiled state. */
+   pDevice->pipe->bind_vs_state(pDevice->pipe, handle);
+   pDevice->pipe->delete_vs_state(pDevice->pipe, shader->handle);
+   ureg_free_tokens(shader->state.tokens);
+   shader->state = state;
+   shader->handle = handle;
+   memcpy(shader->output_mapping, output_mapping, sizeof output_mapping);
+   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; ++i)
+      shader->vertex_input_types[i] = (unsigned char)input_types[i];
 }
 
 
@@ -589,9 +835,26 @@ CreateVertexShader(D3D10DDI_HDEVICE hDevice,                                  //
 
    pShader->type = MESA_SHADER_VERTEX;
    pShader->output_resolved = true;
+   pShader->vertex_code = NULL;
+   pShader->vertex_code_dwords = pCode[1];
+   memset(pShader->vertex_input_types, 0,
+          sizeof pShader->vertex_input_types);
+
+   if (pShader->vertex_code_dwords >= 2 &&
+       pShader->vertex_code_dwords <= (1u << 20)) {
+      pShader->vertex_code = (UINT *)MALLOC(
+         (size_t)pShader->vertex_code_dwords * sizeof(*pShader->vertex_code));
+      if (pShader->vertex_code) {
+         memcpy(pShader->vertex_code, pCode,
+                (size_t)pShader->vertex_code_dwords *
+                   sizeof(*pShader->vertex_code));
+      }
+   }
 
    memset(&pShader->state, 0, sizeof pShader->state);
-   pShader->state.tokens = Shader_tgsi_translate(pCode, pShader->output_mapping);
+   pShader->state.tokens = Shader_tgsi_translate(pCode,
+                                                 pShader->output_mapping,
+                                                 NULL);
    WM_SHADER_INIT_LOG("[WinMaliShaderInit] CreateVertexShader TRANSLATED shader=%p "
                "tokens=%p\n", pShader, pShader->state.tokens);
    if (!pShader->state.tokens) {
@@ -603,6 +866,10 @@ CreateVertexShader(D3D10DDI_HDEVICE hDevice,                                  //
                   pShader->handle);
       return;
    }
+
+#if defined(WINMALI_SHADER_CAPTURE)
+   WinMaliCaptureShader(pShader, pCode, "vs");
+#endif
 
    WM_SHADER_INIT_LOG("[WinMaliShaderInit] CreateVertexShader PIPE CALL shader=%p\n",
                pShader);
@@ -747,7 +1014,9 @@ CreateGeometryShader(D3D10DDI_HDEVICE hDevice,                                //
    pShader->output_resolved = true;
 
    memset(&pShader->state, 0, sizeof pShader->state);
-   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping);
+   pShader->state.tokens = Shader_tgsi_translate(pShaderCode,
+                                                 pShader->output_mapping,
+                                                 NULL);
    WM_SHADER_INIT_LOG("[WinMaliShaderInit] CreateGeometryShader TRANSLATED shader=%p "
                "tokens=%p\n", pShader, pShader->state.tokens);
    if (!pShader->state.tokens) {
@@ -933,8 +1202,9 @@ CreateGeometryShaderWithStreamOutput(
 
    memset(&pShader->state, 0, sizeof pShader->state);
    if (pData->pShaderCode) {
-      pShader->state.tokens = Shader_tgsi_translate(pData->pShaderCode,
-                                                    pShader->output_mapping);
+       pShader->state.tokens = Shader_tgsi_translate(pData->pShaderCode,
+                                                     pShader->output_mapping,
+                                                     NULL);
       if (!pShader->state.tokens) {
          DebugPrintf("CreateGeometryShaderWithStreamOutput: shader "
                      "translation failed\n");
@@ -1107,7 +1377,10 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
 
    memset(&pShader->state, 0, sizeof pShader->state);
    pShader->state.tokens = Shader_tgsi_translate(pShaderCode,
-                                                  pShader->output_mapping);
+                                                 pShader->output_mapping,
+                                                 NULL);
+   WINMALI_TEXT_TRACE("PixelShaderCreate code=%p shader=%p tokens=%p",
+                      pShaderCode, pShader, pShader->state.tokens);
    WM_SHADER_INIT_LOG("[WinMaliShaderInit] CreatePixelShader TRANSLATED shader=%p "
                "tokens=%p\n", pShader, pShader->state.tokens);
    if (!pShader->state.tokens) {
@@ -1119,6 +1392,10 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
                   pShader->handle);
       return;
    }
+
+#if defined(WINMALI_SHADER_CAPTURE)
+   WinMaliCaptureShader(pShader, pShaderCode, "ps");
+#endif
 
    WM_SHADER_INIT_LOG("[WinMaliShaderInit] CreatePixelShader PIPE CALL shader=%p\n",
                pShader);
@@ -1149,6 +1426,19 @@ PsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
    Device *pDevice = CastDevice(hDevice);
    struct pipe_context *pipe = pDevice->pipe;
    void *state = CastPipeShader(hShader);
+
+#if defined(WINMALI_SHADER_CAPTURE)
+   pDevice->captureBoundPs = CastShader(hShader);
+#endif
+
+#if defined(WINMALI_LOG_GLYPH)
+   Shader *shader = CastShader(hShader);
+   if (pDevice->textBoundPs != shader) {
+      pDevice->textBoundPs = shader;
+      WINMALI_TEXT_TRACE("PixelShaderBind device=%p shader=%p pipeState=%p",
+                         pDevice, shader, state);
+   }
+#endif
 
    if (!state) {
       state = pDevice->empty_fs;
@@ -1373,6 +1663,7 @@ CreateShaderResourceView(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->resource = CastResource(pCreateSRView->hDrvResource);
    pSRView->dxgiFormat = pCreateSRView->Format;
    pSRView->glyphDiagnostic =
       format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_R8_UNORM;
@@ -1471,6 +1762,7 @@ CreateShaderResourceView1(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->resource = CastResource(pCreateSRView->hDrvResource);
    pSRView->dxgiFormat = pCreateSRView->Format;
    pSRView->glyphDiagnostic =
       format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_R8_UNORM;

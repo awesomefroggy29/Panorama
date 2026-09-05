@@ -31,14 +31,34 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 
 #include "DxgiFns.h"
 #include "Format.h"
+#include "Resource.h"
 #include "State.h"
 
 #include "Debug.h"
 
 #include "util/format/u_format.h"
+
+static bool
+WinMaliCaptureTargetProcess(void)
+{
+   char path[MAX_PATH] = {0};
+   if (!GetModuleFileNameA(NULL, path, ARRAY_SIZE(path)))
+      return false;
+
+   const char *name = strrchr(path, '\\');
+   name = name ? name + 1 : path;
+   return _stricmp(name, "StartMenuExperienceHost.exe") == 0 ||
+          _stricmp(name, "SearchHost.exe") == 0 ||
+          _stricmp(name, "ShellExperienceHost.exe") == 0 ||
+          _stricmp(name, "ShellHost.exe") == 0 ||
+          _stricmp(name, "Explorer.exe") == 0 ||
+          _stricmp(name, "SystemSettings.exe") == 0 ||
+          _stricmp(name, "dwm.exe") == 0;
+}
 
 
 /*
@@ -70,6 +90,51 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
    DebugPrintf("WinMali: DXGI Present flush-before ENTER device=%p\n", device);
    device->pipe->flush(device->pipe, NULL, 0);
    DebugPrintf("WinMali: DXGI Present flush-before EXIT device=%p\n", device);
+
+   /* DirectComposition applications present several independent surfaces, so
+    * a single process-wide snapshot can miss the text/icon layer entirely.
+    * Capture a bounded set of resource identities, with two samples per
+    * identity so that an initially-empty swapchain buffer does not hide its
+    * later contents.  This is diagnostic-only and uses the ordinary
+    * synchronized Gallium map path. */
+   {
+      struct PresentCaptureSlot {
+         struct pipe_resource *resource;
+         unsigned samples;
+      };
+      static SRWLOCK presentCaptureLock = SRWLOCK_INIT;
+      static PresentCaptureSlot slots[8];
+      static unsigned slotCount;
+      static unsigned captureCount;
+      struct pipe_resource *src = pSrcResource ? pSrcResource->resource : NULL;
+      unsigned slot = 0, sample = 0, sequence = 0;
+      bool capture = false;
+      if (src && src->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+          WinMaliCaptureTargetProcess()) {
+         AcquireSRWLockExclusive(&presentCaptureLock);
+         for (; slot < slotCount; ++slot) {
+            if (slots[slot].resource == src)
+               break;
+         }
+         if (slot == slotCount && slotCount < ARRAY_SIZE(slots)) {
+            slots[slot].resource = src;
+            slots[slot].samples = 0;
+            ++slotCount;
+         }
+         if (slot < slotCount && slots[slot].samples < 2 && captureCount < 16) {
+            sample = ++slots[slot].samples;
+            sequence = ++captureCount;
+            capture = true;
+         }
+         ReleaseSRWLockExclusive(&presentCaptureLock);
+      }
+      if (capture) {
+         char stage[64];
+         snprintf(stage, sizeof(stage), "present-%02u-surface-%u-sample-%u",
+                  sequence, slot + 1, sample);
+         WinMaliDiagnosticCaptureResource(device->pipe, src, stage);
+      }
+   }
 
    /* Redirected present: when hDstResource is non-zero the runtime wants us to
     * copy the source into that destination surface (the DWM-off / cross-adapter

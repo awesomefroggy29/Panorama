@@ -59,10 +59,22 @@ struct Shader
    struct pipe_shader_state state;
    unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
    bool output_resolved;
+   /* A vertex shader's DXBC is retained because DXBC MOV is typeless while
+    * the numeric type of a vertex input lives in the separately-created D3D
+    * input layout.  The active Gallium shader is rebuilt only when that
+    * compact input-type signature changes. */
+   UINT *vertex_code;
+   UINT vertex_code_dwords;
+   unsigned char vertex_input_types[PIPE_MAX_ATTRIBS];
+#if defined(WINMALI_SHADER_CAPTURE)
+   uint64_t captureDxbcHash;
+   uint64_t captureTgsiHash;
+#endif
 };
 
 struct Query;
 struct ElementLayout;
+struct BlendState;
 
 struct Device
 {
@@ -92,6 +104,31 @@ struct Device
    struct pipe_stream_output_target *draw_so_target;
    Shader *bound_empty_gs;
    Shader *bound_vs;
+#if defined(WINMALI_SHADER_CAPTURE)
+   Shader *captureBoundPs;
+   BlendState *captureBoundBlend;
+   float captureBlendFactor[4];
+   unsigned captureSampleMask;
+   struct pipe_viewport_state captureViewports[PIPE_MAX_VIEWPORTS];
+   unsigned captureViewportCount;
+   struct pipe_scissor_state captureScissors[PIPE_MAX_VIEWPORTS];
+   unsigned captureScissorCount;
+   unsigned captureDrawSequence;
+   /* Diagnostic shadow of the constant buffers submitted to Gallium.  The
+    * Gallium context owns the references; these shallow copies are consumed
+    * synchronously at draw time and never affect rendering state. */
+   struct pipe_constant_buffer
+      captureConstantBuffers[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+#endif
+#if defined(WINMALI_LOG_GLYPH)
+   /* Diagnostic shadow state only.  Gallium remains the authoritative state;
+    * these pointers let a glyph-resource draw be correlated without logging
+    * every D3D state change in the process. */
+   Shader *textBoundPs;
+   BlendState *textBoundBlend;
+   unsigned textDrawSequence;
+   unsigned textDrawLogged;
+#endif
 
    unsigned max_dual_source_render_targets;
 
@@ -311,6 +348,16 @@ CastPipeDepthStencilView(D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView)
 struct BlendState
 {
    void *handle;
+   unsigned diagnosticId;
+   bool dualSource;
+   bool blendEnable;
+   unsigned colorMask;
+   unsigned rgbFunc;
+   unsigned rgbSrcFactor;
+   unsigned rgbDstFactor;
+   unsigned alphaFunc;
+   unsigned alphaSrcFactor;
+   unsigned alphaDstFactor;
 };
 
 
@@ -422,6 +469,7 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
 struct ShaderResourceView
 {
    struct pipe_sampler_view *handle;
+   Resource *resource;
    DXGI_FORMAT dxgiFormat;
    bool glyphDiagnostic;
    bool glyphBindLogged;

@@ -989,6 +989,30 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch)
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_vertex_state *vtx = ctx->vertex;
 
+   /* Valhall stores the source byte offset in the attribute descriptor.
+    * Attribute CSOs are shared and immutable, so patch a draw-local copy,
+    * matching PanVK's emit_vs_attrib().  Gallium defines the fetched element
+    * as start_instance + (instance_id / divisor), hence base_instance is
+    * applied before the hardware divisor as base_instance * stride. */
+   if (ctx->base_instance && vtx->attr_depends_on_base_instance_mask) {
+      struct mali_attribute_packed attributes[PIPE_MAX_ATTRIBS];
+      memcpy(attributes, vtx->attributes,
+             vtx->num_elements * sizeof(attributes[0]));
+
+      u_foreach_bit(i, vtx->attr_depends_on_base_instance_mask) {
+         if (i >= vtx->num_elements)
+            continue;
+
+         pan_unpack(&attributes[i], ATTRIBUTE, cfg);
+         cfg.offset += ctx->base_instance * vtx->pipe[i].src_stride;
+         MALI_ATTRIBUTE_pack(&attributes[i], &cfg);
+      }
+
+      return pan_pool_upload_aligned(&batch->pool.base, attributes,
+                                     vtx->num_elements * pan_size(ATTRIBUTE),
+                                     pan_alignment(ATTRIBUTE));
+   }
+
    return pan_pool_upload_aligned(&batch->pool.base, vtx->attributes,
                                   vtx->num_elements * pan_size(ATTRIBUTE),
                                   pan_alignment(ATTRIBUTE));
@@ -2553,10 +2577,8 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
       src_offset += (buf->buffer_offset & 63);
 
       /* Base instance offset */
-      if (ctx->base_instance && so->pipe[i].instance_divisor) {
-         src_offset += (ctx->base_instance * so->pipe[i].src_stride) /
-                       so->pipe[i].instance_divisor;
-      }
+      if (ctx->base_instance && so->pipe[i].instance_divisor)
+         src_offset += ctx->base_instance * so->pipe[i].src_stride;
 
       /* Also, somewhat obscurely per-instance data needs to be
        * offset in response to a delayed start in an indexed draw */
@@ -3121,10 +3143,11 @@ panfrost_update_streamout_offsets(struct panfrost_context *ctx)
 static uint64_t
 panfrost_val_emit_varying_descriptors(struct panfrost_batch *batch)
 {
+   struct panfrost_context *ctx = batch->ctx;
    struct panfrost_compiled_shader *vs =
-      batch->ctx->prog[MESA_SHADER_VERTEX];
+      ctx->prog[MESA_SHADER_VERTEX];
    struct panfrost_compiled_shader *fs =
-      batch->ctx->prog[MESA_SHADER_FRAGMENT];
+      ctx->prog[MESA_SHADER_FRAGMENT];
 
    const struct pan_varying_layout *vs_layout = &vs->info.varyings.formats;
    const struct pan_varying_layout *fs_format = &fs->info.varyings.formats;
@@ -3136,6 +3159,62 @@ panfrost_val_emit_varying_descriptors(struct panfrost_batch *batch)
    struct pan_ptr bufs =
       pan_pool_alloc_desc_array(&batch->pool.base, fs_in_slots, ATTRIBUTE);
    struct mali_attribute_packed *descs = bufs.cpu;
+
+#if defined(WINMALI_IDVS_HANDOFF_PROBE)
+   bool trace_handoff = false;
+   if (!ctx->winmali_varying_handoff_logged &&
+       ctx->uncompiled[MESA_SHADER_VERTEX] != NULL &&
+       ctx->uncompiled[MESA_SHADER_VERTEX]->nir != NULL) {
+      static const uint32_t glyph_vs_blake3[8] = {
+         0x15937609, 0x0d3ac49c, 0x2ac8cbb7, 0xa361c29e,
+         0x1e7587fc, 0x1938546b, 0x590d1b17, 0xcf3fd97d,
+      };
+      trace_handoff =
+         memcmp(ctx->uncompiled[MESA_SHADER_VERTEX]->nir->info.source_blake3,
+                glyph_vs_blake3, sizeof(glyph_vs_blake3)) == 0;
+   }
+
+   if (trace_handoff) {
+      const struct pan_varying_layout *key_layout =
+         &fs->key.fs.vs_varying_layout;
+      bool key_matches_vs =
+         key_layout->known == vs_layout->known &&
+         key_layout->count == vs_layout->count &&
+         key_layout->generic_size_B == vs_layout->generic_size_B &&
+         memcmp(key_layout->slots, vs_layout->slots,
+                vs_layout->count * sizeof(vs_layout->slots[0])) == 0;
+      mesa_logi("[WinMaliHandoff] Pair ctx=%p vs=%p fs=%p descGpu=0x%llx "
+                "vsKnown=0x%x vsCount=%u vsSize=%u fsKnown=0x%x "
+                "fsCount=%u fsSize=%u keyKnown=0x%x keyCount=%u keySize=%u "
+                "keyMatchesVs=%u",
+                ctx, vs, fs, (unsigned long long)bufs.gpu,
+                vs_layout->known, vs_layout->count,
+                vs_layout->generic_size_B, fs_format->known,
+                fs_format->count, fs_format->generic_size_B,
+                key_layout->known, key_layout->count,
+                key_layout->generic_size_B, key_matches_vs);
+
+      for (uint32_t i = 0; i < vs_layout->count; ++i) {
+         const struct pan_varying_slot *slot =
+            pan_varying_layout_slot_at(vs_layout, i);
+         mesa_logi("[WinMaliHandoff] VS slot=%u present=%u loc=%u section=%u "
+                   "offset=%d type=0x%x comps=%u",
+                   i, slot != NULL, slot ? slot->location : 0,
+                   slot ? slot->section : 0, slot ? slot->offset : -1,
+                   slot ? slot->alu_type : 0, slot ? slot->ncomps : 0);
+      }
+
+      for (uint32_t i = 0; i < fs_format->count; ++i) {
+         const struct pan_varying_slot *slot =
+            pan_varying_layout_slot_at(fs_format, i);
+         mesa_logi("[WinMaliHandoff] FS slot=%u present=%u loc=%u section=%u "
+                   "offset=%d type=0x%x comps=%u",
+                   i, slot != NULL, slot ? slot->location : 0,
+                   slot ? slot->section : 0, slot ? slot->offset : -1,
+                   slot ? slot->alu_type : 0, slot ? slot->ncomps : 0);
+      }
+   }
+#endif
 
    batch->nr_varying_attribs[MESA_SHADER_FRAGMENT] = fs_in_slots;
 
@@ -3171,7 +3250,36 @@ panfrost_val_emit_varying_descriptors(struct panfrost_batch *batch)
          cfg.attribute_stride = vs_layout->generic_size_B;
          cfg.packet_stride = vs_layout->generic_size_B + 16;
       }
+
+#if defined(WINMALI_IDVS_HANDOFF_PROBE)
+      if (trace_handoff) {
+         uint64_t words[2] = {0, 0};
+         memcpy(words, &descs[i], MIN2(sizeof(words), sizeof(descs[i])));
+         mesa_logi("[WinMaliHandoff] Slot index=%u fsLoc=%u fsSection=%u "
+                   "fsType=0x%x fsComps=%u vsFound=%u vsLoc=%u "
+                   "vsSection=%u vsOffset=%d vsType=0x%x vsComps=%u "
+                   "pipeFormat=%s hwFormat=0x%x words=%016llx,%016llx",
+                   i, fs_slot ? fs_slot->location : 0,
+                   fs_slot ? fs_slot->section : 0,
+                   fs_slot ? fs_slot->alu_type : 0,
+                   fs_slot ? fs_slot->ncomps : 0, vs_slot != NULL,
+                   vs_slot ? vs_slot->location : 0,
+                   vs_slot ? vs_slot->section : 0,
+                   vs_slot ? vs_slot->offset : -1,
+                   vs_slot ? vs_slot->alu_type : 0,
+                   vs_slot ? vs_slot->ncomps : 0,
+                   util_format_name(format),
+                   GENX(pan_format_from_pipe_format)(format)->hw,
+                   (unsigned long long)words[0],
+                   (unsigned long long)words[1]);
+      }
+#endif
    }
+
+#if defined(WINMALI_IDVS_HANDOFF_PROBE)
+   if (trace_handoff)
+      ctx->winmali_varying_handoff_logged = true;
+#endif
 
    return bufs.gpu;
 }
@@ -3288,6 +3396,12 @@ panfrost_update_state_3d(struct panfrost_batch *batch)
       panfrost_set_batch_masks_zs(batch);
 
 #if PAN_ARCH >= 9
+   struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
+   struct panfrost_vertex_state *vstate = ctx->vertex;
+   bool attr_offsetted_by_instance_base =
+      vstate->attr_depends_on_base_instance_mask &
+      BITFIELD_MASK(vs->info.attributes_read_count);
+
    if ((dirty & (PAN_DIRTY_ZS | PAN_DIRTY_RASTERIZER)) ||
        (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & PAN_DIRTY_STAGE_SHADER))
       batch->depth_stencil = panfrost_emit_depth_stencil(batch);
@@ -3295,7 +3409,10 @@ panfrost_update_state_3d(struct panfrost_batch *batch)
    if (dirty & PAN_DIRTY_BLEND)
       batch->blend = panfrost_emit_blend_valhall(batch);
 
-   if (dirty & PAN_DIRTY_VERTEX) {
+   /* batch->attribs caches a descriptor array, while base_instance changes
+    * per draw. Re-emit instanced descriptors even when the vertex CSO itself
+    * is unchanged, including transitions back to base instance zero. */
+   if ((dirty & PAN_DIRTY_VERTEX) || attr_offsetted_by_instance_base) {
       batch->attribs[MESA_SHADER_VERTEX] = panfrost_emit_vertex_data(batch);
 
       batch->attrib_bufs[MESA_SHADER_VERTEX] =
@@ -3703,6 +3820,30 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 
    struct panfrost_context *ctx = pan_context(pipe);
 
+#if defined(WINMALI_REJECT_CAPTURE)
+   /* DirectWrite/XAML's affected path binds an R8_UINT metadata/index texel
+    * buffer. Mark that pipeline so the CSF layer can report authoritative
+    * final state without logging every desktop draw. */
+   bool has_r8_uint = false;
+   unsigned fs_view_count = ctx->sampler_view_count[MESA_SHADER_FRAGMENT];
+
+   for (unsigned i = 0; i < fs_view_count; ++i) {
+      struct panfrost_sampler_view *view =
+         ctx->sampler_views[MESA_SHADER_FRAGMENT][i];
+      if (!view || !view->base.texture)
+         continue;
+
+      struct pipe_resource *resource = view->base.texture;
+      has_r8_uint |= view->base.format == PIPE_FORMAT_R8_UINT ||
+                     resource->format == PIPE_FORMAT_R8_UINT;
+   }
+
+   /* R8_UINT is the DirectWrite metadata/index path common to the missing
+    * Start, taskbar and Quick Settings glyphs.  Do not require a particular
+    * atlas dimension: XAML can resize or replace the companion texture. */
+   ctx->winmali_reject_probe = has_r8_uint;
+#endif
+
    if (!panfrost_render_condition_check(ctx))
       return;
 
@@ -4096,6 +4237,12 @@ panfrost_pack_attribute(struct panfrost_device *dev,
          cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
          cfg.offset_enable = true;
+      } else if (el.instance_divisor == 1) {
+         /* A divisor of one advances directly with the instance ID.  Use the
+          * native instance frequency instead of the divided-address form,
+          * matching the Valhall CSF PanVK descriptor encoding. */
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
       } else if (util_is_power_of_two_or_zero(el.instance_divisor)) {
          /* Per-instance, POT divisor */
          cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
@@ -4128,6 +4275,11 @@ panfrost_create_vertex_elements_state(struct pipe_context *pctx,
 
    for (unsigned i = 0; i < num_elements; ++i)
       so->strides[elements[i].vertex_buffer_index] = elements[i].src_stride;
+
+   for (unsigned i = 0; i < num_elements; ++i) {
+      if (elements[i].instance_divisor)
+         so->attr_depends_on_base_instance_mask |= BITFIELD_BIT(i);
+   }
 #if PAN_ARCH >= 9
    for (unsigned i = 0; i < num_elements; ++i)
       panfrost_pack_attribute(dev, elements[i], &so->attributes[i]);
@@ -4138,8 +4290,6 @@ panfrost_create_vertex_elements_state(struct pipe_context *pctx,
       so->element_buffer[i] = pan_assign_vertex_buffer(
          so->buffers, &so->nr_bufs, elements[i].vertex_buffer_index,
          elements[i].instance_divisor);
-      if (elements[i].instance_divisor)
-         so->attr_depends_on_base_instance_mask |= BITFIELD_BIT(i);
    }
 
    for (int i = 0; i < num_elements; ++i) {

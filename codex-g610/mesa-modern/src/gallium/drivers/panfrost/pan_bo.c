@@ -129,6 +129,12 @@ panfrost_bo_free(struct panfrost_bo *bo)
 
    ASSERTED int ret = pan_kmod_vm_bind(
       vm, PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT, &vm_op, 1);
+#if defined(WINMALI_LOG_GLYPH)
+   mesa_logi("[WinMaliText] CleanupBoUnmap bo=%p kmodBo=%p gpu=0x%llx "
+             "size=%llu ret=%d errno=%d",
+             bo, kmod_bo, (unsigned long long)gpu_va,
+             (unsigned long long)kmod_bo->size, ret, ret ? errno : 0);
+#endif
    assert(!ret);
 
    pan_kmod_bo_put(kmod_bo);

@@ -1396,6 +1396,33 @@ csf_emit_shader_regs(struct panfrost_batch *batch, mesa_shader_stage stage,
 {
    uint64_t resources = panfrost_emit_resources(batch, stage);
 
+#if defined(WINMALI_IDVS_HANDOFF_PROBE) && PAN_ARCH < 12
+   if (stage == MESA_SHADER_FRAGMENT &&
+       batch->ctx->winmali_varying_handoff_logged &&
+       !batch->ctx->winmali_idvs_handoff_logged) {
+      struct mali_resource_packed attr_resource = {0};
+      pan_pack(&attr_resource, RESOURCE, cfg) {
+         cfg.address = batch->attribs[MESA_SHADER_FRAGMENT];
+         cfg.size = batch->nr_varying_attribs[MESA_SHADER_FRAGMENT] *
+                    pan_size(BUFFER);
+      }
+      uint64_t words[2] = {0, 0};
+      memcpy(words, &attr_resource,
+             MIN2(sizeof(words), sizeof(attr_resource)));
+      mesa_logi("[WinMaliHandoff] FragmentSRT encoded=0x%llx base=0x%llx "
+                "table=%u attribGpu=0x%llx attribCount=%u "
+                "resourceWords=%016llx,%016llx shaderDesc=0x%llx",
+                (unsigned long long)resources,
+                (unsigned long long)(resources & ~UINT64_C(0x3f)),
+                PAN_TABLE_ATTRIBUTE,
+                (unsigned long long)batch->attribs[MESA_SHADER_FRAGMENT],
+                batch->nr_varying_attribs[MESA_SHADER_FRAGMENT],
+                (unsigned long long)words[0],
+                (unsigned long long)words[1],
+                (unsigned long long)shader);
+   }
+#endif
+
    assert(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT ||
           stage == MESA_SHADER_COMPUTE);
 
@@ -1611,11 +1638,33 @@ csf_emit_draw_state(struct panfrost_batch *batch,
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
    struct panfrost_compiled_shader *fs = ctx->prog[MESA_SHADER_FRAGMENT];
+#if defined(WINMALI_REJECT_CAPTURE)
+   const bool reject_probe = ctx->winmali_reject_probe &&
+                             ctx->winmali_reject_draw_count < 32;
+   const unsigned reject_seq = reject_probe
+                                  ? ++ctx->winmali_reject_draw_count
+                                  : 0;
+   ctx->winmali_reject_active_seq = reject_seq;
+#endif
 
    ASSERTED bool idvs = vs->info.vs.idvs;
    bool fs_required = panfrost_fs_required(
       fs, ctx->blend, &ctx->pipe_framebuffer, ctx->depth_stencil);
    bool secondary_shader = vs->info.vs.secondary_enable && fs_required;
+#if defined(WINMALI_IDVS_HANDOFF_PROBE) && PAN_ARCH < 12
+   bool winmali_idvs_glyph = false;
+   if (!ctx->winmali_idvs_handoff_logged &&
+       ctx->uncompiled[MESA_SHADER_VERTEX] != NULL &&
+       ctx->uncompiled[MESA_SHADER_VERTEX]->nir != NULL) {
+      static const uint32_t glyph_vs_blake3[8] = {
+         0x15937609, 0x0d3ac49c, 0x2ac8cbb7, 0xa361c29e,
+         0x1e7587fc, 0x1938546b, 0x590d1b17, 0xcf3fd97d,
+      };
+      winmali_idvs_glyph =
+         memcmp(ctx->uncompiled[MESA_SHADER_VERTEX]->nir->info.source_blake3,
+                glyph_vs_blake3, sizeof(glyph_vs_blake3)) == 0;
+   }
+#endif
 
    assert(idvs && "IDVS required for CSF");
 
@@ -1820,6 +1869,53 @@ csf_emit_draw_state(struct panfrost_batch *batch,
       }
    }
 
+#if defined(WINMALI_REJECT_CAPTURE)
+   if (reject_probe) {
+      const struct pipe_rasterizer_state *probe_rast =
+         &ctx->rasterizer->base;
+      const struct pipe_depth_stencil_alpha_state *probe_zsa =
+         &ctx->depth_stencil->base;
+      const bool has_zs = ctx->pipe_framebuffer.zsbuf.texture != NULL;
+      const unsigned effective_depth_func =
+         (has_zs && probe_zsa->depth_enabled) ? probe_zsa->depth_func
+                                              : PIPE_FUNC_ALWAYS;
+
+      pan_unpack(&dcd_flags0, DCD_FLAGS_0, probe_dcd0);
+      pan_unpack(&dcd_flags1, DCD_FLAGS_1, probe_dcd1);
+
+      mesa_logi("[WinMaliReject] FinalState seq=%u ctx=%p mode=%u "
+                "fsRequired=%u secondary=%u dcd0=0x%08x dcd1=0x%08x "
+                "primitive=0x%08x cull=0x%x frontCCW=%u rasterDiscard=%u "
+                "scissor=%u multisample=%u depthClip=%u,%u "
+                "depthEnabled=%u depthWrite=%u depthFunc=%u effectiveDepthFunc=%u "
+                "stencil=%u,%u hasZS=%u zsd=0x%llx rtMask=0x%x "
+                "hwCull=%u,%u hwFrontCCW=%u pixelKill=%u zsUpdate=%u "
+                "hwRtMask=0x%x sampleMask=0x%x "
+                "viewportScale=%g,%g,%g viewportTranslate=%g,%g,%g "
+                "scissorBox=%u,%u-%u,%u",
+                reject_seq, ctx, info->mode, fs_required, secondary_shader,
+                dcd_flags0.opaque[0], dcd_flags1.opaque[0],
+                primitive_flags.opaque[0], probe_rast->cull_face,
+                probe_rast->front_ccw, probe_rast->rasterizer_discard,
+                probe_rast->scissor, probe_rast->multisample,
+                probe_rast->depth_clip_near, probe_rast->depth_clip_far,
+                probe_zsa->depth_enabled, probe_zsa->depth_writemask,
+                probe_zsa->depth_func, effective_depth_func,
+                probe_zsa->stencil[0].enabled,
+                probe_zsa->stencil[1].enabled, has_zs,
+                (unsigned long long)batch->depth_stencil, ctx->fb_rt_mask,
+                probe_dcd0.cull_front_face, probe_dcd0.cull_back_face,
+                probe_dcd0.front_face_ccw, probe_dcd0.pixel_kill_operation,
+                probe_dcd0.zs_update_operation, probe_dcd1.render_target_mask,
+                probe_dcd1.sample_mask,
+                ctx->pipe_viewport.scale[0], ctx->pipe_viewport.scale[1],
+                ctx->pipe_viewport.scale[2], ctx->pipe_viewport.translate[0],
+                ctx->pipe_viewport.translate[1],
+                ctx->pipe_viewport.translate[2], ctx->scissor.minx,
+                ctx->scissor.miny, ctx->scissor.maxx, ctx->scissor.maxy);
+   }
+#endif
+
    cs_move32_to(b, cs_sr_reg32(b, IDVS, DCD0), dcd_flags0.opaque[0]);
    cs_move32_to(b, cs_sr_reg32(b, IDVS, DCD1), dcd_flags1.opaque[0]);
 
@@ -1843,6 +1939,30 @@ csf_emit_draw_state(struct panfrost_batch *batch,
       cfg.index_type = panfrost_translate_index_size(info->index_size);
       cfg.secondary_shader = secondary_shader;
    };
+
+#if defined(WINMALI_IDVS_HANDOFF_PROBE) && PAN_ARCH < 12
+   if (winmali_idvs_glyph) {
+      const uint64_t pos_spd = panfrost_get_position_shader(batch, info);
+      const uint64_t vary_spd = panfrost_get_varying_shader(batch);
+      mesa_logi("[WinMaliIDVS] Draw ctx=%p mode=%u idvs=%u fsRequired=%u "
+                "secondaryEnable=%u secondaryShader=%u flags=0x%08x "
+                "descBase=0x%llx posSpd=0x%llx varySpd=0x%llx "
+                "binary=0x%llx secondaryBinary=0x%llx "
+                "secondaryOffset=0x%x genericSize=%u",
+                ctx, info->mode, idvs, fs_required,
+                vs->info.vs.secondary_enable, secondary_shader,
+                flags_override.opaque[0],
+                (unsigned long long)batch->rsd[MESA_SHADER_VERTEX],
+                (unsigned long long)pos_spd,
+                (unsigned long long)vary_spd,
+                (unsigned long long)vs->bin.gpu,
+                (unsigned long long)(vs->bin.gpu +
+                                     vs->info.vs.secondary_offset),
+                vs->info.vs.secondary_offset,
+                vs->info.varyings.formats.generic_size_B);
+      ctx->winmali_idvs_handoff_logged = true;
+   }
+#endif
 
    return flags_override.opaque[0];
 }
@@ -1875,6 +1995,63 @@ GENX(csf_launch_draw)(struct panfrost_batch *batch,
 
    uint32_t flags_override = csf_emit_draw_state(batch, info, drawid_offset);
    struct cs_index drawid = csf_emit_draw_id_register(batch, drawid_offset);
+
+#if defined(WINMALI_REJECT_CAPTURE)
+   if (batch->ctx->winmali_reject_active_seq != 0) {
+      struct panfrost_context *ctx = batch->ctx;
+      struct panfrost_vertex_state *vertex = ctx->vertex;
+      const unsigned reject_seq = ctx->winmali_reject_active_seq;
+
+      mesa_logi("[WinMaliReject] DrawRegs seq=%u count=%u instances=%u "
+                "indexSize=%u indexBias=%d start=%u baseInstance=%u "
+                "indexGpu=0x%llx flagsOverride=0x%08x attributes=0x%llx "
+                "attributeBuffers=0x%llx elements=%u vbMask=0x%x",
+                reject_seq, draw->count, info->instance_count,
+                info->index_size, draw->index_bias, draw->start,
+                info->start_instance, (unsigned long long)batch->indices,
+                flags_override,
+                (unsigned long long)batch->attribs[MESA_SHADER_VERTEX],
+                (unsigned long long)batch->attrib_bufs[MESA_SHADER_VERTEX],
+                vertex ? vertex->num_elements : 0, ctx->vb_mask);
+
+      if (vertex) {
+         for (unsigned i = 0; i < vertex->num_elements; ++i) {
+            struct mali_attribute_packed packed = vertex->attributes[i];
+            pan_unpack(&packed, ATTRIBUTE, attrib);
+            if (info->start_instance &&
+                (vertex->attr_depends_on_base_instance_mask & BITFIELD_BIT(i)))
+               attrib.offset +=
+                  (int64_t)info->start_instance * vertex->pipe[i].src_stride;
+            unsigned vbi = vertex->pipe[i].vertex_buffer_index;
+            const struct pipe_vertex_buffer *vb =
+               vbi < PIPE_MAX_ATTRIBS ? &ctx->vertex_buffers[vbi] : NULL;
+            struct pipe_resource *resource = vb ? vb->buffer.resource : NULL;
+            uint64_t gpu = resource ? pan_resource(resource)->plane.base : 0;
+
+            mesa_logi("[WinMaliReject] Attribute seq=%u reg=%u vbi=%u "
+                      "pipeFormat=%u pipeOffset=%u pipeStride=%u divisor=%u "
+                      "hwFormat=0x%x type=%u frequency=%u table=%u "
+                      "bufferIndex=0x%llx offset=%lld stride=%llu offsetEnable=%u "
+                      "divR=%u divE=%u divD=%llu vbGpu=0x%llx "
+                      "vbOffset=%u vbSize=%u",
+                      reject_seq, i, vbi, vertex->pipe[i].src_format,
+                      vertex->pipe[i].src_offset,
+                      vertex->pipe[i].src_stride,
+                      vertex->pipe[i].instance_divisor, attrib.format,
+                      attrib.attribute_type, attrib.frequency, attrib.table,
+                      (unsigned long long)attrib.buffer_index,
+                      (long long)attrib.offset,
+                      (unsigned long long)attrib.stride,
+                      attrib.offset_enable, attrib.divisor_r,
+                      attrib.divisor_e,
+                      (unsigned long long)attrib.divisor_d,
+                      (unsigned long long)gpu,
+                      vb ? vb->buffer_offset : 0,
+                      resource ? resource->width0 : 0);
+         }
+      }
+   }
+#endif
 
    cs_move32_to(b, cs_sr_reg32(b, IDVS, INDEX_COUNT), draw->count);
    cs_move32_to(b, cs_sr_reg32(b, IDVS, INSTANCE_COUNT), info->instance_count);
@@ -2211,10 +2388,18 @@ GENX(csf_cleanup_context)(struct panfrost_context *ctx)
    /* Make sure all jobs are done before destroying the heap. */
    ret = drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
                         NULL);
+#if defined(WINMALI_LOG_GLYPH)
+   mesa_logi("[WinMaliText] CleanupSyncWait ctx=%p syncobj=%u ret=%d errno=%d",
+             ctx, ctx->syncobj, ret, ret ? errno : 0);
+#endif
    assert(!ret);
 
    ret = pan_kmod_dev_ioctl(dev->kmod.dev,
-                        DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+                         DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+#if defined(WINMALI_LOG_GLYPH)
+   mesa_logi("[WinMaliText] CleanupHeapDestroy ctx=%p heap=%u ret=%d errno=%d",
+             ctx, thd.handle, ret, ret ? errno : 0);
+#endif
    assert(!ret);
 
    struct drm_panthor_group_destroy gd = {
@@ -2223,7 +2408,11 @@ GENX(csf_cleanup_context)(struct panfrost_context *ctx)
 
    ret =
       pan_kmod_dev_ioctl(dev->kmod.dev, DRM_IOCTL_PANTHOR_GROUP_DESTROY,
-                     &gd);
+                      &gd);
+#if defined(WINMALI_LOG_GLYPH)
+   mesa_logi("[WinMaliText] CleanupGroupDestroy ctx=%p group=%u ret=%d errno=%d",
+             ctx, gd.group_handle, ret, ret ? errno : 0);
+#endif
    assert(!ret);
 
    panfrost_bo_unreference(ctx->csf.tmp_geom_bo);

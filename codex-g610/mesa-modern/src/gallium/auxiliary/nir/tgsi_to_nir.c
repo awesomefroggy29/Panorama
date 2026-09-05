@@ -42,6 +42,7 @@
 #include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_info.h"
 #include "tgsi/tgsi_scan.h"
+#include "tgsi/tgsi_util.h"
 #include "tgsi/tgsi_from_mesa.h"
 
 #if defined(WINMALI_LOG_FOCUSED) || defined(WINMALI_LOG_LIFECYCLE)
@@ -65,6 +66,14 @@ struct ttn_reg_info {
    int offset;
 };
 
+enum ttn_input_type {
+   TTN_INPUT_TYPE_UNKNOWN = 0,
+   TTN_INPUT_TYPE_FLOAT,
+   TTN_INPUT_TYPE_SIGNED,
+   TTN_INPUT_TYPE_UNSIGNED,
+   TTN_INPUT_TYPE_CONFLICT,
+};
+
 struct ttn_compile {
    union tgsi_full_token *token;
    nir_builder build;
@@ -80,6 +89,7 @@ struct ttn_compile {
    nir_def *addr_reg;
 
    nir_variable **inputs;
+   enum ttn_input_type *input_types;
    nir_variable **outputs;
    nir_variable *samplers[PIPE_MAX_SAMPLERS];
    nir_variable *images[PIPE_MAX_SHADER_IMAGES];
@@ -105,6 +115,206 @@ struct ttn_compile {
    bool cap_integers;
    bool cap_tg4_component_in_swizzle;
 };
+
+static enum ttn_input_type
+ttn_input_type_for_tgsi_type(enum tgsi_opcode_type type)
+{
+   switch (type) {
+   case TGSI_TYPE_SIGNED:
+   case TGSI_TYPE_SIGNED64:
+      return TTN_INPUT_TYPE_SIGNED;
+   case TGSI_TYPE_UNSIGNED:
+   case TGSI_TYPE_UNSIGNED64:
+      return TTN_INPUT_TYPE_UNSIGNED;
+   case TGSI_TYPE_FLOAT:
+   case TGSI_TYPE_DOUBLE:
+      return TTN_INPUT_TYPE_FLOAT;
+   case TGSI_TYPE_UNTYPED:
+   case TGSI_TYPE_VOID:
+      return TTN_INPUT_TYPE_UNKNOWN;
+   }
+
+   UNREACHABLE("invalid TGSI source type");
+}
+
+static bool
+ttn_merge_input_type(enum ttn_input_type *dst, enum ttn_input_type type)
+{
+   if (type == TTN_INPUT_TYPE_UNKNOWN || *dst == type ||
+       *dst == TTN_INPUT_TYPE_CONFLICT)
+      return false;
+
+   enum ttn_input_type merged = type;
+   if (*dst != TTN_INPUT_TYPE_UNKNOWN) {
+      /* Signed and unsigned 32-bit TGSI values have the same bit-preserving
+       * transport requirements.  Prefer uint when both interpretations reach
+       * a typeless value; only mixing integer and floating-point uses is a
+       * genuine input-type conflict. */
+      bool dst_integer = *dst == TTN_INPUT_TYPE_SIGNED ||
+                         *dst == TTN_INPUT_TYPE_UNSIGNED;
+      bool src_integer = type == TTN_INPUT_TYPE_SIGNED ||
+                         type == TTN_INPUT_TYPE_UNSIGNED;
+
+      if (dst_integer && src_integer)
+         merged = TTN_INPUT_TYPE_UNSIGNED;
+      else
+         merged = TTN_INPUT_TYPE_CONFLICT;
+   }
+
+   if (*dst == merged)
+      return false;
+
+   *dst = merged;
+   return true;
+}
+
+static enum ttn_input_type *
+ttn_component_type(enum ttn_input_type *input_types,
+                   unsigned num_inputs,
+                   enum ttn_input_type *temp_types,
+                   unsigned num_temps,
+                   unsigned file, int index, unsigned component)
+{
+   if (index < 0 || component >= 4)
+      return NULL;
+
+   if (file == TGSI_FILE_INPUT && (unsigned)index < num_inputs)
+      return &input_types[index * 4 + component];
+
+   if (file == TGSI_FILE_TEMPORARY && (unsigned)index < num_temps)
+      return &temp_types[index * 4 + component];
+
+   return NULL;
+}
+
+/* TGSI registers are typeless, whereas NIR input variables are typed.
+ * Determine the type expected by every input component from the instructions
+ * which consume it before creating those variables.  MOV is also typeless,
+ * but it preserves bits, so requirements on a temporary must be propagated
+ * backwards through MOV chains to the input which supplied those bits.
+ *
+ * This distinction matters for vertex attributes on hardware with typed
+ * attribute conversion.  For example, an SINT attribute consumed by I2F must
+ * be loaded as an integer and converted exactly once by I2F.  Describing the
+ * NIR load as float causes the attribute load to convert SINT to float first,
+ * after which I2F incorrectly interprets the float bit pattern as an integer.
+ */
+static void
+ttn_scan_input_types(struct ttn_compile *c, const void *tgsi_tokens)
+{
+   unsigned num_inputs = c->build.shader->num_inputs;
+   unsigned num_temps = c->scan->file_max[TGSI_FILE_TEMPORARY] + 1;
+   enum ttn_input_type *input_component_types =
+      rzalloc_array(c, enum ttn_input_type, num_inputs * 4);
+   enum ttn_input_type *temp_component_types =
+      rzalloc_array(c, enum ttn_input_type, num_temps * 4);
+   struct tgsi_parse_context parser;
+   ASSERTED int ret = tgsi_parse_init(&parser, tgsi_tokens);
+   assert(ret == TGSI_PARSE_OK);
+
+   /* Seed constraints at typed consumers, including consumers of temporaries.
+    * tgsi_util_get_inst_usage_mask() accounts for the instruction writemask
+    * and source swizzle, so unrelated components do not create false type
+    * conflicts. */
+   while (!tgsi_parse_end_of_tokens(&parser)) {
+      tgsi_parse_token(&parser);
+
+      if (parser.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION)
+         continue;
+
+      const struct tgsi_full_instruction *inst =
+         &parser.FullToken.FullInstruction;
+      const enum tgsi_opcode opcode = inst->Instruction.Opcode;
+
+      for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; ++i) {
+         const struct tgsi_src_register *src = &inst->Src[i].Register;
+         if (src->Indirect)
+            continue;
+
+         enum ttn_input_type type = ttn_input_type_for_tgsi_type(
+            tgsi_opcode_infer_src_type(opcode, i));
+         if (type == TTN_INPUT_TYPE_UNKNOWN)
+            continue;
+
+         unsigned usage_mask = tgsi_util_get_inst_usage_mask(inst, i);
+         for (unsigned component = 0; component < 4; ++component) {
+            if (!(usage_mask & BITFIELD_BIT(component)))
+               continue;
+
+            enum ttn_input_type *component_type =
+               ttn_component_type(input_component_types, num_inputs,
+                                  temp_component_types, num_temps,
+                                  src->File, src->Index, component);
+            if (component_type)
+               ttn_merge_input_type(component_type, type);
+         }
+      }
+   }
+
+   tgsi_parse_free(&parser);
+
+   /* Propagate the constraints to a fixed point through bit-preserving MOVs.
+    * TGSI's destination component selects the corresponding source swizzle,
+    * e.g. MOV TEMP[0].y, IN[1].yyyy carries TEMP[0].y's requirement back to
+    * IN[1].y.  The type lattice is monotonic, so this always terminates. */
+   bool progress;
+   do {
+      progress = false;
+      ret = tgsi_parse_init(&parser, tgsi_tokens);
+      assert(ret == TGSI_PARSE_OK);
+
+      while (!tgsi_parse_end_of_tokens(&parser)) {
+         tgsi_parse_token(&parser);
+
+         if (parser.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION)
+            continue;
+
+         const struct tgsi_full_instruction *inst =
+            &parser.FullToken.FullInstruction;
+         if (inst->Instruction.Opcode != TGSI_OPCODE_MOV ||
+             inst->Instruction.NumDstRegs != 1 ||
+             inst->Instruction.NumSrcRegs != 1)
+            continue;
+
+         const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+         const struct tgsi_src_register *src = &inst->Src[0].Register;
+         if (dst->Indirect || src->Indirect)
+            continue;
+
+         const unsigned swizzles[4] = {
+            src->SwizzleX, src->SwizzleY, src->SwizzleZ, src->SwizzleW,
+         };
+
+         for (unsigned component = 0; component < 4; ++component) {
+            if (!(dst->WriteMask & BITFIELD_BIT(component)))
+               continue;
+
+            enum ttn_input_type *dst_type =
+               ttn_component_type(input_component_types, num_inputs,
+                                  temp_component_types, num_temps,
+                                  dst->File, dst->Index, component);
+            enum ttn_input_type *src_type =
+               ttn_component_type(input_component_types, num_inputs,
+                                  temp_component_types, num_temps,
+                                  src->File, src->Index, swizzles[component]);
+            if (dst_type && src_type)
+               progress |= ttn_merge_input_type(src_type, *dst_type);
+         }
+      }
+
+      tgsi_parse_free(&parser);
+   } while (progress);
+
+   /* NIR IO variables have one scalar type for the whole vec4.  Fold the
+    * component constraints only after propagation so a typed use of one
+    * component can still traverse a MOV without contaminating the others. */
+   for (unsigned input = 0; input < num_inputs; ++input) {
+      for (unsigned component = 0; component < 4; ++component) {
+         ttn_merge_input_type(&c->input_types[input],
+                              input_component_types[input * 4 + component]);
+      }
+   }
+}
 
 #define ttn_swizzle(b, src, x, y, z, w) \
    nir_swizzle(b, src, SWIZ(x, y, z, w), 4)
@@ -300,7 +510,23 @@ ttn_emit_declaration(struct ttn_compile *c)
 
          var->data.driver_location = idx;
 
-         var->type = glsl_vec4_type();
+         if (file == TGSI_FILE_INPUT && c->input_types) {
+            switch (c->input_types[idx]) {
+            case TTN_INPUT_TYPE_SIGNED:
+               var->type = glsl_vector_type(GLSL_TYPE_INT, 4);
+               break;
+            case TTN_INPUT_TYPE_UNSIGNED:
+               var->type = glsl_vector_type(GLSL_TYPE_UINT, 4);
+               break;
+            case TTN_INPUT_TYPE_UNKNOWN:
+            case TTN_INPUT_TYPE_FLOAT:
+            case TTN_INPUT_TYPE_CONFLICT:
+               var->type = glsl_vec4_type();
+               break;
+            }
+         } else {
+            var->type = glsl_vec4_type();
+         }
          if (is_array)
             var->type = glsl_array_type(var->type, array_size, 0);
 
@@ -2731,6 +2957,7 @@ ttn_compile_init(const void *tgsi_tokens,
       s->info.workgroup_size_variable = true;
 
    c->inputs = rzalloc_array(c, struct nir_variable *, s->num_inputs);
+   c->input_types = rzalloc_array(c, enum ttn_input_type, s->num_inputs);
    c->outputs = rzalloc_array(c, struct nir_variable *, s->num_outputs);
 
    c->output_regs = rzalloc_array(c, struct ttn_reg_info,
@@ -2742,6 +2969,16 @@ ttn_compile_init(const void *tgsi_tokens,
 
    c->num_samp_types = scan.file_max[TGSI_FILE_SAMPLER_VIEW] + 1;
    c->samp_types = rzalloc_array(c, nir_alu_type, c->num_samp_types);
+
+   /* Recover the type of vertex attributes and fragment varyings from their
+    * consumers.  TGSI registers are typeless, but NIR input variables are
+    * typed.  In particular, a flat integer fragment input must not default to
+    * float: separate TGSI shaders retain that type through Panfrost linking,
+    * causing the varying descriptor to interpret the integer payload as
+    * floating-point data. */
+   if (s->info.stage == MESA_SHADER_VERTEX ||
+       s->info.stage == MESA_SHADER_FRAGMENT)
+      ttn_scan_input_types(c, tgsi_tokens);
 
    if (trace_fragment)
       mesa_logi("[WinMaliTgsiDiag] CompileInit PARSE CALL tokens=%p",

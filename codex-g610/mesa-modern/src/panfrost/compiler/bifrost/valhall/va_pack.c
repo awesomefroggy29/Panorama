@@ -1043,6 +1043,12 @@ va_pack_instr(const bi_instr *I, unsigned arch)
          hex |= (1ull << 12);
       if (I->skip)
          hex |= (1ull << 39);
+      /* Every Valhall texture message in this shared encoding carries a
+       * destination register type.  Leaving this field at zero selects the
+       * reserved encoding, which can corrupt sampled values consumed by
+       * follow-on glyph and blit operations.
+       */
+      hex |= ((uint64_t)va_pack_register_type(I)) << 26;
       if (!bi_is_regfmt_16(I->register_format))
          hex |= (1ull << 46);
 

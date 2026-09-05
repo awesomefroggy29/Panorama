@@ -98,7 +98,14 @@ SetViewports(D3D10DDI_HDEVICE hDevice,                                        //
     * so the common (NumViewports=1, ClearViewports=15) update remains one
     * hardware viewport. */
    const UINT galliumViewports = MIN2(NumViewports + ClearViewports,
-                                      maxViewports);
+                                       maxViewports);
+#if defined(WINMALI_SHADER_CAPTURE)
+   Device *captureDevice = CastDevice(hDevice);
+   captureDevice->captureViewportCount = galliumViewports;
+   if (galliumViewports)
+      memcpy(captureDevice->captureViewports, states,
+             galliumViewports * sizeof(states[0]));
+#endif
    if (galliumViewports)
       pipe->set_viewport_states(pipe, 0, galliumViewports, states);
 }
@@ -151,7 +158,14 @@ SetScissorRects(D3D10DDI_HDEVICE hDevice,                            // IN
              sizeof(struct pipe_scissor_state) * ClearScissorRects);
    }
    const UINT galliumScissors = MIN2(NumScissorRects + ClearScissorRects,
-                                     maxScissors);
+                                      maxScissors);
+#if defined(WINMALI_SHADER_CAPTURE)
+   Device *captureDevice = CastDevice(hDevice);
+   captureDevice->captureScissorCount = galliumScissors;
+   if (galliumScissors)
+      memcpy(captureDevice->captureScissors, states,
+             galliumScissors * sizeof(states[0]));
+#endif
    if (galliumScissors)
       pipe->set_scissor_states(pipe, 0, galliumScissors, states);
 }

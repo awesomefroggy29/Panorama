@@ -156,6 +156,13 @@ struct Shader_parser {
    struct Shader_header header;
 };
 
+enum Shader_input_type {
+   SHADER_INPUT_TYPE_UNKNOWN = 0,
+   SHADER_INPUT_TYPE_FLOAT,
+   SHADER_INPUT_TYPE_SINT,
+   SHADER_INPUT_TYPE_UINT,
+};
+
 void
 Shader_parse_init(struct Shader_parser *parser,
                        const unsigned *code);
@@ -170,7 +177,8 @@ Shader_opcode_free(struct Shader_opcode *opcode);
 
 const struct tgsi_token *
 Shader_tgsi_translate(const unsigned *code,
-                      unsigned *output_mapping);
+                      unsigned *output_mapping,
+                      const enum Shader_input_type *input_types);
 
 
 #ifdef __cplusplus

@@ -21,6 +21,7 @@
 #include "util/libsync.h"
 #include "util/macros.h"
 #include "util/u_debug_cb.h"
+#include "util/u_dual_blend.h"
 #include "util/u_helpers.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
@@ -219,6 +220,14 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
          ->vtbl.get_blend_shader(&dev->blend_shaders, &pan_blend, col0_type,
                                  col1_type, rti);
    uint64_t address = shader->address;
+#if defined(WINMALI_LOG_GLYPH)
+   if (util_blend_state_is_dual(&blend->base, rti)) {
+      mesa_logi("[WinMaliText] BlendProgram rt=%u format=%u samples=%u "
+                "fs=%p src0Type=0x%x src1Type=0x%x shader=%p gpu=0x%llx",
+                rti, fmt, nr_samples, ss, col0_type, col1_type, shader,
+                (unsigned long long)address);
+   }
+#endif
    mesa_logi("[WinMaliShader] BlendProgram ctx=%p rt=%u format=%u "
              "samples=%u shader=%p binary=0x%llx",
              ctx, rti, fmt, nr_samples, shader,
