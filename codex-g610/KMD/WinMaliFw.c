@@ -2195,6 +2195,8 @@ WinMaliCsfSubmitStreamCall_(
     UINT64             ringExtract;
     UINT64             ringWriteOffset;
     UINT64             ringUsed;
+    SIZE_T             ringTailBytes;
+    SIZE_T             ringHeadBytes;
     UINT64             callInstrs[WINMALI_CSF_NUM_INSTRS_PER_SLOT];
     volatile WINMALI_PANTHOR_SYNCOBJ64* sync;
     volatile UINT64*   tagSlot;
@@ -2310,10 +2312,6 @@ WinMaliCsfSubmitStreamCall_(
             (ULONGLONG)ringUsed, (ULONGLONG)sizeof(callInstrs));
         return STATUS_DEVICE_BUSY;
     }
-    if (ringWriteOffset + sizeof(callInstrs) > WINMALI_CSF_RING_BYTES) {
-        return STATUS_BUFFER_OVERFLOW;
-    }
-
     if (ringInsert != 0ull && ringWriteOffset == 0ull) {
         WINMALI_DIAG(
             "CSF ring wrap: insert=%llu extract=%llu writeOffset=%llu next=%llu",
@@ -2322,8 +2320,30 @@ WinMaliCsfSubmitStreamCall_(
             (ULONGLONG)(ringInsert + sizeof(callInstrs)));
     }
 
+    /* The CS queue is circular.  A trampoline can begin close enough to the
+       end that its final instructions belong at offset zero.  Keep Insert
+       monotonic, but split the host copy at the physical allocation boundary
+       instead of rejecting valid work with STATUS_BUFFER_OVERFLOW. */
+    ringTailBytes = (SIZE_T)WINMALI_CSF_RING_BYTES -
+                    (SIZE_T)ringWriteOffset;
+    if (ringTailBytes > sizeof(callInstrs)) {
+        ringTailBytes = sizeof(callInstrs);
+    }
+    ringHeadBytes = sizeof(callInstrs) - ringTailBytes;
+
     RtlCopyMemory((PUCHAR)Fw->HostRingVa + (SIZE_T)ringWriteOffset,
-                  callInstrs, sizeof(callInstrs));
+                  callInstrs, ringTailBytes);
+    if (ringHeadBytes != 0u) {
+        RtlCopyMemory(Fw->HostRingVa,
+                      (PUCHAR)callInstrs + ringTailBytes,
+                      ringHeadBytes);
+        WINMALI_DIAG(
+            "CSF ring split: insert=%llu extract=%llu offset=%llu tail=%llu head=%llu next=%llu",
+            (ULONGLONG)ringInsert, (ULONGLONG)ringExtract,
+            (ULONGLONG)ringWriteOffset,
+            (ULONGLONG)ringTailBytes, (ULONGLONG)ringHeadBytes,
+            (ULONGLONG)(ringInsert + sizeof(callInstrs)));
+    }
     KeMemoryBarrier();
 
     Fw->QRingIn->Extract = ringExtract;

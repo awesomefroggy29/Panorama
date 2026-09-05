@@ -60,10 +60,10 @@ struct winmali_wddm_alloc_ops {
 
    /* Phase 2 UMD half: map/unmap a dxgk allocation into the GPU virtual address
     * space via pfnMapGpuVirtualAddressCb / pfnFreeGpuVirtualAddressCb, retiring
-    * the escape VmBind for BOs that are real dxgk allocations. map_va requests
-    * *inout_va (panfrost's chosen VA) as the base and returns the dxgk-assigned
-    * VA in *inout_va (must match for panfrost's bookkeeping to hold). map_flags
-    * is WINMALI_WDDM_MAP_* and must reflect the BO's GPU access contract. The
+    * the escape VmBind for BOs that are real dxgk allocations. A nonzero
+    * *inout_va requests an explicit base; zero requests process-wide automatic
+    * placement by VidMm. The selected address is returned through *inout_va.
+    * map_flags is WINMALI_WDDM_MAP_* and must reflect the BO's GPU access contract. The
     * map is synchronised on the device's paging queue before returning. Opt-in:
     * panfrost only calls these when WINMALI_DXGK_ADDR is set AND the BO is
     * dxgk-backed (wddm_kmt_handle != 0); otherwise escape VmBind is used.
