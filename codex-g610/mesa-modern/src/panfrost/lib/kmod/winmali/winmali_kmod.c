@@ -51,6 +51,20 @@ struct winmali_kmod_va_collect {
    uint64_t size;
 };
 
+/* A WDDM GPUVA mapping owns a reference to its backing BO.  dxgkrnl does not
+ * receive panthor's GEM object list with a CSF submission, so this is the
+ * userspace equivalent of the kernel retaining every mapped GEM object until
+ * the deferred unmap has passed the VM idle point. */
+struct winmali_kmod_mapping {
+   struct list_head node;
+   struct pan_kmod_bo *bo;
+   uint64_t va;
+   uint64_t size;
+   uint64_t retire_point;
+   bool pending_unmap;
+   bool heap_owned_va;
+};
+
 struct winmali_kmod_vm {
    struct pan_kmod_vm base;
 
@@ -60,13 +74,15 @@ struct winmali_kmod_vm {
    uint32_t vm_id;
    uint32_t pad0;
 
-   /* Auto-VA management: mesa allocates VA from a userspace heap and
-    * tells the KMD where to map. AUTO_VA + ASYNC unmap defers reclaim
-    * to a sync point on the VM timeline. */
+   /* Auto-VA management for the escape VM_BIND path. WDDM mappings instead
+    * ask VidMm for process-wide automatic placement, because several logical
+    * pan_kmod VMs in one process share the same WDDM GPUVA address space.
+    * AUTO_VA + ASYNC unmap defers mapping/BO retirement to a VM sync point. */
    struct {
       simple_mtx_t lock;
       struct util_vma_heap heap;
       struct list_head gc_list;
+      struct list_head mapping_list;
    } auto_va;
 
    /* Per-VM timeline sync object. PAN_KMOD_VM_FLAG_TRACK_ACTIVITY
@@ -783,8 +799,11 @@ winmali_kmod_bo_free(struct pan_kmod_bo *bo)
     * allocation in that exceptional case rather than create a GPU use-after-
     * free. */
    if (retire_point != 0) {
-      int wait_err =
-         syncobj_timeline_wait(wbo->sync.handle, retire_point, INT64_MAX);
+      /* Mapping records normally keep the BO alive until this point has
+       * completed.  This zero-time poll is only a final safety check for BOs
+       * that were never tracked as mappings; destruction must never stall a
+       * compositor thread. */
+      int wait_err = syncobj_timeline_wait(wbo->sync.handle, retire_point, 0);
 
       backing_quiesced = wait_err == 0 || wait_err == -EIO;
       if (!backing_quiesced) {
@@ -1109,6 +1128,7 @@ winmali_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
       simple_mtx_init(&wvm->auto_va.lock, mtx_plain);
       util_vma_heap_init(&wvm->auto_va.heap, va_start, va_range);
       list_inithead(&wvm->auto_va.gc_list);
+      list_inithead(&wvm->auto_va.mapping_list);
    }
 
    if (flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY) {
@@ -1160,10 +1180,110 @@ winmali_kmod_vm_collect_freed_vas(struct winmali_kmod_vm *wvm)
    }
 }
 
+static struct winmali_kmod_mapping *
+winmali_kmod_vm_find_mapping_locked(struct winmali_kmod_vm *wvm,
+                                    uint64_t va, uint64_t size)
+{
+   simple_mtx_assert_locked(&wvm->auto_va.lock);
+
+   list_for_each_entry(struct winmali_kmod_mapping, mapping,
+                       &wvm->auto_va.mapping_list, node) {
+      if (mapping->va == va && mapping->size == size)
+         return mapping;
+   }
+
+   return NULL;
+}
+
+/* Retire completed WDDM unmaps without ever waiting.  The timeline poll is
+ * deliberately zero-time.  A pending mapping and its BO reference remain
+ * intact until the captured VM point is signaled (or terminally failed). */
+static void
+winmali_kmod_vm_collect_wddm_mappings(struct winmali_kmod_vm *wvm)
+{
+   if (!(wvm->base.flags & PAN_KMOD_VM_FLAG_AUTO_VA))
+      return;
+
+   struct winmali_kmod_dev *wdev = to_winmali_dev(wvm->base.dev);
+   const struct winmali_wddm_alloc_ops *bridge = &wdev->wddm_alloc;
+
+   for (;;) {
+      struct winmali_kmod_mapping *retired = NULL;
+
+      simple_mtx_lock(&wvm->auto_va.lock);
+      list_for_each_entry(struct winmali_kmod_mapping, mapping,
+                          &wvm->auto_va.mapping_list, node) {
+         if (!mapping->pending_unmap)
+            continue;
+
+         int wait_err = syncobj_timeline_wait(
+            wvm->sync.handle, mapping->retire_point, 0);
+         if (wait_err == 0 || wait_err == -EIO) {
+            list_del(&mapping->node);
+            if (mapping->heap_owned_va)
+               util_vma_heap_free(&wvm->auto_va.heap, mapping->va,
+                                  mapping->size);
+            retired = mapping;
+         } else if (wait_err != -ETIMEDOUT) {
+            winmali_d3dkmt_log("[WinMaliSync] deferred unmap poll vm=%u "
+                               "va=0x%llx point=%llu err=%d; retained",
+                               wvm->vm_id,
+                               (unsigned long long)mapping->va,
+                               (unsigned long long)mapping->retire_point,
+                               wait_err);
+         }
+         break;
+      }
+      simple_mtx_unlock(&wvm->auto_va.lock);
+
+      if (!retired)
+         break;
+
+      if (bridge->unmap_va)
+         bridge->unmap_va(bridge->cookie, retired->va, retired->size);
+      winmali_d3dkmt_log("[WinMaliSync] deferred unmap retired vm=%u "
+                         "va=0x%llx size=0x%llx point=%llu bo=%u",
+                         wvm->vm_id, (unsigned long long)retired->va,
+                         (unsigned long long)retired->size,
+                         (unsigned long long)retired->retire_point,
+                         retired->bo ? retired->bo->handle : 0);
+      pan_kmod_bo_put(retired->bo);
+      free(retired);
+   }
+}
+
+static void
+winmali_kmod_vm_release_wddm_mappings(struct winmali_kmod_vm *wvm)
+{
+   struct winmali_kmod_dev *wdev = to_winmali_dev(wvm->base.dev);
+   const struct winmali_wddm_alloc_ops *bridge = &wdev->wddm_alloc;
+
+   while (!list_is_empty(&wvm->auto_va.mapping_list)) {
+      struct winmali_kmod_mapping *mapping =
+         list_first_entry(&wvm->auto_va.mapping_list,
+                          struct winmali_kmod_mapping, node);
+      list_del(&mapping->node);
+      if (bridge->unmap_va)
+         bridge->unmap_va(bridge->cookie, mapping->va, mapping->size);
+      if (mapping->heap_owned_va)
+         util_vma_heap_free(&wvm->auto_va.heap, mapping->va, mapping->size);
+      pan_kmod_bo_put(mapping->bo);
+      free(mapping);
+   }
+}
+
 static void
 winmali_kmod_vm_destroy(struct pan_kmod_vm *vm)
 {
    struct winmali_kmod_vm *wvm = to_winmali_vm(vm);
+
+   /* VM destruction is the lifetime boundary for all remaining mappings.
+    * Release mapping-owned BO references while the VM timeline and WDDM
+    * allocation bridge are still valid. */
+   if (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA) {
+      winmali_kmod_vm_collect_wddm_mappings(wvm);
+      winmali_kmod_vm_release_wddm_mappings(wvm);
+   }
 
    if (vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY) {
       syncobj_destroy(wvm->sync.handle);
@@ -1211,6 +1331,8 @@ winmali_vm_bind_dxgk(struct winmali_kmod_vm *wvm,
    const struct winmali_wddm_alloc_ops *bridge = &wdev->wddm_alloc;
    void *cookie = bridge->cookie;
 
+   winmali_kmod_vm_collect_wddm_mappings(wvm);
+
    /* Pre-scan: every MAP target must be a dxgk-backed BO, else not routable.
     * Done before any work so falling back to escape is clean (no double-map). */
    for (uint32_t i = 0; i < op_count; i++) {
@@ -1242,11 +1364,23 @@ winmali_vm_bind_dxgk(struct winmali_kmod_vm *wvm,
 
       switch (op->type) {
       case PAN_KMOD_VM_OP_TYPE_MAP: {
-         if (auto_va && op->va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
-            op->va.start = winmali_kmod_vm_alloc_va(wvm, op->va.size);
-            if (op->va.start == 0) { err = -ENOMEM; break; }
+         struct winmali_kmod_mapping *mapping = NULL;
+         bool heap_owned_va = false;
+         const bool vidmm_auto_va =
+            auto_va && op->va.start == PAN_KMOD_VM_MAP_AUTO_VA;
+         if (auto_va) {
+            mapping = calloc(1, sizeof(*mapping));
+            if (!mapping) {
+               err = -ENOMEM;
+               break;
+            }
          }
-         uint64_t va = op->va.start;
+         /* WDDM GPU virtual addresses are process-wide, not private to this
+          * logical pan_kmod VM.  Passing zero for an automatic mapping asks
+          * VidMm to choose a free address from the process address space and
+          * prevents independent Mesa VM heaps from selecting the same VA.
+          * Explicit-address mappings retain their requested address. */
+         uint64_t va = vidmm_auto_va ? 0 : op->va.start;
          uint32_t map_flags = 0;
          /* Match panthor's protection contract: shader/code BOs are
           * read-only executable; every other BO is writable non-executable.
@@ -1259,16 +1393,41 @@ winmali_vm_bind_dxgk(struct winmali_kmod_vm *wvm,
                                    to_winmali_bo(op->map.bo)->wddm_kmt_handle,
                                    (uint64_t)op->map.bo_offset,
                                    op->va.size, map_flags, &va);
-         if (merr) { err = merr; break; }
+         if (merr) {
+            if (heap_owned_va)
+               util_vma_heap_free(&wvm->auto_va.heap, op->va.start,
+                                  op->va.size);
+            free(mapping);
+            err = merr;
+            break;
+         }
          op->va.start = va;
+         if (mapping) {
+            mapping->bo = op->map.bo;
+            mapping->va = va;
+            mapping->size = op->va.size;
+            mapping->heap_owned_va = heap_owned_va;
+            pan_kmod_bo_get(mapping->bo);
+            list_addtail(&mapping->node, &wvm->auto_va.mapping_list);
+         }
          break;
       }
-      case PAN_KMOD_VM_OP_TYPE_UNMAP:
+      case PAN_KMOD_VM_OP_TYPE_UNMAP: {
+         struct winmali_kmod_mapping *mapping =
+            auto_va ? winmali_kmod_vm_find_mapping_locked(
+                         wvm, op->va.start, op->va.size) : NULL;
          bridge->unmap_va(cookie, op->va.start, op->va.size);
          /* Synchronous unmap -> reclaim the VA immediately (no async gc). */
-         if (auto_va)
-            util_vma_heap_free(&wvm->auto_va.heap, op->va.start, op->va.size);
+         if (mapping && mapping->heap_owned_va)
+            util_vma_heap_free(&wvm->auto_va.heap, op->va.start,
+                               op->va.size);
+         if (mapping) {
+            list_del(&mapping->node);
+            pan_kmod_bo_put(mapping->bo);
+            free(mapping);
+         }
          break;
+      }
       case PAN_KMOD_VM_OP_TYPE_SYNC_ONLY:
       default:
          break;
@@ -1287,6 +1446,56 @@ winmali_vm_bind_dxgk(struct winmali_kmod_vm *wvm,
    if (auto_va)
       simple_mtx_unlock(&wvm->auto_va.lock);
    return err;
+}
+
+static int
+winmali_kmod_vm_defer_wddm_unmaps(struct winmali_kmod_vm *wvm,
+                                  struct pan_kmod_vm_op *ops,
+                                  uint32_t op_count, uint64_t retire_point)
+{
+   simple_mtx_lock(&wvm->auto_va.lock);
+
+   /* Validate the whole batch before changing any mapping state.  Returning
+    * an error is safer than pretending an untracked VA was deferred: without
+    * its mapping-owned BO reference the caller's following bo_put() could
+    * release backing that the GPU still uses. */
+   for (uint32_t i = 0; i < op_count; i++) {
+      if (ops[i].type != PAN_KMOD_VM_OP_TYPE_UNMAP) {
+         simple_mtx_unlock(&wvm->auto_va.lock);
+         return -EINVAL;
+      }
+
+      struct winmali_kmod_mapping *mapping =
+         winmali_kmod_vm_find_mapping_locked(wvm, ops[i].va.start,
+                                             ops[i].va.size);
+      if (!mapping) {
+         winmali_d3dkmt_log("[WinMaliSync] deferred unmap has no mapping "
+                            "vm=%u va=0x%llx size=0x%llx; rejected",
+                            wvm->vm_id,
+                            (unsigned long long)ops[i].va.start,
+                            (unsigned long long)ops[i].va.size);
+         simple_mtx_unlock(&wvm->auto_va.lock);
+         return -ENOENT;
+      }
+   }
+
+   for (uint32_t i = 0; i < op_count; i++) {
+      struct winmali_kmod_mapping *mapping =
+         winmali_kmod_vm_find_mapping_locked(wvm, ops[i].va.start,
+                                             ops[i].va.size);
+      mapping->retire_point = retire_point;
+      mapping->pending_unmap = true;
+      winmali_d3dkmt_log("[WinMaliSync] deferred unmap queued vm=%u "
+                         "va=0x%llx size=0x%llx point=%llu bo=%u",
+                         wvm->vm_id, (unsigned long long)mapping->va,
+                         (unsigned long long)mapping->size,
+                         (unsigned long long)retire_point,
+                         mapping->bo->handle);
+   }
+
+   simple_mtx_unlock(&wvm->auto_va.lock);
+   winmali_kmod_vm_collect_wddm_mappings(wvm);
+   return 0;
 }
 
 static int
@@ -1479,37 +1688,39 @@ winmali_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
 
    struct winmali_kmod_vm *wvm = to_winmali_vm(vm);
 
-   /* panthor implements DEFER_TO_NEXT_IDLE_POINT as an asynchronous bind that
-    * waits on the VM timeline point current when the bind is queued.  WDDM's
-    * MapGpuVirtualAddress callback is synchronous and has no equivalent wait
-    * list, so provide the same ordering by holding the VM submission lock,
-    * waiting for that captured point, and only then issuing the bind/unbind.
-    * Holding the lock prevents a new submission from entering the retiring VA
-    * range between the wait and the unmap.
-    *
-    * -EIO is a terminal completion for the captured point: the KMD has failed
-    * and retired that work.  Other errors do not establish an idle point and
-    * must leave the mapping intact. */
+   /* Snapshot the last submitted VM point under the submission lock, then
+    * release it immediately.  The mapping record owns the BO until the
+    * nonblocking collector observes that point complete. */
    uint64_t idle_point = panthor_kmod_vm_sync_lock(vm);
-   int wait_err =
-      syncobj_timeline_wait(wvm->sync.handle, idle_point, INT64_MAX);
-   if (wait_err != 0 && wait_err != -EIO) {
-      panthor_kmod_vm_sync_unlock(vm, idle_point);
-      winmali_d3dkmt_log("[WinMaliSync] VM deferred bind blocked vm=%u "
-                         "sync=%u point=%llu err=%d",
-                         wvm->vm_id, wvm->sync.handle,
-                         (unsigned long long)idle_point, wait_err);
-      mesa_loge("[WinMaliSync] VM deferred bind blocked vm=%u sync=%u "
-                "point=%llu err=%d",
-                wvm->vm_id, wvm->sync.handle,
-                (unsigned long long)idle_point, wait_err);
-      return wait_err;
-   }
-
-   int ret = winmali_kmod_vm_bind_impl(
-      vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, op_count);
    panthor_kmod_vm_sync_unlock(vm, idle_point);
-   return ret;
+
+   struct winmali_kmod_dev *wdev = to_winmali_dev(vm->dev);
+   if (wdev->wddm_alloc.map_va != NULL &&
+       (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA))
+      return winmali_kmod_vm_defer_wddm_unmaps(
+         wvm, ops, op_count, idle_point);
+
+   /* Device bootstrap creates and releases a few escape-backed BOs before the
+    * D3D frontend installs its WDDM GPUVA bridge.  At that point the VM has no
+    * submitted work (normally idle_point == 0), so an immediate escape unmap
+    * is correct.  Prove that with a zero-time poll rather than either blocking
+    * or rejecting device creation.  Once work is outstanding, the escape KMD
+    * cannot yet attach a timeline dependency to VM_BIND; retain the mapping
+    * and report the unsupported asynchronous operation instead of unmapping
+    * storage that the GPU may still use. */
+   int idle_err = syncobj_timeline_wait(wvm->sync.handle, idle_point, 0);
+   if (idle_err == 0 || idle_err == -EIO)
+      return winmali_kmod_vm_bind_impl(
+         vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, op_count);
+
+   winmali_d3dkmt_log("[WinMaliSync] escape deferred unmap retained vm=%u "
+                      "sync=%u point=%llu err=%d",
+                      wvm->vm_id, wvm->sync.handle,
+                      (unsigned long long)idle_point, idle_err);
+   mesa_loge("escape deferred VM unmap requires asynchronous KMD support "
+             "(vm=%u point=%llu err=%d)",
+             wvm->vm_id, (unsigned long long)idle_point, idle_err);
+   return idle_err == -ETIMEDOUT ? -ENOTSUP : idle_err;
 }
 
 static enum pan_kmod_vm_state

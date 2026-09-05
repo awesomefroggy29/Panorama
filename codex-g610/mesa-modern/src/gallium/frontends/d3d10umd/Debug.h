@@ -72,7 +72,6 @@ CheckHResult(HRESULT hr, const char *function, unsigned line);
 void
 AssertFail(const char *expr, const char *file, unsigned line, const char *function);
 
-
 #ifndef NDEBUG
 #define ASSERT(expr) ((expr) ? (void)0 : AssertFail(#expr, __FILE__, __LINE__, __func__))
 #else

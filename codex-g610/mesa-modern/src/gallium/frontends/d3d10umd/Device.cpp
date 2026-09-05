@@ -429,8 +429,11 @@ WinMaliWddmMapVaCb(void *cookie, uint32_t kmt_handle, uint64_t offset_bytes,
 
    D3DDDI_MAPGPUVIRTUALADDRESS m;
    memset(&m, 0, sizeof m);
+   const uint64_t requested_va = *inout_va;
    m.hPagingQueue     = pDevice->hPagingQueue;
-   m.BaseAddress      = (D3DGPU_VIRTUAL_ADDRESS)*inout_va; /* request panfrost's VA */
+   /* Zero requests that VidMm select a process-wide free GPUVA. A nonzero
+    * value is an explicit-address mapping and must be honored exactly. */
+   m.BaseAddress      = (D3DGPU_VIRTUAL_ADDRESS)requested_va;
    m.hAllocation      = kmt_handle;
    m.OffsetInPages    = offset_bytes >> 12;
    m.SizeInPages      = (size + 0xFFF) >> 12;
@@ -464,10 +467,11 @@ WinMaliWddmMapVaCb(void *cookie, uint32_t kmt_handle, uint64_t offset_bytes,
       return -1;
    }
 
-   if (m.VirtualAddress != (D3DGPU_VIRTUAL_ADDRESS)*inout_va) {
+   if (requested_va != 0 &&
+       m.VirtualAddress != (D3DGPU_VIRTUAL_ADDRESS)requested_va) {
       DebugPrintf("WinMali: dxgk assigned VA %llx != requested %llx\n",
                   (unsigned long long)m.VirtualAddress,
-                  (unsigned long long)*inout_va);
+                  (unsigned long long)requested_va);
    }
    *inout_va = (uint64_t)m.VirtualAddress;
    DebugPrintf("WinMali: GPUVA map ready alloc=%u va=%llx pages=%llu prot=%s%s flags=0x%x fence=%llu hr=0x%08x\n",
@@ -678,6 +682,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
    pDevice->empty_vs = CreateEmptyShader(pDevice, MESA_SHADER_VERTEX);
    pDevice->empty_fs = CreateEmptyShader(pDevice, MESA_SHADER_FRAGMENT);
 
+
    pipe->bind_vs_state(pipe, pDevice->empty_vs);
    pipe->bind_fs_state(pipe, pDevice->empty_fs);
 
@@ -834,6 +839,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
       _RotateResourceIdentities;
    pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
       _Blt;
+
 
    /* Return S_OK so DXGI ENABLES the shared-resource presentation path to
     * communicate with DWM. Returning DXGI_STATUS_NO_REDIRECTION opts out of
