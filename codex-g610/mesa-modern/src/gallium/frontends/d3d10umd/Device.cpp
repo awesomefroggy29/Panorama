@@ -66,6 +66,9 @@ WinMaliWddmEnsurePagingQueue(Device *pDevice)
       if (pDevice->KTCallbacks.pfnCreatePagingQueueCb != NULL)
          hr = pDevice->KTCallbacks.pfnCreatePagingQueueCb(pDevice->hDevice,
                                                            &cpq);
+#if defined(WINMALI_PRESENT_PROBE)
+      DebugPrintf("[WinMaliInit] CreatePagingQueue END device=%p hr=0x%08x\n", pDevice, hr);
+#endif
       if (SUCCEEDED(hr)) {
          pDevice->hPagingQueue = cpq.hPagingQueue;
          pDevice->hPagingFence = cpq.hSyncObject;
@@ -103,8 +106,19 @@ WinMaliWddmWaitPagingFence(Device *pDevice, UINT64 value,
    wait.FenceValueArray   = &value;
    wait.hAsyncEvent       = NULL;
 
+#if defined(WINMALI_PRESENT_PROBE)
+   static volatile LONG initWaitSequence = 0;
+   const bool traceWait = InterlockedIncrement(&initWaitSequence) <= 8;
+   if (traceWait)
+      DebugPrintf("[WinMaliInit] PagingWait BEGIN device=%p allocation=%u value=%llu\n",
+                  pDevice, kmt_handle, (unsigned long long)value);
+#endif
    HRESULT hr = pDevice->KTCallbacks.pfnWaitForSynchronizationObjectFromCpuCb(
       pDevice->hDevice, &wait);
+#if defined(WINMALI_PRESENT_PROBE)
+   if (traceWait)
+      DebugPrintf("[WinMaliInit] PagingWait END device=%p hr=0x%08x\n", pDevice, hr);
+#endif
    if (FAILED(hr)) {
       DebugPrintf("WinMali: %s paging-fence wait failed alloc=%u value=%llu hr=0x%08x\n",
                   operation, kmt_handle, (unsigned long long)value, hr);
@@ -148,6 +162,11 @@ WinMaliWddmAllocCb(void *cookie, uint64_t size, uint32_t *out_kmt_handle,
                    void **out_cpu)
 {
    Device *pDevice = static_cast<Device *>(cookie);
+   bool traceInit = false;
+#if defined(WINMALI_PRESENT_PROBE)
+   static volatile LONG initAllocSequence = 0;
+   traceInit = InterlockedIncrement(&initAllocSequence) <= 8;
+#endif
    if (out_cpu)
       *out_cpu = NULL;
 
@@ -167,7 +186,13 @@ WinMaliWddmAllocCb(void *cookie, uint64_t size, uint32_t *out_kmt_handle,
    allocCb.NumAllocations  = 1;
    allocCb.pAllocationInfo = &ai;
 
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] Allocate BEGIN device=%p size=%llu\n", pDevice,
+                  (unsigned long long)size);
    HRESULT hr = pDevice->KTCallbacks.pfnAllocateCb(pDevice->hDevice, &allocCb);
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] Allocate END device=%p hr=0x%08x allocation=%u\n",
+                  pDevice, hr, ai.hAllocation);
    if (FAILED(hr) || ai.hAllocation == 0)
       return -1;
 
@@ -175,7 +200,14 @@ WinMaliWddmAllocCb(void *cookie, uint64_t size, uint32_t *out_kmt_handle,
     * residency reference for the BO's lifetime before mapping or submitting it.
     * LockCb below provides persistent CPU access; it is not a substitute for
     * adding the allocation to the device residency list. */
-   if (WinMaliWddmEnsurePagingQueue(pDevice) != 0 ||
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] PagingQueue BEGIN device=%p\n", pDevice);
+   const int pagingQueueResult = WinMaliWddmEnsurePagingQueue(pDevice);
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] PagingQueue END device=%p result=%d queue=%u fence=%u makeResidentAvailable=%u\n",
+                  pDevice, pagingQueueResult, pDevice->hPagingQueue,
+                  pDevice->hPagingFence, pDevice->KTCallbacks.pfnMakeResidentCb != NULL);
+   if (pagingQueueResult != 0 ||
        pDevice->KTCallbacks.pfnMakeResidentCb == NULL) {
       DebugPrintf("WinMali: MakeResident unavailable alloc=%u\n",
                   ai.hAllocation);
@@ -195,7 +227,12 @@ WinMaliWddmAllocCb(void *cookie, uint64_t size, uint32_t *out_kmt_handle,
    resident.NumAllocations = 1;
    resident.AllocationList = &residentAllocation;
 
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] MakeResident BEGIN device=%p allocation=%u\n", pDevice, ai.hAllocation);
    hr = pDevice->KTCallbacks.pfnMakeResidentCb(pDevice->hDevice, &resident);
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] MakeResident END device=%p hr=0x%08x count=%u fence=%llu\n",
+                  pDevice, hr, resident.NumAllocations, (unsigned long long)resident.PagingFenceValue);
    if ((FAILED(hr) && hr != E_PENDING) || resident.NumAllocations != 1 ||
        WinMaliWddmWaitPagingFence(pDevice, resident.PagingFenceValue,
                                   "MakeResident", ai.hAllocation) != 0) {
@@ -224,7 +261,11 @@ WinMaliWddmAllocCb(void *cookie, uint64_t size, uint32_t *out_kmt_handle,
    memset(&lockCb, 0, sizeof lockCb);
    lockCb.hAllocation      = ai.hAllocation;
    lockCb.Flags.LockEntire = 1;
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] Lock BEGIN device=%p allocation=%u\n", pDevice, ai.hAllocation);
    hr = pDevice->KTCallbacks.pfnLockCb(pDevice->hDevice, &lockCb);
+   if (traceInit)
+      DebugPrintf("[WinMaliInit] Lock END device=%p hr=0x%08x cpu=%p\n", pDevice, hr, lockCb.pData);
    if (FAILED(hr)) {
       WinMaliWddmEvictAllocation(pDevice, ai.hAllocation);
       D3DKMT_HANDLE handleList[1] = { ai.hAllocation };
@@ -841,15 +882,18 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
       _Blt;
 
 
-   /* Return S_OK so DXGI ENABLES the shared-resource presentation path to
-    * communicate with DWM. Returning DXGI_STATUS_NO_REDIRECTION opts out of
-    * that path - which is fatal for a render-only adapter, because with no
-    * scanout the DWM shared-surface blt (BltDXGI -> _Blt) is the only way a
-    * rendered frame reaches the screen. With this on, DXGI sets up the shared
-    * destination surface and drives BltDXGI; _Blt copies the backbuffer into it
-    * and DWM composites it. */
+#if defined(_WIN32) && defined(HAVE_WINMALI_WDDM_KMOD)
+   /* WinMali does not implement the D3D9 shared-hardware interoperability
+    * required by DXGI's shared-resource redirection path. Request the
+    * PresentDXGI path with CPU-accessible swap-chain resources instead.
+    * NO_REDIRECTION is a success status; device creation is complete. */
+   DebugPrintf("[WinMaliUmdDiag] CreateDevice EXIT hr=0x%08lx presentation=no-redirection\n",
+               (unsigned long)DXGI_STATUS_NO_REDIRECTION);
+   return DXGI_STATUS_NO_REDIRECTION;
+#else
    DebugPrintf("[WinMaliUmdDiag] CreateDevice EXIT hr=0x%08lx\n", S_OK);
    return S_OK;
+#endif
 }
 
 

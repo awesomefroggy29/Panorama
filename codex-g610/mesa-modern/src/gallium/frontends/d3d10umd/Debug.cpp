@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(WINMALI_PRESENT_PROBE) && defined(HAVE_WINMALI_WDDM_KMOD)
+#include "panfrost/lib/kmod/winmali/winmali_d3dkmt.h"
+#endif
+
 #if defined(WINMALI_SHADER_CAPTURE)
 void
 WinMaliCaptureRecord(const char *format, ...)
@@ -80,6 +84,26 @@ st_debug_parse(void)
 void
 DebugPrintf(const char *format, ...)
 {
+#if defined(WINMALI_LOG_DISABLED)
+    (void)format;
+    return;
+#endif
+#if defined(WINMALI_PRESENT_PROBE) && defined(HAVE_WINMALI_WDDM_KMOD)
+    /* Initialization failures must survive Focused filtering and reach gpu.log.
+     * Do not forward general per-draw chatter through the escape transport. */
+    if (format &&
+        (strncmp(format, "[WinMaliInit]", 13) == 0 ||
+         strncmp(format, "[WinMaliUmdDiag] CreateDevice", 28) == 0)) {
+        char initLine[2048];
+        va_list initArgs;
+        va_start(initArgs, format);
+        vsnprintf(initLine, sizeof(initLine), format, initArgs);
+        va_end(initArgs);
+        OutputDebugStringA(initLine);
+        winmali_d3dkmt_log("%s", initLine);
+        return;
+    }
+#endif
 #if defined(WINMALI_LOG_LIFECYCLE)
     (void)format;
     return;

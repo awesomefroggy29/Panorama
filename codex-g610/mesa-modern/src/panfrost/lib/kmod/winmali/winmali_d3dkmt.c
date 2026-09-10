@@ -29,6 +29,7 @@ typedef LONG NTSTATUS;
 #include "WinMaliEscape.h"
 #include "WinMaliDiagnostic.h"
 #include "WinMaliWddmBridge.h"
+#define WINMALI_D3DKMT_LOG_IMPLEMENTATION 1
 #include "winmali_d3dkmt.h"
 
 /* gdi32 thunk pointers + the singleton handle pair. */
@@ -56,8 +57,10 @@ static struct {
 
 static SRWLOCK g_wm_lock = SRWLOCK_INIT;
 
+#if !defined(WINMALI_LOG_DISABLED)
 static void winmali_log_sink(enum mesa_log_level level, const char *tag,
                              const char *msg);
+#endif
 
 static int
 escape_send(D3DKMT_HANDLE adapter, D3DKMT_HANDLE device, void *buf, uint32_t size)
@@ -115,8 +118,10 @@ probe(D3DKMT_HANDLE adapter, D3DKMT_HANDLE device)
 static void
 winmali_d3dkmt_reset_locked(void)
 {
+#if !defined(WINMALI_LOG_DISABLED)
    if (g_wm.open)
       mesa_log_set_extra_sink(NULL);
+#endif
    if (g_wm.device && g_wm.destroy_device) {
       D3DKMT_DESTROYDEVICE dd = { 0 };
       dd.hDevice = g_wm.device;
@@ -217,9 +222,11 @@ winmali_d3dkmt_open(void)
          /* From here the KMD's UART can carry our logs: register the
           * mesa_log mirror and announce ourselves so the serial shows
           * which process bound the adapter. */
+#if !defined(WINMALI_LOG_DISABLED)
          mesa_log_set_extra_sink(winmali_log_sink);
          winmali_d3dkmt_log("wm: adapter bound (hAdapter=0x%x hDevice=0x%x)",
                             g_wm.adapter, g_wm.device);
+#endif
          ReleaseSRWLockExclusive(&g_wm_lock);
          return 0;
       }
@@ -274,6 +281,12 @@ winmali_d3dkmt_diag_record(uint32_t batch_sequence,
                            const void *stream_cpu,
                            uint32_t stream_size)
 {
+#if defined(WINMALI_LOG_DISABLED)
+   (void)batch_sequence;
+   (void)stream_gpu_va;
+   (void)stream_cpu;
+   (void)stream_size;
+#else
    struct {
       WINMALI_ESCAPE_HEADER hdr;
       WINMALI_DIAG_CONTROL control;
@@ -309,19 +322,25 @@ winmali_d3dkmt_diag_record(uint32_t batch_sequence,
    /* Recorder availability must never influence rendering. */
    (void)winmali_d3dkmt_escape(buf, sizeof(*buf));
    free(buf);
+#endif
 }
 
 /* ---- UMD -> UART log mirroring (WinMaliEscapeOp_DebugLog) ------------- */
 
+#if !defined(WINMALI_LOG_DISABLED)
 /* Muted after the first -EOPNOTSUPP so an old KMD costs one escape total. */
 static bool g_log_unsupported;
 /* Reentrancy guard: a failing DebugLog escape must not log its own
  * failure back into this path (escape_send errors go via mesa_log too). */
 static _Thread_local bool g_in_log;
+#endif
 
 void
 winmali_d3dkmt_log(const char *fmt, ...)
 {
+#if defined(WINMALI_LOG_DISABLED)
+   (void)fmt;
+#else
    struct {
       WINMALI_ESCAPE_HEADER hdr;
       WINMALI_DEBUG_LOG     body;
@@ -357,10 +376,12 @@ winmali_d3dkmt_log(const char *fmt, ...)
 
    if (err == -EOPNOTSUPP)
       g_log_unsupported = true;
+#endif
 }
 
 /* mesa_log extra sink: every mesa_loge/logw/logi/logd in the process,
  * already formatted "tag: level: text". */
+#if !defined(WINMALI_LOG_DISABLED)
 static void
 winmali_log_sink(enum mesa_log_level level, const char *tag, const char *msg)
 {
@@ -368,6 +389,7 @@ winmali_log_sink(enum mesa_log_level level, const char *tag, const char *msg)
    (void)tag;
    winmali_d3dkmt_log("%s", msg);
 }
+#endif
 
 /* ---- drm_syncobj wiring (WinMaliEscapeOp_SyncObj*) -------------------- */
 /* pan_context.c / pan_csf.c call libdrm's drmSyncobj* directly (not via the

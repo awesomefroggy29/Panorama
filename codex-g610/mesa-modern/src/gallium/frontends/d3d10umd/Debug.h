@@ -33,7 +33,8 @@ void st_debug_parse(void);
 #endif
 
 
-#if defined(WINMALI_LOG_LIFECYCLE) && !defined(WINMALI_DEBUG_IMPLEMENTATION)
+#if (defined(WINMALI_LOG_DISABLED) || defined(WINMALI_LOG_LIFECYCLE)) && \
+    !defined(WINMALI_DEBUG_IMPLEMENTATION)
 #define DebugPrintf(...) ((void)0)
 #else
 void

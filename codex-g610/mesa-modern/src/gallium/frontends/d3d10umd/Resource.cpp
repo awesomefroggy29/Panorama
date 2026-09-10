@@ -822,9 +822,21 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
          return;
       }
 
-      /* Linear layout for compositor-visible surfaces. */
-      unsigned stride = templat.width0 * bpp;
-      uint64_t allocSize = (uint64_t)stride * templat.height0;
+      /* Panfrost linear images require a cache-line-aligned explicit row
+       * stride.  Keep the value passed to KMD and the winsys import identical
+       * so both sides describe the same allocation layout. */
+      const uint64_t rowBytes = (uint64_t)templat.width0 * bpp;
+      if (rowBytes > 0xffffffffull - 63ull) {
+         DebugPrintf("%s: presentable resource row stride overflow "
+                     "width=%u bpp=%u\n",
+                     __func__, templat.width0, bpp);
+         SetError(hDevice, E_INVALIDARG);
+         return;
+      }
+
+      const unsigned stride =
+         (unsigned)ALIGN_POT(rowBytes, UINT64_C(64));
+      const uint64_t allocSize = (uint64_t)stride * templat.height0;
 
       WINMALI_ALLOCATION_PRIVATE allocPriv;
       memset(&allocPriv, 0, sizeof allocPriv);
@@ -1405,13 +1417,51 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
    }
    free(pResource->transfers);
 
+#if defined(_WIN32) && defined(HAVE_WINMALI_WDDM_KMOD)
+   /* The Gallium BO reference and the WDDM allocation are two views of the
+    * same storage, but their lifetime tracking is independent.  In
+    * particular, dropping the pipe_resource below only defers Panfrost's VM
+    * unmap; pfnDeallocateCb may immediately make the VidMm allocation's PTEs
+    * invalid.  A resize can therefore reclaim a backbuffer while an already
+    * submitted CSF fragment job is still reading it.
+    *
+    * Finish this context's submitted work while both ownership references
+    * are still alive.  The normal path completes in a few milliseconds.  A
+    * finite upper bound prevents a lost GPU from hanging Explorer forever;
+    * on failure we intentionally retain the WDDM allocation below rather
+    * than turn a timeout into a GPU use-after-free. */
+   bool releaseKMAllocation = true;
+   if (pResource->hKMAllocation) {
+      struct pipe_fence_handle *fence = NULL;
+      pipe->flush(pipe, &fence, PIPE_FLUSH_HINT_FINISH);
+
+      if (!fence) {
+         releaseKMAllocation = false;
+         DebugPrintf("[WinMaliLifetime] DestroyResource allocation=%u "
+                     "result=no-fence retained=1\n",
+                     pResource->hKMAllocation);
+      } else {
+         const uint64_t waitNs = UINT64_C(1000000000);
+         releaseKMAllocation =
+            pipe->screen->fence_finish(pipe->screen, pipe, fence, waitNs);
+         pipe->screen->fence_reference(pipe->screen, &fence, NULL);
+         DebugPrintf("[WinMaliLifetime] DestroyResource allocation=%u "
+                     "waitNs=%llu complete=%u retained=%u\n",
+                     pResource->hKMAllocation,
+                     (unsigned long long)waitNs,
+                     releaseKMAllocation ? 1u : 0u,
+                     releaseKMAllocation ? 0u : 1u);
+      }
+   }
+#endif
+
    pipe_resource_reference(&pResource->resource, NULL);
 
 #if defined(_WIN32) && defined(HAVE_WINMALI_WDDM_KMOD)
    /* Release residency/CPU-map references for both allocations created by
     * this UMD and borrowed allocations imported by OpenResource. Only the
     * creator owns the final pfnDeallocateCb operation. */
-   if (pResource->hKMAllocation) {
+   if (pResource->hKMAllocation && releaseKMAllocation) {
       Device *pDevice = CastDevice(hDevice);
       if (pResource->kmAllocationLocked) {
          D3DDDICB_UNLOCK unlockCb;
@@ -1436,6 +1486,20 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
          dealloc.hResource = pResource->hRTResource;
          pDevice->KTCallbacks.pfnDeallocateCb(pDevice->hDevice, &dealloc);
       }
+      pResource->ownsKMAllocation = false;
+      pResource->hRTResource      = NULL;
+      pResource->hKMAllocation    = 0;
+      pResource->hKMResource      = 0;
+   } else if (pResource->hKMAllocation) {
+      /* The DDI private Resource storage disappears after this callback, so
+       * these handles cannot be reclaimed later from here.  Leaking an
+       * allocation only on a failed/lost-device path is safer than allowing
+       * VidMm to invalidate storage still referenced by the GPU. */
+      DebugPrintf("[WinMaliLifetime] DestroyResource resource=%p "
+                  "kmResource=%u allocation=%u owner=%u retained-after-wait\n",
+                  hResource.pDrvPrivate, pResource->hKMResource,
+                  pResource->hKMAllocation,
+                  pResource->ownsKMAllocation ? 1u : 0u);
       pResource->ownsKMAllocation = false;
       pResource->hRTResource      = NULL;
       pResource->hKMAllocation    = 0;

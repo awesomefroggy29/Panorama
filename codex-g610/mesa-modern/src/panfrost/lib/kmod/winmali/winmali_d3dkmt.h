@@ -77,15 +77,25 @@ int winmali_d3dkmt_syncobj_transfer(uint32_t dst, uint64_t dst_point,
  * or when re-entered from its own escape path. winmali_d3dkmt_open()
  * also registers a mesa_log extra sink so every mesa_loge/logw/logi in
  * the process flows here automatically. */
+#if defined(WINMALI_LOG_DISABLED) && \
+    !defined(WINMALI_D3DKMT_LOG_IMPLEMENTATION)
+#define winmali_d3dkmt_log(...) ((void)0)
+#else
 void winmali_d3dkmt_log(const char *fmt, ...);
+#endif
 
 /* Copy the finalized root CS into the KMD's bounded flight recorder before
  * the WDDM packet is queued. Diagnostic only: failure/old KMD is ignored and
  * never changes submission behavior. */
+#if defined(WINMALI_LOG_DISABLED) && \
+    !defined(WINMALI_D3DKMT_LOG_IMPLEMENTATION)
+#define winmali_d3dkmt_diag_record(...) ((void)0)
+#else
 void winmali_d3dkmt_diag_record(uint32_t batch_sequence,
                                 uint64_t stream_gpu_va,
                                 const void *stream_cpu,
                                 uint32_t stream_size);
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

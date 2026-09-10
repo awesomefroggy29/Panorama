@@ -110,10 +110,14 @@ void _debug_vprintf(const char *format, va_list ap);
 static inline void
 _debug_printf(const char *format, ...)
 {
+#if defined(WINMALI_LOG_DISABLED)
+   (void)format;
+#else
    va_list ap;
    va_start(ap, format);
    _debug_vprintf(format, ap);
    va_end(ap);
+#endif
 }
 
 
@@ -133,7 +137,9 @@ debug_printf(const char *format, ...) _util_printf_format(1,2);
 static inline void
 debug_printf(const char *format, ...)
 {
-#if MESA_DEBUG
+#if defined(WINMALI_LOG_DISABLED)
+   (void)format;
+#elif MESA_DEBUG
    va_list ap;
    va_start(ap, format);
    _debug_vprintf(format, ap);

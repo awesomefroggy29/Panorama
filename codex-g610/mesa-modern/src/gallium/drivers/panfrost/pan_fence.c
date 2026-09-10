@@ -109,6 +109,37 @@ struct pipe_fence_handle *
 panfrost_fence_create(struct panfrost_context *ctx)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+#ifdef _WIN32
+   /* WinMali has native binary syncobjs but no Linux sync-file FD namespace.
+    * Snapshot the current generation of the context fence directly: a binary
+    * source point of zero means "the generation submitted at transfer time",
+    * and a binary destination point of zero creates a new pending generation.
+    * The resulting fence is therefore independent of later submissions that
+    * replace ctx->syncobj, just like the sync-file import path below. */
+   struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+   if (!f)
+      return NULL;
+
+   int ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &f->syncobj);
+   if (ret) {
+      mesa_loge("create fence syncobj failed\n");
+      free(f);
+      return NULL;
+   }
+
+   ret = drmSyncobjTransfer(panfrost_device_fd(dev), f->syncobj, 0,
+                            ctx->syncobj, 0, 0);
+   if (ret) {
+      mesa_loge("snapshot fence syncobj failed\n");
+      drmSyncobjDestroy(panfrost_device_fd(dev), f->syncobj);
+      free(f);
+      return NULL;
+   }
+
+   pipe_reference_init(&f->reference, 1);
+   return f;
+#else
    int fd = -1, ret;
 
    /* Snapshot the last rendering out fence. We'd rather have another
@@ -128,4 +159,5 @@ panfrost_fence_create(struct panfrost_context *ctx)
    close(fd);
 
    return f;
+#endif
 }

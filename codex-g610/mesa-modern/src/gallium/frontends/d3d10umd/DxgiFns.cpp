@@ -41,6 +41,68 @@
 #include "Debug.h"
 
 #include "util/format/u_format.h"
+#include "util/log.h"
+
+#if defined(WINMALI_PRESENT_PROBE)
+static volatile LONG g_WinMaliPresentProbeSequence;
+static volatile LONG g_WinMaliBltProbeSequence;
+
+static bool
+WinMaliPresentProbeHash(struct pipe_context *pipe,
+                        struct pipe_resource *resource,
+                        const char *label,
+                        LONG sequence)
+{
+   if (!pipe || !resource || resource->target == PIPE_BUFFER ||
+       !resource->width0 || !resource->height0 || resource->depth0 != 1) {
+      mesa_logi("[WinMaliPresent] %s seq=%ld hash=skipped resource=%p", label,
+                sequence, resource);
+      return false;
+   }
+
+   const unsigned bytesPerPixel = util_format_get_blocksize(resource->format);
+   if (!bytesPerPixel || util_format_is_compressed(resource->format)) {
+      mesa_logi("[WinMaliPresent] %s seq=%ld hash=unsupported resource=%p "
+                "format=%s", label, sequence, resource,
+                util_format_name(resource->format));
+      return false;
+   }
+
+   struct pipe_box box = {};
+   box.width = static_cast<decltype(box.width)>(resource->width0);
+   box.height = static_cast<decltype(box.height)>(resource->height0);
+   box.depth = 1;
+   struct pipe_transfer *transfer = NULL;
+   const uint8_t *map = (const uint8_t *)pipe->texture_map(
+      pipe, resource, 0, PIPE_MAP_READ, &box, &transfer);
+   if (!map || !transfer) {
+      mesa_logi("[WinMaliPresent] %s seq=%ld hash=map-failed resource=%p "
+                "size=%ux%u format=%s", label, sequence, resource,
+                resource->width0, resource->height0,
+                util_format_name(resource->format));
+      return false;
+   }
+
+   uint32_t hash = 2166136261u;
+   uint64_t nonzero = 0;
+   const size_t rowBytes = (size_t)resource->width0 * bytesPerPixel;
+   for (unsigned y = 0; y < resource->height0; ++y) {
+      const uint8_t *row = map + (size_t)y * transfer->stride;
+      for (size_t x = 0; x < rowBytes; ++x) {
+         hash = (hash ^ row[x]) * 16777619u;
+         nonzero += row[x] != 0;
+      }
+   }
+
+   mesa_logi("[WinMaliPresent] %s seq=%ld hash=0x%08x nonzero=%llu "
+             "resource=%p size=%ux%u stride=%u format=%s", label, sequence,
+             hash, (unsigned long long)nonzero, resource, resource->width0,
+             resource->height0, transfer->stride,
+             util_format_name(resource->format));
+   pipe->texture_unmap(pipe, transfer);
+   return true;
+}
+#endif
 
 static bool
 WinMaliCaptureTargetProcess(void)
@@ -57,7 +119,12 @@ WinMaliCaptureTargetProcess(void)
           _stricmp(name, "ShellHost.exe") == 0 ||
           _stricmp(name, "Explorer.exe") == 0 ||
           _stricmp(name, "SystemSettings.exe") == 0 ||
-          _stricmp(name, "dwm.exe") == 0;
+          _stricmp(name, "dwm.exe") == 0
+#if defined(WINMALI_PRESENT_PROBE)
+          || _stricmp(name, "d3dtri.exe") == 0
+          || _stricmp(name, "WinMaliTriangleReplay.exe") == 0
+#endif
+          ;
 }
 
 
@@ -86,10 +153,47 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
 
    struct Device *device = CastDevice(pPresentData->hDevice);
    Resource *pSrcResource = CastResource(pPresentData->hSurfaceToPresent);
+#if defined(WINMALI_PRESENT_PROBE)
+   const LONG presentSequence = InterlockedIncrement(
+      &g_WinMaliPresentProbeSequence);
+   const bool tracePresent = presentSequence <= 12;
+   Resource *pDstResource = CastResource(pPresentData->hDstResource);
+   if (tracePresent) {
+      struct pipe_resource *src = pSrcResource ? pSrcResource->resource : NULL;
+      struct pipe_resource *dst = pDstResource ? pDstResource->resource : NULL;
+      mesa_logi("[WinMaliPresent] Present ENTER seq=%ld path=%s flags=0x%x "
+                "srcHandle=%p src=%p srcAlloc=%p srcSize=%ux%u srcFormat=%s "
+                "dstHandle=%p dst=%p dstAlloc=%p dstSize=%ux%u dstFormat=%s "
+                "dxgiContext=%p", presentSequence, dst ? "redirected-copy" :
+                "present-callback", pPresentData->Flags.Value,
+                (void *)(uintptr_t)pPresentData->hSurfaceToPresent, src,
+                pSrcResource ? (void *)(uintptr_t)pSrcResource->hKMAllocation : NULL,
+                src ? src->width0 : 0, src ? src->height0 : 0,
+                src ? util_format_name(src->format) : "none",
+                (void *)(uintptr_t)pPresentData->hDstResource, dst,
+                pDstResource ? (void *)(uintptr_t)pDstResource->hKMAllocation : NULL,
+                dst ? dst->width0 : 0, dst ? dst->height0 : 0,
+                dst ? util_format_name(dst->format) : "none",
+                pPresentData->pDXGIContext);
+   }
+#endif
 
    DebugPrintf("WinMali: DXGI Present flush-before ENTER device=%p\n", device);
    device->pipe->flush(device->pipe, NULL, 0);
    DebugPrintf("WinMali: DXGI Present flush-before EXIT device=%p\n", device);
+
+#if defined(WINMALI_PRESENT_PROBE)
+   /* Establish whether the application's rendered pixels are already present
+    * in the swap-chain allocation at the exact UMD -> DXGI handoff.  Keep the
+    * synchronized readback bounded: mapping every presented frame changes
+    * timing enough to hide the presentation bug we are trying to isolate. */
+   if (presentSequence <= 3) {
+      struct pipe_resource *src =
+         pSrcResource ? pSrcResource->resource : NULL;
+      WinMaliPresentProbeHash(device->pipe, src, "Present source-before-callback",
+                              presentSequence);
+   }
+#endif
 
    /* DirectComposition applications present several independent surfaces, so
     * a single process-wide snapshot can miss the text/icon layer entirely.
@@ -155,6 +259,14 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
                                             src, 0, &box);
          DebugPrintf("WinMali: DXGI Present redirected-flush ENTER\n");
          device->pipe->flush(device->pipe, NULL, 0);
+#if defined(WINMALI_PRESENT_PROBE)
+         if (tracePresent && presentSequence <= 4)
+            WinMaliPresentProbeHash(device->pipe, dst, "Present redirected-dst",
+                                    presentSequence);
+         if (tracePresent)
+            mesa_logi("[WinMaliPresent] Present EXIT seq=%ld "
+                      "path=redirected-copy hr=0x%08x", presentSequence, S_OK);
+#endif
          DebugPrintf("WinMali: DXGI Present redirected-flush EXIT\n");
          DebugPrintf("WinMali: DXGI Present redirected-copy EXIT hr=0x%08x\n", S_OK);
          return S_OK;
@@ -191,13 +303,11 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
                   device->hContext);
    }
 
-   /* Kernel present. The backbuffer is a real D3DKMT allocation that the
-    * GPU rendered into via the BoFromAllocation alias, and WinMali submits
-    * are synchronous, so the pixels are in the allocation once flush()
-    * returns. hDstAllocation = 0 lets the runtime route the present to the
-    * proper target (DWM redirection / cross-adapter surface); dxgk then
-    * calls the KMD's DxgkDdiPresent, which records the blt executed by
-    * SubmitCommand.
+   /* Hand the allocation to DXGI after submitting its rendering commands.
+    * flush() submits work; it does not by itself guarantee GPU completion.
+    * With no explicit destination resource, hDstAllocation = 0 leaves
+    * destination selection to the runtime. The callback's success status
+    * records acceptance, not proof that the pixels reached the display.
     *
     * _Present is a DXGI DDI entry point, so it must use the DXGI callback
     * table supplied in DXGIBaseDDI.  D3DDDI_DEVICECALLBACKS::pfnPresentCb
@@ -221,6 +331,14 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
                   pPresentData->pDXGIContext);
       HRESULT hr = device->pDXGIBaseCallbacks->pfnPresentCb(device->hDevice,
                                                            &presentCb);
+#if defined(WINMALI_PRESENT_PROBE)
+      if (tracePresent)
+         mesa_logi("[WinMaliPresent] Present EXIT seq=%ld "
+                   "path=present-callback srcAlloc=%p context=%p hr=0x%08x",
+                   presentSequence,
+                   (void *)(uintptr_t)pSrcResource->hKMAllocation,
+                   (void *)device->hContext, hr);
+#endif
       DebugPrintf("WinMali: DXGI Present pfnPresentCb EXIT hr=0x%08x srcAlloc=%p context=%p\n",
                   hr, (void *)(uintptr_t)pSrcResource->hKMAllocation,
                   (void *)device->hContext);
@@ -235,6 +353,12 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
                device->pDXGIBaseCallbacks
                   ? (void *)device->pDXGIBaseCallbacks->pfnPresentCb
                   : NULL);
+#if defined(WINMALI_PRESENT_PROBE)
+   if (tracePresent)
+      mesa_logi("[WinMaliPresent] Present EXIT seq=%ld "
+                "path=present-callback-unavailable hr=0x%08x",
+                presentSequence, E_FAIL);
+#endif
    return E_FAIL;
 #endif
 
@@ -455,9 +579,35 @@ _Blt(DXGI_DDI_ARG_BLT *Blt)
     * scanout, so this copy is the ONLY way pixels reach the screen. (Previously
     * this was a no-op, so DWM's surface stayed blank -> white window.) */
    Device *pDevice = CastDevice(Blt->hDevice);
-   struct pipe_resource *dst = CastPipeResource(Blt->hDstResource);
-   struct pipe_resource *src = CastPipeResource(Blt->hSrcResource);
+   Resource *pDstResource = CastResource(Blt->hDstResource);
+   Resource *pSrcResource = CastResource(Blt->hSrcResource);
+   struct pipe_resource *dst = pDstResource ? pDstResource->resource : NULL;
+   struct pipe_resource *src = pSrcResource ? pSrcResource->resource : NULL;
+#if defined(WINMALI_PRESENT_PROBE)
+   const LONG bltSequence = InterlockedIncrement(&g_WinMaliBltProbeSequence);
+   const bool traceBlt = bltSequence <= 12;
+   if (traceBlt) {
+      mesa_logi("[WinMaliPresent] Blt ENTER seq=%ld present=%u "
+                "srcHandle=%p src=%p srcAlloc=%p srcSize=%ux%u srcFormat=%s "
+                "dstHandle=%p dst=%p dstAlloc=%p dstSize=%ux%u dstFormat=%s "
+                "dstRect=%u,%u-%u,%u", bltSequence, Blt->Flags.Present,
+                (void *)(uintptr_t)Blt->hSrcResource, src,
+                pSrcResource ? (void *)(uintptr_t)pSrcResource->hKMAllocation : NULL,
+                src ? src->width0 : 0, src ? src->height0 : 0,
+                src ? util_format_name(src->format) : "none",
+                (void *)(uintptr_t)Blt->hDstResource, dst,
+                pDstResource ? (void *)(uintptr_t)pDstResource->hKMAllocation : NULL,
+                dst ? dst->width0 : 0, dst ? dst->height0 : 0,
+                dst ? util_format_name(dst->format) : "none", Blt->DstLeft,
+                Blt->DstTop, Blt->DstRight, Blt->DstBottom);
+   }
+#endif
    if (pDevice == NULL || dst == NULL || src == NULL) {
+#if defined(WINMALI_PRESENT_PROBE)
+      if (traceBlt)
+         mesa_logi("[WinMaliPresent] Blt EXIT seq=%ld path=no-op hr=0x%08x",
+                   bltSequence, S_OK);
+#endif
       DebugPrintf("WinMali: DXGI Blt EXIT no-op device=%p src=%p dst=%p hr=0x%08x\n",
                   pDevice, src, dst, S_OK);
       return S_OK;
@@ -502,6 +652,16 @@ _Blt(DXGI_DDI_ARG_BLT *Blt)
    }
    DebugPrintf("WinMali: DXGI Blt flush ENTER src=%p dst=%p\n", src, dst);
    pipe->flush(pipe, NULL, 0);
+#if defined(WINMALI_PRESENT_PROBE)
+   if (traceBlt && bltSequence <= 4)
+      WinMaliPresentProbeHash(pipe, dst, "Blt dst", bltSequence);
+   if (traceBlt)
+      mesa_logi("[WinMaliPresent] Blt EXIT seq=%ld path=%s hr=0x%08x",
+                bltSequence,
+                info.dst.box.width == info.src.box.width &&
+                info.dst.box.height == info.src.box.height &&
+                dst->format == src->format ? "copy" : "shader-blit", S_OK);
+#endif
    DebugPrintf("[WinMaliFlow] DXGI Blt EXIT hr=0x%08x\n", S_OK);
    return S_OK;
 }
