@@ -1297,8 +1297,8 @@ WinMaliKmdQueryCurrentFence(
 static VOID
 WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
 {
-    PWINMALI_KMD_OPEN_ALLOCATION src = d->Src;
-    PWINMALI_KMD_OPEN_ALLOCATION dst = d->Dst;
+    PWINMALI_KMD_ALLOCATION src = d->Src;
+    PWINMALI_KMD_ALLOCATION dst = d->Dst;
     PUCHAR srcBase, dstBase;
     SIZE_T srcBytes, dstBytes;
     ULONG  srcPitch, dstPitch;
@@ -1306,17 +1306,14 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
     const ULONG bpp = 4;   /* swapchain / GDI surfaces are 32bpp linear */
 
     if (src == NULL || dst == NULL ||
-        src->Magic != WINMALI_KMD_OPEN_ALLOC_MAGIC ||
-        dst->Magic != WINMALI_KMD_OPEN_ALLOC_MAGIC) {
+        src->Magic != WINMALI_KMD_ALLOC_MAGIC ||
+        dst->Magic != WINMALI_KMD_ALLOC_MAGIC) {
         WINMALI_WARN("PresentBlt: bad allocation descriptors (src=%p dst=%p)", src, dst);
         return;
     }
-    if (src->Global == NULL || dst->Global == NULL ||
-        src->Global->ApertureMdl == NULL ||
-        dst->Global->ApertureMdl == NULL) {
+    if (src->ApertureMdl == NULL || dst->ApertureMdl == NULL) {
         WINMALI_WARN("PresentBlt: not resident (srcMdl=%p dstMdl=%p) - frame dropped",
-                     src->Global ? src->Global->ApertureMdl : NULL,
-                     dst->Global ? dst->Global->ApertureMdl : NULL);
+                     src->ApertureMdl, dst->ApertureMdl);
         return;
     }
 
@@ -1328,19 +1325,19 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
         return;
     }
 
-    srcBase = (PUCHAR)MmGetSystemAddressForMdlSafe(src->Global->ApertureMdl,
+    srcBase = (PUCHAR)MmGetSystemAddressForMdlSafe(src->ApertureMdl,
                                                    NormalPagePriority | MdlMappingNoExecute);
-    dstBase = (PUCHAR)MmGetSystemAddressForMdlSafe(dst->Global->ApertureMdl,
+    dstBase = (PUCHAR)MmGetSystemAddressForMdlSafe(dst->ApertureMdl,
                                                    NormalPagePriority | MdlMappingNoExecute);
     if (srcBase == NULL || dstBase == NULL) {
         WINMALI_WARN("PresentBlt: MDL map failed (src=%p dst=%p) - frame dropped",
                      srcBase, dstBase);
         return;
     }
-    srcBase += (SIZE_T)src->Global->ApertureMdlOffset << PAGE_SHIFT;
-    dstBase += (SIZE_T)dst->Global->ApertureMdlOffset << PAGE_SHIFT;
-    srcBytes = (SIZE_T)src->Global->AperturePageCount << PAGE_SHIFT;
-    dstBytes = (SIZE_T)dst->Global->AperturePageCount << PAGE_SHIFT;
+    srcBase += (SIZE_T)src->ApertureMdlOffset << PAGE_SHIFT;
+    dstBase += (SIZE_T)dst->ApertureMdlOffset << PAGE_SHIFT;
+    srcBytes = (SIZE_T)src->AperturePageCount << PAGE_SHIFT;
+    dstBytes = (SIZE_T)dst->AperturePageCount << PAGE_SHIFT;
 
     width  = d->DstRight - d->DstLeft;
     height = d->DstBottom - d->DstTop;
@@ -1386,6 +1383,10 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
                   "src[%d,%d] dst[%d,%d]",
                   width, height, srcPitch, srcBytes, dstPitch, dstBytes,
                   d->SrcLeft, d->SrcTop, d->DstLeft, d->DstTop);
+#if defined(WINMALI_PRESENT_PROBE)
+    WINMALI_DIAG("[WinMaliPresentOrder] WorkerCopy size=%ldx%ld src=%p dst=%p",
+                 width, height, src, dst);
+#endif
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1546,12 +1547,40 @@ WinMaliSchedFinishSubmit_(_Inout_ PWINMALI_ADAPTER a,
     }
 }
 
+/* A queued present can outlive the OpenAllocation callback objects. Keep the
+   adapter-global allocations alive until the worker has executed or discarded
+   the ordered blt packet. */
+static VOID
+WinMaliSchedReleaseBlt_(_Inout_ WINMALI_BLT_DESC* blt)
+{
+    PWINMALI_KMD_ALLOCATION allocations[2];
+    ULONG i;
+
+    if (blt == NULL || blt->Magic != WINMALI_BLT_DESC_MAGIC) {
+        return;
+    }
+    allocations[0] = blt->Src;
+    allocations[1] = blt->Dst;
+    blt->Magic = 0;
+    blt->Src = NULL;
+    blt->Dst = NULL;
+    for (i = 0; i < ARRAYSIZE(allocations); ++i) {
+        PWINMALI_KMD_ALLOCATION allocation = allocations[i];
+        if (allocation != NULL &&
+            InterlockedDecrement(&allocation->ReferenceCount) == 0) {
+            allocation->Magic = 0;
+            ExFreePoolWithTag(allocation, WINMALI_POOL_TAG);
+        }
+    }
+}
+
 /* Enqueue a submit request for the worker. A FALSE result is a scheduler
    invariant failure and must enter recovery; it is never a fake completion. */
 static BOOLEAN
 WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
                       _In_ UINT node, _In_ UINT engine,
                       _In_opt_ const WINMALI_CS_SUBMIT_DESC* cs,
+                      _In_opt_ const WINMALI_BLT_DESC* blt,
                       _In_ ULONG asSlot,
                       _In_opt_ PWINMALI_KMD_CONTEXT context)
 {
@@ -1576,6 +1605,7 @@ WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
         a->SubmitQueue[a->SubmitQueueTail].NodeOrdinal   = node;
         a->SubmitQueue[a->SubmitQueueTail].EngineOrdinal = engine;
         a->SubmitQueue[a->SubmitQueueTail].HasCs         = (cs != NULL) ? TRUE : FALSE;
+        a->SubmitQueue[a->SubmitQueueTail].HasBlt        = (blt != NULL) ? TRUE : FALSE;
         a->SubmitQueue[a->SubmitQueueTail].AsSlot        = asSlot;
         a->SubmitQueue[a->SubmitQueueTail].Context       = context;
         a->SubmitQueue[a->SubmitQueueTail].ResetGeneration =
@@ -1585,6 +1615,15 @@ WinMaliSchedEnqueue_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT fence,
         } else {
             RtlZeroMemory(&a->SubmitQueue[a->SubmitQueueTail].Cs,
                           sizeof(a->SubmitQueue[a->SubmitQueueTail].Cs));
+        }
+        if (blt != NULL) {
+            RtlCopyMemory(&a->SubmitQueue[a->SubmitQueueTail].Blt,
+                          blt, sizeof(*blt));
+            InterlockedIncrement(&blt->Src->ReferenceCount);
+            InterlockedIncrement(&blt->Dst->ReferenceCount);
+        } else {
+            RtlZeroMemory(&a->SubmitQueue[a->SubmitQueueTail].Blt,
+                          sizeof(a->SubmitQueue[a->SubmitQueueTail].Blt));
         }
         a->SubmitQueueTail = next;
         KeClearEvent(&a->SubmitWorkerIdle);
@@ -1609,6 +1648,10 @@ WinMaliSchedDrainNodeLocked_(_Inout_ PWINMALI_ADAPTER a, _In_ UINT node)
     while (read != a->SubmitQueueTail) {
         ULONG next = (read + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
         if (a->SubmitQueue[read].NodeOrdinal == node) {
+            if (a->SubmitQueue[read].HasBlt) {
+                WinMaliSchedReleaseBlt_(&a->SubmitQueue[read].Blt);
+                a->SubmitQueue[read].HasBlt = FALSE;
+            }
             WinMaliContextPut_((PWINMALI_KMD_CONTEXT)
                                a->SubmitQueue[read].Context);
             a->SubmitQueue[read].Context = NULL;
@@ -1696,12 +1739,15 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             BOOLEAN have = FALSE;
             UINT    fence = 0, node = 0, engine = 0;
             BOOLEAN hasCs = FALSE;
+            BOOLEAN hasBlt = FALSE;
             ULONG   asSlot = WINMALI_AS_SLOT_MAX;
             PWINMALI_KMD_CONTEXT submitContext = NULL;
             LONG    resetGeneration = 0;
             WINMALI_CS_SUBMIT_DESC cs;
+            WINMALI_BLT_DESC blt;
 
             RtlZeroMemory(&cs, sizeof(cs));
+            RtlZeroMemory(&blt, sizeof(blt));
 
             if (WinMaliSchedHandlePreempt_(a)) {
                 continue;
@@ -1720,6 +1766,7 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                 fence     = a->SubmitQueue[a->SubmitQueueHead].FenceId;
                 engine    = a->SubmitQueue[a->SubmitQueueHead].EngineOrdinal;
                 hasCs     = a->SubmitQueue[a->SubmitQueueHead].HasCs;
+                hasBlt    = a->SubmitQueue[a->SubmitQueueHead].HasBlt;
                 asSlot    = a->SubmitQueue[a->SubmitQueueHead].AsSlot;
                 submitContext = (PWINMALI_KMD_CONTEXT)
                     a->SubmitQueue[a->SubmitQueueHead].Context;
@@ -1728,6 +1775,13 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                 if (hasCs) {
                     RtlCopyMemory(&cs, &a->SubmitQueue[a->SubmitQueueHead].Cs,
                                   sizeof(cs));
+                }
+                if (hasBlt) {
+                    RtlCopyMemory(&blt, &a->SubmitQueue[a->SubmitQueueHead].Blt,
+                                  sizeof(blt));
+                    a->SubmitQueue[a->SubmitQueueHead].HasBlt = FALSE;
+                    RtlZeroMemory(&a->SubmitQueue[a->SubmitQueueHead].Blt,
+                                  sizeof(a->SubmitQueue[a->SubmitQueueHead].Blt));
                 }
                 a->SubmitQueueHead = (a->SubmitQueueHead + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
                 InterlockedExchange(&a->SubmitWorkerActive, 1);
@@ -1757,8 +1811,9 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                 BOOLEAN preemptedBeforeExecution = FALSE;
                 ULONGLONG executeStart100ns = KeQueryInterruptTime();
 
-                WINMALI_ROUTINE("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
-                             fence, node, engine, hasCs, hasCs ? cs.VmId : 0,
+                WINMALI_ROUTINE("CSF WORKER BEGIN: fence=%u node=%u engine=%u hasCs=%u hasBlt=%u vm=%u AS%u stream=0x%llx size=%u syncs=%u",
+                             fence, node, engine, hasCs, hasBlt,
+                             hasCs ? cs.VmId : 0,
                              asSlot, hasCs ? (ULONGLONG)cs.StreamGpuVa : 0,
                              hasCs ? cs.StreamSize : 0,
                              hasCs ? cs.SyncCount : 0);
@@ -1849,10 +1904,12 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                         WinMaliBoFlushVm(a, cs.VmId, TRUE);
                         if (transientVm != NULL || contextLeased) {
                             st = WinMaliCsfSubmitTransientGroupStream(
-                                a, asSlot, cs.StreamGpuVa, cs.StreamSize,
+                                a, asSlot, cs.VmId,
+                                cs.StreamGpuVa, cs.StreamSize,
                                 0u, 500u, &transientParked);
                         } else {
                             st = WinMaliCsfSubmitGroupStream(a, asSlot,
+                                                            cs.VmId,
                                                             cs.StreamGpuVa,
                                                             cs.StreamSize,
                                                             0u, 500u);
@@ -1888,6 +1945,16 @@ WinMaliSchedWorker_(_In_ PVOID Context)
                     if (executionGateHeld) {
                         WinMaliMmuLeaveTransientExecution(a);
                     }
+                }
+                /* Present blts execute in this same FIFO, after every render
+                   packet submitted before them. Copying earlier races CPU
+                   reads/cache maintenance against an in-flight Mali render. */
+                if (hasBlt && NT_SUCCESS(st) &&
+                    resetGeneration ==
+                        InterlockedCompareExchange(
+                            &a->NodeSched[node].ResetGeneration, 0, 0) &&
+                    InterlockedCompareExchange(&a->SubmitWorkerStop, 0, 0) == 0) {
+                    WinMaliPresentExecuteBlt_(&blt);
                 }
                 if (resetGeneration !=
                     InterlockedCompareExchange(&a->NodeSched[node].ResetGeneration, 0, 0) ||
@@ -1943,6 +2010,9 @@ WinMaliSchedWorker_(_In_ PVOID Context)
             KeReleaseSpinLock(&a->SubmitQueueLock, irql);
             WinMaliSchedRequestDpc(a);
             WinMaliContextPut_(submitContext);
+            if (hasBlt) {
+                WinMaliSchedReleaseBlt_(&blt);
+            }
 
             /* Do not execute later packets on a node while dxgkrnl is
                recovering the failed packet. */
@@ -2025,6 +2095,11 @@ WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
     Adapter->SubmitWorkerThread = NULL;
     KeAcquireSpinLock(&Adapter->SubmitQueueLock, &irql);
     while (Adapter->SubmitQueueHead != Adapter->SubmitQueueTail) {
+        if (Adapter->SubmitQueue[Adapter->SubmitQueueHead].HasBlt) {
+            WinMaliSchedReleaseBlt_(
+                &Adapter->SubmitQueue[Adapter->SubmitQueueHead].Blt);
+            Adapter->SubmitQueue[Adapter->SubmitQueueHead].HasBlt = FALSE;
+        }
         WinMaliContextPut_((PWINMALI_KMD_CONTEXT)
             Adapter->SubmitQueue[Adapter->SubmitQueueHead].Context);
         Adapter->SubmitQueue[Adapter->SubmitQueueHead].Context = NULL;
@@ -2037,10 +2112,9 @@ WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
 
 /* DxgkDdiSubmitCommand - enqueue to the async worker (see above) and return.
 
-   For a Blt present the pixel copy (WinMaliPresentExecuteBlt_) runs here
-   first (fast CPU memcpy of an already-rendered backbuffer); only the CSF
-   fence is deferred to the worker. Paging submits carry no private data and
-   just get a fence. */
+   A Blt present is copied into the same FIFO as render work. The worker runs
+   WinMaliPresentExecuteBlt_ only after older rendering has completed, then
+   completes the present fence. Paging submits carry no private data. */
 _Function_class_(DXGKDDI_SUBMITCOMMAND)
 NTSTATUS
 APIENTRY
@@ -2049,6 +2123,10 @@ WinMaliKmdSubmitCommand(
     IN_CONST_PDXGKARG_SUBMITCOMMAND pSubmit)
 {
     PWINMALI_ADAPTER adapter;
+    WINMALI_BLT_DESC bltCopy;
+    const WINMALI_BLT_DESC* queuedBlt = NULL;
+
+    RtlZeroMemory(&bltCopy, sizeof(bltCopy));
 
     if (pSubmit == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2066,16 +2144,17 @@ WinMaliKmdSubmitCommand(
                   pSubmit->DmaBufferSubmissionStartOffset,
                   pSubmit->DmaBufferSubmissionEndOffset);
 
-    /* Present phase-2: a magic'd blt descriptor in the DMA private data
-       means this submit is a DxgkDdiPresent Blt - execute the pixel copy
-       before fencing. Paging submits ride the system context whose
-       DmaBufferPrivateDataSize is 0, so they can never enter here. */
+    /* Copy the transient descriptor into the ordered worker packet. Paging
+       submits have no private data and cannot enter here. */
     if (pSubmit->pDmaBufferPrivateData != NULL &&
         pSubmit->DmaBufferPrivateDataSize >= sizeof(WINMALI_BLT_DESC)) {
         PWINMALI_BLT_DESC blt = (PWINMALI_BLT_DESC)pSubmit->pDmaBufferPrivateData;
-        if (blt->Magic == WINMALI_BLT_DESC_MAGIC) {
-            WinMaliPresentExecuteBlt_(blt);
-            blt->Magic = 0;   /* consume: a TDR resubmit must not replay stale pointers */
+        if (blt->Magic == WINMALI_BLT_DESC_MAGIC &&
+            blt->Src != NULL && blt->Dst != NULL &&
+            blt->Src->Magic == WINMALI_KMD_ALLOC_MAGIC &&
+            blt->Dst->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+            RtlCopyMemory(&bltCopy, blt, sizeof(bltCopy));
+            queuedBlt = &bltCopy;
         }
     }
 
@@ -2094,7 +2173,7 @@ WinMaliKmdSubmitCommand(
                           (LONG64)pSubmit->SubmissionFenceId);
     if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
                                pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
-                               NULL, WINMALI_AS_SLOT_MAX, NULL)) {
+                               NULL, queuedBlt, WINMALI_AS_SLOT_MAX, NULL)) {
         /* The packet was accepted by dxgkrnl but was not queued. Never claim
            completion for work that did not execute; enter the normal TDR
            recovery path instead. */
@@ -2225,8 +2304,8 @@ WinMaliKmdValidateSubmitCommand(
    DDI, not the legacy physical DxgkDdiSubmitCommand - in particular the paging
    buffers for our copy node (node 1). A stubbed NOT_SUPPORTED here bugchecks
    0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR, arg2=0xC00000BB). Behaviour mirrors
-   WinMaliKmdSubmitCommand: run a present blt if tagged, then hand the fence to
-   the async worker and return. */
+   WinMaliKmdSubmitCommand: enqueue a tagged present blt with its fence and
+   return; the async worker preserves render-to-present ordering. */
 _Function_class_(DXGKDDI_SUBMITCOMMANDVIRTUAL)
 NTSTATUS
 APIENTRY
@@ -2237,12 +2316,15 @@ WinMaliKmdSubmitCommandVirtual(
     PWINMALI_ADAPTER adapter;
     WINMALI_CS_SUBMIT_DESC csCopy;
     const WINMALI_CS_SUBMIT_DESC* queuedCs = NULL;
+    WINMALI_BLT_DESC bltCopy;
+    const WINMALI_BLT_DESC* queuedBlt = NULL;
     ULONG asSlot = WINMALI_AS_SLOT_MAX;
     NTSTATUS csStatus = STATUS_SUCCESS;
     BOOLEAN needsTransientVm = FALSE;
     BOOLEAN needsTransientContext = FALSE;
 
     RtlZeroMemory(&csCopy, sizeof(csCopy));
+    RtlZeroMemory(&bltCopy, sizeof(bltCopy));
 
     if (pSubmit == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -2264,14 +2346,17 @@ WinMaliKmdSubmitCommandVirtual(
                   pSubmit->DmaBufferPrivateDataSize,
                   pSubmit->DmaBufferUmdPrivateDataSize);
 
-    /* Present phase-2 blt (same tagging as the physical path). Paging submits
-       carry no private data so they never enter here. */
+    /* Preserve the present blt in the same FIFO packet as its WDDM fence.
+       The worker executes it only after all older render packets. */
     if (pSubmit->pDmaBufferPrivateData != NULL &&
         pSubmit->DmaBufferPrivateDataSize >= sizeof(WINMALI_BLT_DESC)) {
         PWINMALI_BLT_DESC blt = (PWINMALI_BLT_DESC)pSubmit->pDmaBufferPrivateData;
-        if (blt->Magic == WINMALI_BLT_DESC_MAGIC) {
-            WinMaliPresentExecuteBlt_(blt);
-            blt->Magic = 0;
+        if (blt->Magic == WINMALI_BLT_DESC_MAGIC &&
+            blt->Src != NULL && blt->Dst != NULL &&
+            blt->Src->Magic == WINMALI_KMD_ALLOC_MAGIC &&
+            blt->Dst->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+            RtlCopyMemory(&bltCopy, blt, sizeof(bltCopy));
+            queuedBlt = &bltCopy;
         }
     }
 
@@ -2338,7 +2423,7 @@ WinMaliKmdSubmitCommandVirtual(
     }
     if (!WinMaliSchedEnqueue_(adapter, pSubmit->SubmissionFenceId,
                                pSubmit->NodeOrdinal, pSubmit->EngineOrdinal,
-                               queuedCs, asSlot,
+                               queuedCs, queuedBlt, asSlot,
                                (PWINMALI_KMD_CONTEXT)pSubmit->hContext)) {
         NTSTATUS queueStatus = STATUS_DEVICE_BUSY;
         WinMaliSchedFinishSubmit_(adapter, queuedCs,
@@ -2585,15 +2670,32 @@ WinMaliKmdPresent(
                  pPresent->DmaBufferPrivateDataSize, pPresent->pDmaBuffer,
                  pPresent->DmaSize);
 
-    if (!pPresent->Flags.Blt ||
-        pPresent->pAllocationList == NULL ||
-        pPresent->NumSrcAllocations < 1 ||
-        pPresent->NumDstAllocations < 1 ||
-        pPresent->pDmaBufferPrivateData == NULL ||
+    if (!pPresent->Flags.Blt) {
+        WINMALI_WARN("Flow Present EXIT ctx=%p result=unsupported-present flags=0x%x",
+                     hContext, pPresent->Flags.Value);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    /* Ordinary Blt presents use fixed allocation-list slots. The WDDM 2
+       context-allocation counts are not the length of that list and can be
+       zero for this path. Validate the actual handles below. */
+    if (pPresent->pAllocationList == NULL) {
+        WINMALI_WARN("Flow Present EXIT ctx=%p result=missing-blt-allocations",
+                     hContext);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (pPresent->pDmaBufferPrivateData == NULL ||
         pPresent->DmaBufferPrivateDataSize < sizeof(WINMALI_BLT_DESC)) {
-        /* Nothing we can (or need to) do; complete so the swap chain proceeds. */
-        WINMALI_DIAG("Flow Present EXIT ctx=%p result=no-blt-work", hContext);
-        return STATUS_SUCCESS;
+        WINMALI_WARN("Flow Present EXIT ctx=%p result=insufficient-private-buffer",
+                     hContext);
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    }
+
+    if (pPresent->pDmaBuffer == NULL || pPresent->DmaSize < sizeof(ULONG)) {
+        WINMALI_WARN("Flow Present EXIT ctx=%p result=insufficient-dma-buffer",
+                     hContext);
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
     }
 
     src = (PWINMALI_KMD_OPEN_ALLOCATION)
@@ -2607,11 +2709,35 @@ WinMaliKmdPresent(
         return STATUS_INVALID_HANDLE;
     }
 
+#if defined(WINMALI_PRESENT_PROBE)
+    {
+        static volatile LONG probeCount;
+        LONG sequence = InterlockedIncrement(&probeCount);
+        if (sequence <= 16) {
+            WINMALI_DIAG("[WinMaliPresentCopy] Allocations seq=%ld src=%p dst=%p "
+                         "srcHandle=0x%x dstHandle=0x%x srcGlobal=%p dstGlobal=%p "
+                         "srcMdl=%p dstMdl=%p srcPitch=%u dstPitch=%u "
+                         "srcFormat=%u dstFormat=%u srcSegment=%u dstSegment=%u "
+                         "srcAddress=0x%llx dstAddress=0x%llx irql=%u",
+                         sequence, src, dst, src->hAllocation, dst->hAllocation,
+                         src->Global, dst->Global,
+                         src->Global ? src->Global->ApertureMdl : NULL,
+                         dst->Global ? dst->Global->ApertureMdl : NULL,
+                         src->Pitch, dst->Pitch, src->Format, dst->Format,
+                         pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].SegmentId,
+                         pPresent->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX].SegmentId,
+                         (ULONGLONG)pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX].PhysicalAddress.QuadPart,
+                         (ULONGLONG)pPresent->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX].PhysicalAddress.QuadPart,
+                         (UINT)KeGetCurrentIrql());
+        }
+    }
+#endif
+
     desc = (PWINMALI_BLT_DESC)pPresent->pDmaBufferPrivateData;
     desc->Magic      = WINMALI_BLT_DESC_MAGIC;
     desc->SubRectCnt = pPresent->SubRectCnt;
-    desc->Src        = src;
-    desc->Dst        = dst;
+    desc->Src        = src->Global;
+    desc->Dst        = dst->Global;
     desc->SrcLeft    = pPresent->SrcRect.left;
     desc->SrcTop     = pPresent->SrcRect.top;
     desc->DstLeft    = pPresent->DstRect.left;
@@ -2619,69 +2745,25 @@ WinMaliKmdPresent(
     desc->DstRight   = pPresent->DstRect.right;
     desc->DstBottom  = pPresent->DstRect.bottom;
 
-    /* Render-only present blt (RosKmd model): there is no display engine and no
-       DMA copy engine, so do the copy on the CPU right here. Both allocations
-       must be resident (ApertureMdl set by BuildPagingBuffer MAP_APERTURE_SEGMENT)
-       - the UMD pins the backbuffer via LockCb, and dxgk makes the destination
-       resident for the present. If the destination is a cross-adapter surface we
-       do not own pages for (windowed DWM redirection), ApertureMdl is NULL and we
-       log + skip (that case needs a cross-adapter path, not this direct blt). */
-    {
-        PUCHAR srcBase = NULL, dstBase = NULL;
-
-        if (src->Global != NULL && src->Global->ApertureMdl != NULL) {
-            srcBase = (PUCHAR)MmGetSystemAddressForMdlSafe(
-                src->Global->ApertureMdl,
-                NormalPagePriority | MdlMappingNoExecute);
-            if (srcBase != NULL)
-                srcBase += (SIZE_T)src->Global->ApertureMdlOffset * PAGE_SIZE;
-        }
-        if (dst->Global != NULL && dst->Global->ApertureMdl != NULL) {
-            dstBase = (PUCHAR)MmGetSystemAddressForMdlSafe(
-                dst->Global->ApertureMdl,
-                NormalPagePriority | MdlMappingNoExecute);
-            if (dstBase != NULL)
-                dstBase += (SIZE_T)dst->Global->ApertureMdlOffset * PAGE_SIZE;
-        }
-
-        if (srcBase != NULL && dstBase != NULL &&
-            src->Pitch != 0 && dst->Pitch != 0) {
-            ULONG bpp = (dst->Width != 0) ? (dst->Pitch / dst->Width) : 4u;
-            LONG  w   = pPresent->DstRect.right  - pPresent->DstRect.left;
-            LONG  h   = pPresent->DstRect.bottom - pPresent->DstRect.top;
-            LONG  y;
-
-            if (bpp == 0) bpp = 4u;
-            for (y = 0; y < h; ++y) {
-                LONG   sy = pPresent->SrcRect.top  + y;
-                LONG   dy = pPresent->DstRect.top  + y;
-                SIZE_T sOff, dOff, rowBytes;
-
-                if (sy < 0 || dy < 0 || w <= 0)
-                    continue;
-                sOff = (SIZE_T)sy * src->Pitch + (SIZE_T)pPresent->SrcRect.left * bpp;
-                dOff = (SIZE_T)dy * dst->Pitch + (SIZE_T)pPresent->DstRect.left * bpp;
-                rowBytes = (SIZE_T)w * bpp;
-                /* Never read/write past either allocation. */
-                if (sOff + rowBytes > src->Size || dOff + rowBytes > dst->Size)
-                    break;
-                RtlCopyMemory(dstBase + dOff, srcBase + sOff, rowBytes);
-            }
-            WINMALI_DIAG("Flow Present: Blt COPIED %dx%d bpp=%u src=%p dst=%p "
-                         "dst=[%d,%d..%d,%d]",
-                         w, h, bpp, src, dst, pPresent->DstRect.left,
-                         pPresent->DstRect.top, pPresent->DstRect.right,
-                         pPresent->DstRect.bottom);
-        } else {
-            WINMALI_WARN("Present: Blt SKIPPED (src resident=%d dst resident=%d) "
-                         "- destination likely cross-adapter (DWM), needs a "
-                         "cross-adapter copy path",
-                         srcBase != NULL, dstBase != NULL);
-        }
+    /* Validate residency here, but do not touch either allocation's pixels.
+       The render submit preceding this present may still be in our async
+       worker queue. The worker owns the actual copy so it is ordered after
+       that render and before this present fence completes. */
+    if (desc->Src == NULL || desc->Dst == NULL ||
+        desc->Src->ApertureMdl == NULL || desc->Dst->ApertureMdl == NULL ||
+        desc->Src->Pitch == 0 || desc->Dst->Pitch == 0) {
+        WINMALI_WARN("Flow Present EXIT result=unavailable-blt-mapping "
+                     "srcMapped=%d dstMapped=%d srcPitch=%u dstPitch=%u",
+                     desc->Src != NULL && desc->Src->ApertureMdl != NULL,
+                     desc->Dst != NULL && desc->Dst->ApertureMdl != NULL,
+                     desc->Src != NULL ? desc->Src->Pitch : 0,
+                     desc->Dst != NULL ? desc->Dst->Pitch : 0);
+        desc->Magic = 0;
+        return STATUS_NOT_SUPPORTED;
     }
 
     /* Consume a DMA-buffer token so dxgk still routes this through the submit
-       path (fence/complete); the copy above already happened synchronously. */
+       path; the ordered worker performs the copy before completing its fence. */
     if (pPresent->pDmaBuffer != NULL && pPresent->DmaSize >= sizeof(ULONG)) {
         *(ULONG UNALIGNED*)pPresent->pDmaBuffer = WINMALI_BLT_DESC_MAGIC;
         pPresent->pDmaBuffer = (PVOID)((PUCHAR)pPresent->pDmaBuffer + sizeof(ULONG));
@@ -2734,6 +2816,18 @@ WinMaliKmdResetFromTimeout(
         InterlockedExchange(&adapter->NodeSched[node].PreemptPending, 0);
     }
     KeAcquireSpinLock(&adapter->SubmitQueueLock, &irql);
+    while (adapter->SubmitQueueHead != adapter->SubmitQueueTail) {
+        if (adapter->SubmitQueue[adapter->SubmitQueueHead].HasBlt) {
+            WinMaliSchedReleaseBlt_(
+                &adapter->SubmitQueue[adapter->SubmitQueueHead].Blt);
+            adapter->SubmitQueue[adapter->SubmitQueueHead].HasBlt = FALSE;
+        }
+        WinMaliContextPut_((PWINMALI_KMD_CONTEXT)
+            adapter->SubmitQueue[adapter->SubmitQueueHead].Context);
+        adapter->SubmitQueue[adapter->SubmitQueueHead].Context = NULL;
+        adapter->SubmitQueueHead =
+            (adapter->SubmitQueueHead + 1) % WINMALI_SUBMIT_QUEUE_DEPTH;
+    }
     adapter->SubmitQueueHead = adapter->SubmitQueueTail;
     WinMaliSchedUpdateIdleLocked_(adapter);
     KeReleaseSpinLock(&adapter->SubmitQueueLock, irql);

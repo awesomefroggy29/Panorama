@@ -50,8 +50,9 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     DRIVER_INITIALIZATION_DATA init;
     NTSTATUS                   status;
-    ULONG                      fileLogging = 1;
 
+#if !defined(WINMALI_LOG_DISABLED)
+    ULONG fileLogging = 0;
     /* The file logger is deliberately best-effort: a missing/unwritable C:
        must never prevent the display miniport from loading. No filesystem I/O
        occurs on this thread or in any graphics/interrupt callback. */
@@ -62,6 +63,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     /* UART2 serial log mirror FIRST so even this banner reaches the wire
        when running with kernel debugging off (see WinMaliLog.h). */
     (VOID)WinMaliSerialInit();
+#endif
 
     WINMALI_LIFECYCLE(">> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR,
                       WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
@@ -84,7 +86,9 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DbgPrint("[WinMali]    DxgkInitialize returned 0x%08x\n", status);
     if (!NT_SUCCESS(status)) {
         WINMALI_LIFECYCLE("<< DriverEntry DxgkInitialize=0x%08x", status);
+#if !defined(WINMALI_LOG_DISABLED)
         WinMaliFileLogTeardown();
+#endif
         return status;
     }
 
@@ -108,8 +112,10 @@ WinMaliKmdDxgkUnload(VOID)
 {
     WINMALI_LIFECYCLE(">> DxgkUnload");
     WINMALI_LIFECYCLE("<< DxgkUnload");
+#if !defined(WINMALI_LOG_DISABLED)
     WinMaliFileLogTeardown(); /* drains the final lifecycle records */
     WinMaliSerialTeardown();   /* after the last print */
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -140,6 +146,11 @@ WinMaliKmdAddDevice(
     adapter->Magic                = WINMALI_ADAPTER_MAGIC;
     adapter->PhysicalDeviceObject = PhysicalDeviceObject;
     KeInitializeSpinLock(&adapter->FenceQueueLock);
+    KeInitializeSpinLock(&adapter->AllocationRegistryLock);
+    InitializeListHead(&adapter->AllocationRegistryHead);
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+    KeInitializeSpinLock(&adapter->AllocLifecycleLock);
+#endif
     KeInitializeEvent(&adapter->CsfFirmwareEvent,
                       SynchronizationEvent, FALSE);
     WinMaliBoTableInit(&adapter->BoTable);

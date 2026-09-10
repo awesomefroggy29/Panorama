@@ -22,7 +22,18 @@
 /* Driver-wide trace shim. Glyph builds retain lifecycle plus warnings/errors:
    enough to correlate a UMD failure with a KMD fault without restoring the
    high-frequency scheduler/MMU trace. Lifecycle builds retain only lifecycle. */
-#if defined(WINMALI_LOG_GLYPH)
+#if defined(WINMALI_LOG_DISABLED)
+#undef DbgPrint
+#define DbgPrint(...)             (0UL)
+#define WinMaliLogPrint(...)      (0UL)
+#define WinMaliLifecycleLogPrint(...) (0UL)
+#define WINMALI_TRACE(fmt, ...)   ((void)0)
+#define WINMALI_DIAG(fmt, ...)    ((void)0)
+#define WINMALI_ROUTINE(fmt, ...) ((void)0)
+#define WINMALI_WARN(fmt, ...)    ((void)0)
+#define WINMALI_ERROR(fmt, ...)   ((void)0)
+#define WINMALI_LIFECYCLE(fmt, ...) ((void)0)
+#elif defined(WINMALI_LOG_GLYPH)
 #undef DbgPrint
 #define DbgPrint(...)             (0UL)
 #define WinMaliLogPrint(...)      (0UL)
@@ -62,6 +73,29 @@
 #define WINMALI_ERROR(fmt, ...) DbgPrint("[WinMali] ERR  " fmt "\n", ##__VA_ARGS__)
 #define WINMALI_LIFECYCLE(fmt, ...) \
     DbgPrint("[WinMali] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+#define WINMALI_ALLOC_LIFECYCLE_SLOTS 128u
+typedef struct _WINMALI_ALLOC_LIFECYCLE_RECORD {
+    ULONGLONG Id;
+    PVOID     Allocation;
+    ULONG     AllocationPrivateHash;
+    ULONG     AllocationPrivateSize;
+    ULONG     ResourcePrivateHash;
+    ULONG     ResourcePrivateSize;
+    SIZE_T    Size;
+    UINT      Width;
+    UINT      Height;
+    UINT      Pitch;
+    UINT      Format;
+    UINT      Usage;
+    HANDLE    CreateProcessId;
+    HANDLE    CreateThreadId;
+    HANDLE    DestroyProcessId;
+    HANDLE    DestroyThreadId;
+    BOOLEAN   Destroyed;
+} WINMALI_ALLOC_LIFECYCLE_RECORD, *PWINMALI_ALLOC_LIFECYCLE_RECORD;
 #endif
 
 /*
@@ -239,10 +273,12 @@ typedef struct _WINMALI_ADAPTER {
         UINT    NodeOrdinal;
         UINT    EngineOrdinal;
         BOOLEAN HasCs;
+        BOOLEAN HasBlt;
         ULONG   AsSlot;
         PVOID   Context;                 /* referenced WINMALI_KMD_CONTEXT */
         LONG    ResetGeneration;
         WINMALI_CS_SUBMIT_DESC Cs;      /* owned copy; dxgk private data is transient */
+        WINMALI_BLT_DESC       Blt;     /* owned copy + allocation references */
     } SubmitQueue[WINMALI_SUBMIT_QUEUE_DEPTH];
     PVOID               SubmitWorkerThread;   /* PKTHREAD (referenced) */
     KEVENT              SubmitWorkerWake;
@@ -251,6 +287,25 @@ typedef struct _WINMALI_ADAPTER {
     LONG                SubmitWorkerActive;
     LONG                SubmitWorkerActiveNode; /* -1 while idle */
     LONG                SchedulerAccepting;
+
+    /* Dxgkrnl normally maps a D3DKMT allocation handle back to the private
+       pointer returned by CreateAllocation.  Some render-only paths on this
+       adapter return NULL from DxgkCbGetHandleData even while that object is
+       live.  Keep the live objects registered so OpenAllocation can recover
+       the association without losing residency/aperture state. */
+    KSPIN_LOCK           AllocationRegistryLock;
+    LIST_ENTRY           AllocationRegistryHead;
+    ULONGLONG            AllocationRegistryNextId;
+
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+    /* Bounded diagnostic ledger used to distinguish a missing dxgkrnl handle
+       association from an allocation lifetime/order problem. */
+    KSPIN_LOCK              AllocLifecycleLock;
+    ULONGLONG               AllocLifecycleNextId;
+    ULONG                   AllocLifecycleCursor;
+    WINMALI_ALLOC_LIFECYCLE_RECORD
+                            AllocLifecycle[WINMALI_ALLOC_LIFECYCLE_SLOTS];
+#endif
 
     /* Set after a successful bring-up so RemoveDevice can tell a clean
        stop/remove cycle from a never-started one. */
@@ -343,6 +398,7 @@ NTSTATUS WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Tim
    the caller should fall back to WinMaliCsfSubmitNopJob. */
 NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
+                                     _In_ ULONG   VmId,
                                      _In_ UINT64  StreamGpuVa,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
@@ -353,6 +409,7 @@ NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
 NTSTATUS WinMaliCsfSubmitTransientGroupStream(
                                      _Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
+                                     _In_ ULONG   VmId,
                                      _In_ UINT64  StreamGpuVa,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
@@ -419,6 +476,14 @@ VOID WinMaliTilerHeapTableTeardown(_Inout_ PWINMALI_ADAPTER adapter);
 ULONG WinMaliTilerHeapRundownOwner(
     _Inout_ PWINMALI_ADAPTER adapter,
     _In_ PVOID ownerDevice);
+NTSTATUS WinMaliTilerHeapGrow(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_ ULONG vmId,
+    _In_ UINT64 heapContextGpuVa,
+    _Out_ UINT64* encodedChunkGpuVa);
+VOID WinMaliTilerHeapReclaimCompleted(
+    _Inout_ PWINMALI_ADAPTER adapter,
+    _In_ ULONG vmId);
 
 /* WinMaliDdi.c: async submit scheduler lifecycle. Init creates the worker
    thread (call from StartDevice after CSF is up); Teardown stops+joins it

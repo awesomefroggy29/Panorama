@@ -84,7 +84,7 @@ param(
     # IdvsProbe leaves rendering untouched and records the exact position /
     # secondary-varying program handoff plus the linked varying descriptors
     # and fragment resource-table entry for the captured XAML glyph pipeline.
-    [ValidateSet("Verbose","Focused","Lifecycle","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe")]
+    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","HandleLifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
@@ -545,7 +545,11 @@ if ($env:WindowsSdkDir -and $env:WindowsSDKVersion) {
 #       Clang < 19 in <yvals_core.h>. We ABI-match fine in practice.
 $env:CFLAGS   = "$env:CFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 $env:CXXFLAGS = "$env:CXXFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-if ($DriverLogProfile -eq "Focused") {
+if ($DriverLogProfile -eq "NoLogging") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_DISABLED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_DISABLED=1"
+}
+elseif ($DriverLogProfile -eq "Focused") {
     $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_FOCUSED=1"
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_FOCUSED=1"
 }
@@ -590,6 +594,16 @@ elseif ($DriverLogProfile -eq "LdVarProbe") {
 elseif ($DriverLogProfile -eq "IdvsProbe") {
     $env:CFLAGS   = "$env:CFLAGS -DWINMALI_IDVS_HANDOFF_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_IDVS_HANDOFF_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "PresentProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "HandleLifecycle") {
+    # The detailed ledger lives in the KMD. Keep the UMD output focused so
+    # gpu.log contains the allocation transitions without unrelated spam.
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_LOG_FOCUSED=1"
 }
 
 # MSYS2 flex emits POSIX names even for Windows scanners.  Force-include a

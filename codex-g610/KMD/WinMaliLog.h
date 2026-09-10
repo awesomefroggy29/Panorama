@@ -32,7 +32,11 @@
  * controlled by Services\WinMaliKmd\Parameters\FileLogging (default 1 in the
  * INF). Producers only copy into a fixed nonpaged ring; a dedicated
  * PASSIVE_LEVEL worker performs all filesystem I/O. */
+#if defined(WINMALI_LOG_DISABLED)
+#define WINMALI_LOG_TO_FILE 0
+#else
 #define WINMALI_LOG_TO_FILE 1
+#endif
 
 /* Map the UART MMIO + program 115200-8n1 (only when no debugger owns
    it). Call once, early in DriverEntry, before the first print.

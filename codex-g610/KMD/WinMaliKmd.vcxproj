@@ -103,6 +103,7 @@
     <WinMaliLogProfile Condition="'$(WinMaliLogProfile)' == ''">Verbose</WinMaliLogProfile>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Focused'">WINMALI_LOG_FOCUSED=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Lifecycle'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'NoLogging'">WINMALI_LOG_DISABLED=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Glyph'">WINMALI_LOG_GLYPH=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'ShaderCapture'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'Reject'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
@@ -112,6 +113,10 @@
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'FragWProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'LdVarProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'IdvsProbe'">WINMALI_LOG_LIFECYCLE=1;</WinMaliLogDefine>
+    <!-- PresentProbe must retain the UMD DebugLog escape path so its bounded
+         DXGI trace reaches C:\gpu.log. -->
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'PresentProbe'">WINMALI_LOG_FOCUSED=1;WINMALI_PRESENT_PROBE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'HandleLifecycle'">WINMALI_LOG_FOCUSED=1;WINMALI_HANDLE_LIFECYCLE_PROBE=1;</WinMaliLogDefine>
   </PropertyGroup>
 
   <ItemDefinitionGroup>

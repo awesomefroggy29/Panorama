@@ -100,7 +100,10 @@ WinMaliBoTableTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
     while (!IsListEmpty(&freeHead)) {
         entry = RemoveHeadList(&freeHead);
         PWINMALI_BO bo = CONTAINING_RECORD(entry, WINMALI_BO, Link);
-        WinMaliBoFree_(bo);
+        /* Drop the table's owner reference.  Outstanding users obtained via
+           WinMaliBoGet (for example the VM cache-flush worker) keep the BO
+           and its MDL alive until their matching WinMaliBoPut. */
+        WinMaliBoPut(bo);
     }
 }
 
@@ -271,7 +274,10 @@ WinMaliBoDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
     }
     WINMALI_TRACE("BoDestroy: handle=%u size=%llu",
                   bo->Handle, (ULONGLONG)bo->Size);
-    WinMaliBoFree_(bo);
+    /* The handle-table entry owns one reference.  Do not free the MDL here
+       if a worker has already acquired a temporary reference with
+       WinMaliBoGet; its WinMaliBoPut will perform the final free. */
+    WinMaliBoPut(bo);
     return WMERR_OK;
 }
 
@@ -307,7 +313,9 @@ WinMaliBoRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter, _In_ PVOID OwnerDevice)
                                            WINMALI_BO, Link);
         WINMALI_TRACE("BoRundown: handle=%u size=%llu (owner device died "
                       "without BoDestroy)", bo->Handle, (ULONGLONG)bo->Size);
-        WinMaliBoFree_(bo);
+        /* Drop the table/device owner reference, preserving the BO for any
+           in-flight scheduler or cache-maintenance users. */
+        WinMaliBoPut(bo);
         ++freed;
     }
     return freed;
@@ -339,10 +347,12 @@ VOID
 WinMaliBoPut(_In_ PWINMALI_BO Bo)
 {
     if (Bo != NULL) {
-        InterlockedDecrement(&Bo->RefCount);
-        /* Note: we don't auto-free at 0 here. BoDestroy is the explicit
-           release path. Refcount is informational for now (used by VmBind
-           to mark a BO as live-in-GPU). */
+        if (InterlockedDecrement(&Bo->RefCount) == 0) {
+            /* The BO has been removed from the handle table and all users
+               have released their temporary references.  This is the only
+               point at which the MDL may be reclaimed. */
+            WinMaliBoFree_(Bo);
+        }
     }
 }
 

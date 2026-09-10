@@ -886,8 +886,9 @@ WinMaliEscapeProcessSyncOps_(_Inout_ PWINMALI_ADAPTER adapter,
 }
 
 #define WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS  16u
+#define WINMALI_TILER_HEAP_MAX_CHUNKS          64u
 #define WINMALI_TILER_HEAP_MAX_MAPPINGS        \
-    (1u + WINMALI_TILER_HEAP_MAX_INITIAL_CHUNKS)
+    (1u + WINMALI_TILER_HEAP_MAX_CHUNKS)
 
 typedef struct _WINMALI_TILER_HEAP_MAPPING {
     ULONG  BoHandle;
@@ -897,10 +898,15 @@ typedef struct _WINMALI_TILER_HEAP_MAPPING {
 
 typedef struct _WINMALI_TILER_HEAP_RECORD {
     LIST_ENTRY Link;
+    EX_RUNDOWN_REF Rundown;
     ULONG      Handle;
     ULONG      VmId;
     PVOID      OwnerDevice;
     BOOLEAN    MapProcessReserved;
+    ULONG      ChunkSize;
+    ULONG      InitialChunkCount;
+    ULONG      ChunkCount;
+    ULONG      MaxChunks;
     ULONG      MappingCount;
     WINMALI_TILER_HEAP_MAPPING Mappings[WINMALI_TILER_HEAP_MAX_MAPPINGS];
 } WINMALI_TILER_HEAP_RECORD, *PWINMALI_TILER_HEAP_RECORD;
@@ -922,6 +928,10 @@ WinMaliTilerHeapDestroyRecord_(
     ULONG i;
 
     if (heap == NULL) return;
+    /* The record is removed from the table before teardown.  Drain a grow
+       operation that found it immediately before removal before touching its
+       mapping array or freeing the record. */
+    ExWaitForRundownProtectionRelease(&heap->Rundown);
     vm = WinMaliVmGet(adapter, heap->VmId);
     /* Unmap before releasing backing.  The record owns every BO handle, and
        process teardown occurs only after all of its devices are destroyed. */
@@ -1157,6 +1167,7 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
                             _In_    ULONG            vmId,
                             _In_    ULONG            chunkSize,
                             _In_    ULONG            initialChunkCount,
+                            _In_    ULONG            maxChunks,
                             _Out_   UINT64*          outCtxVa,
                             _Out_   UINT64*          outFirstChunkVa,
                             _Outptr_ PWINMALI_TILER_HEAP_RECORD* outRecord)
@@ -1205,8 +1216,21 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(record, sizeof(*record));
+    ExInitializeRundownProtection(&record->Rundown);
     record->VmId = vmId;
     record->OwnerDevice = ownerDevice;
+    record->ChunkSize = chunkSize;
+    record->InitialChunkCount = count;
+    /* A zero MaxChunks means unbounded in the escape ABI.  The fixed record
+       storage imposes our implementation ceiling.  Never choose a limit
+       below the initial allocation count. */
+    record->MaxChunks = (maxChunks == 0u ||
+                         maxChunks > WINMALI_TILER_HEAP_MAX_CHUNKS)
+                            ? WINMALI_TILER_HEAP_MAX_CHUNKS
+                            : maxChunks;
+    if (record->MaxChunks < count) {
+        record->MaxChunks = count;
+    }
 
     /* Prefer the owner process's dxgkrnl-reserved GPUVA.  The same VA is also
        installed in the escape VM, so legacy GroupSubmit remains valid.  A
@@ -1276,6 +1300,7 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
         record->Mappings[record->MappingCount].PageCount = chunkSize / PAGE_SIZE;
         record->Mappings[record->MappingCount].GpuVa = va;
         ++record->MappingCount;
+        ++record->ChunkCount;
         prevChunkVa  = va;
         firstChunkVa = va;               /* newest = first_chunk_gpu_va */
     }
@@ -1289,6 +1314,276 @@ WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
         vmId, mapProcessReserved ? "DXGK+escape" : "escape-only",
         (ULONGLONG)ctxVa, (ULONGLONG)firstChunkVa);
     return STATUS_SUCCESS;
+}
+
+/* Service the firmware's CS_TILER_OOM request.  Unlike the initial chunks,
+   a grown chunk is handed directly to firmware through CS_INPUT.heap_start /
+   heap_end, so its header must be zero and must not be linked to the original
+   initial list by the CPU.  Retained mappings from an earlier terminated CSG
+   are reused before allocating more backing.  The low address bits carry
+   chunk_size >> 12, as required by the CSF firmware interface. */
+NTSTATUS
+WinMaliTilerHeapGrow(_Inout_ PWINMALI_ADAPTER adapter,
+                     _In_ ULONG vmId,
+                     _In_ UINT64 heapContextGpuVa,
+                     _Out_ UINT64* encodedChunkGpuVa)
+{
+    PWINMALI_TILER_HEAP_RECORD heap = NULL;
+    PWINMALI_VM vm = NULL;
+    PLIST_ENTRY entry;
+    KIRQL irql;
+    UINT64 va = 0;
+    ULONG handle = 0;
+    NTSTATUS st;
+
+    if (adapter == NULL || encodedChunkGpuVa == NULL ||
+        heapContextGpuVa == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *encodedChunkGpuVa = 0;
+
+    KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+    for (entry = adapter->TilerHeapHead.Flink;
+         entry != &adapter->TilerHeapHead; entry = entry->Flink) {
+        PWINMALI_TILER_HEAP_RECORD candidate =
+            CONTAINING_RECORD(entry, WINMALI_TILER_HEAP_RECORD, Link);
+        if (candidate->VmId == vmId && candidate->MappingCount != 0 &&
+            candidate->Mappings[0].GpuVa == heapContextGpuVa &&
+            ExAcquireRundownProtection(&candidate->Rundown)) {
+            heap = candidate;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
+
+    if (heap == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+    if (heap->ChunkCount >= heap->MaxChunks) {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto out_release;
+    }
+
+    /* Mapping[0] is the heap context and the remaining mappings are chunks.
+       Recycling resets ChunkCount to InitialChunkCount but deliberately keeps
+       every grown mapping alive.  A retained mapping beyond the active chunk
+       count is therefore the next chunk to return to firmware. */
+    if (heap->ChunkCount < heap->MappingCount - 1u) {
+        PWINMALI_TILER_HEAP_MAPPING m =
+            &heap->Mappings[1u + heap->ChunkCount];
+        PWINMALI_BO bo = WinMaliBoGet(adapter, m->BoHandle);
+        PVOID kva = NULL;
+
+        if (bo != NULL) {
+            kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                                NULL, FALSE, NormalPagePriority);
+        }
+        if (kva == NULL) {
+            if (bo != NULL) WinMaliBoPut(bo);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            goto out_release;
+        }
+
+        RtlZeroMemory(kva, 64u);
+        KeFlushIoBuffers(bo->Mdl, FALSE, TRUE);
+        MmUnmapLockedPages(kva, bo->Mdl);
+        WinMaliBoPut(bo);
+
+        va = m->GpuVa;
+        ++heap->ChunkCount;
+        *encodedChunkGpuVa =
+            (va & ~0xFFFull) | ((UINT64)heap->ChunkSize >> PAGE_SHIFT);
+        WINMALI_DIAG("TilerHeapReuse: vm=%u ctx=0x%llx chunk=%u/%u retained=%u va=0x%llx encoded=0x%llx",
+                     heap->VmId, (ULONGLONG)heapContextGpuVa,
+                     heap->ChunkCount, heap->MaxChunks,
+                     heap->MappingCount - 1u, (ULONGLONG)va,
+                     (ULONGLONG)*encodedChunkGpuVa);
+        st = STATUS_SUCCESS;
+        goto out_release;
+    }
+
+    if (heap->MappingCount >= WINMALI_TILER_HEAP_MAX_MAPPINGS) {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto out_release;
+    }
+
+    vm = WinMaliVmGet(adapter, heap->VmId);
+    if (vm == NULL || !vm->PtInitialized) {
+        st = STATUS_DEVICE_NOT_READY;
+        goto out_release;
+    }
+
+    if (heap->MapProcessReserved) {
+        st = WinMaliKmdAllocateProcessReservedGpuVa(
+            heap->OwnerDevice, heap->ChunkSize, PAGE_SIZE, &va);
+    } else {
+        va = vm->KmdVaNext;
+        vm->KmdVaNext += heap->ChunkSize;
+        st = STATUS_SUCCESS;
+    }
+    if (!NT_SUCCESS(st)) {
+        goto out_vm;
+    }
+
+    st = WinMaliHeapAllocMapped_(adapter, vm, heap->OwnerDevice,
+                                 heap->MapProcessReserved, heap->ChunkSize,
+                                 va, FALSE, 0, &handle);
+    if (!NT_SUCCESS(st)) {
+        goto out_vm;
+    }
+
+    heap->Mappings[heap->MappingCount].BoHandle = handle;
+    heap->Mappings[heap->MappingCount].PageCount =
+        heap->ChunkSize / PAGE_SIZE;
+    heap->Mappings[heap->MappingCount].GpuVa = va;
+    ++heap->MappingCount;
+    ++heap->ChunkCount;
+    *encodedChunkGpuVa =
+        (va & ~0xFFFull) | ((UINT64)heap->ChunkSize >> PAGE_SHIFT);
+
+    WINMALI_DIAG("TilerHeapGrow: vm=%u ctx=0x%llx chunk=%u/%u va=0x%llx encoded=0x%llx",
+                 heap->VmId, (ULONGLONG)heapContextGpuVa,
+                 heap->ChunkCount, heap->MaxChunks, (ULONGLONG)va,
+                 (ULONGLONG)*encodedChunkGpuVa);
+
+out_vm:
+    if (vm != NULL) WinMaliVmPut(vm);
+out_release:
+    ExReleaseRundownProtection(&heap->Rundown);
+    return st;
+}
+
+/* WinMali currently serializes all CSF packets through one firmware queue and
+   reconstructs that queue when switching WDDM contexts.  The firmware queue
+   teardown loses the live tiler-heap free-list state that FINISH_FRAGMENT
+   maintains, while the opaque heap context and allocated chunks survive in
+   memory.  Without repairing that ownership boundary, every later render
+   consumes another 2 MiB chunk until max_chunks is reached; replying to the
+   next TILER_OOM with heap_start == heap_end == 0 is fatal on G610/G615.
+
+   A terminal stream sync is not sufficient to recycle these mappings: CSF may
+   retain a grown chunk in its persistent heap state after WAIT(all) completes.
+   The caller must first receive an acknowledged CSG STATE_TERMINATE while the
+   global submit lock excludes the next packet.  Only at that ownership barrier
+   may we restore the original chunk chain, zero the opaque GPU context, and
+   mark chunks grown by the terminated CSG reusable.  Even then, the GPU can
+   retain addresses from the old heap state beyond the acknowledgement, so the
+   mappings and BOs remain alive until explicit heap destruction.  The next
+   batch's HEAP_SET then starts from the same logical state as heap creation and
+   later OOM requests consume the retained mappings before allocating new ones.
+*/
+VOID
+WinMaliTilerHeapReclaimCompleted(_Inout_ PWINMALI_ADAPTER adapter,
+                                 _In_ ULONG vmId)
+{
+    PWINMALI_TILER_HEAP_RECORD heap = NULL;
+    PLIST_ENTRY entry;
+    KIRQL irql;
+    ULONG i;
+    UINT64 previousVa = 0;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    if (adapter == NULL || vmId == 0) return;
+
+    KeAcquireSpinLock(&adapter->TilerHeapLock, &irql);
+    for (entry = adapter->TilerHeapHead.Flink;
+         entry != &adapter->TilerHeapHead; entry = entry->Flink) {
+        PWINMALI_TILER_HEAP_RECORD candidate =
+            CONTAINING_RECORD(entry, WINMALI_TILER_HEAP_RECORD, Link);
+        if (candidate->VmId == vmId &&
+            candidate->ChunkCount > candidate->InitialChunkCount &&
+            ExAcquireRundownProtection(&candidate->Rundown)) {
+            heap = candidate;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&adapter->TilerHeapLock, irql);
+
+    if (heap == NULL) return;
+
+    /* Mapping[0] is the opaque 32-byte heap context. */
+    {
+        PWINMALI_BO bo = WinMaliBoGet(adapter, heap->Mappings[0].BoHandle);
+        PVOID kva = NULL;
+        if (bo != NULL) {
+            kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                                NULL, FALSE, NormalPagePriority);
+        }
+        if (kva == NULL) {
+            if (bo != NULL) WinMaliBoPut(bo);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            goto out;
+        }
+        RtlZeroMemory(kva, 64u);
+        KeFlushIoBuffers(bo->Mdl, FALSE, TRUE);
+        MmUnmapLockedPages(kva, bo->Mdl);
+        WinMaliBoPut(bo);
+    }
+
+    /* Recreate the original newest->oldest linked list.  The userspace TILER
+       descriptor still points at the newest original chunk. */
+    for (i = 1; i <= heap->InitialChunkCount; ++i) {
+        PWINMALI_TILER_HEAP_MAPPING m = &heap->Mappings[i];
+        PWINMALI_BO bo = WinMaliBoGet(adapter, m->BoHandle);
+        PVOID kva = NULL;
+        UINT64 next = previousVa
+            ? ((previousVa & ~0xFFFull) |
+               ((UINT64)heap->ChunkSize >> PAGE_SHIFT))
+            : 0ull;
+
+        if (bo != NULL) {
+            kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                                NULL, FALSE, NormalPagePriority);
+        }
+        if (kva == NULL) {
+            if (bo != NULL) WinMaliBoPut(bo);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            goto out;
+        }
+        RtlZeroMemory(kva, 64u);
+        *(volatile UINT64 UNALIGNED*)kva = next;
+        KeFlushIoBuffers(bo->Mdl, FALSE, TRUE);
+        MmUnmapLockedPages(kva, bo->Mdl);
+        WinMaliBoPut(bo);
+        previousVa = m->GpuVa;
+    }
+
+    /* Preserve every grown VA/BO until heap destruction.  An acknowledged CSG
+       termination is sufficient to reset logical ownership, but the observed
+       firmware/GPU lifetime can still extend past that acknowledgement.  Clear
+       only the firmware-owned header so a later OOM can safely reuse it. */
+    for (i = 1u + heap->InitialChunkCount; i < heap->MappingCount; ++i) {
+        PWINMALI_TILER_HEAP_MAPPING m = &heap->Mappings[i];
+        PWINMALI_BO bo = WinMaliBoGet(adapter, m->BoHandle);
+        PVOID kva = NULL;
+
+        if (bo != NULL) {
+            kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                                NULL, FALSE, NormalPagePriority);
+        }
+        if (kva == NULL) {
+            if (bo != NULL) WinMaliBoPut(bo);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            goto out;
+        }
+        RtlZeroMemory(kva, 64u);
+        KeFlushIoBuffers(bo->Mdl, FALSE, TRUE);
+        MmUnmapLockedPages(kva, bo->Mdl);
+        WinMaliBoPut(bo);
+    }
+    heap->ChunkCount = heap->InitialChunkCount;
+
+    WINMALI_DIAG("TilerHeapRecycle: vm=%u ctx=0x%llx active=%u retained=%u max=%u",
+                 vmId, (ULONGLONG)heap->Mappings[0].GpuVa,
+                 heap->ChunkCount, heap->MappingCount - 1u,
+                 heap->MaxChunks);
+
+out:
+    if (!NT_SUCCESS(st)) {
+        WINMALI_WARN("TilerHeapRecycle: vm=%u ctx=0x%llx failed 0x%08x",
+                     vmId, (ULONGLONG)heap->Mappings[0].GpuVa, st);
+    }
+    ExReleaseRundownProtection(&heap->Rundown);
 }
 
 /* GroupSubmit: walk queue submits, process pre-submit sync waits, run the
@@ -1407,7 +1702,7 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
             WinMaliBoFlushVm(adapter, vmId, TRUE /* clean CPU->DRAM */);
 
             csfSt = WinMaliCsfSubmitTransientGroupStream(
-                adapter, asSlot, qs->StreamAddr, qs->StreamSize,
+                adapter, asSlot, vmId, qs->StreamAddr, qs->StreamSize,
                 0u, 500u, &parked);
             WinMaliBoFlushVm(adapter, vmId, FALSE /* invalidate DRAM->CPU */);
             if (parked) {
@@ -1634,7 +1929,7 @@ WinMaliKmdEscape(
             NTSTATUS heapSt = WinMaliTilerHeapCreateReal_(
                                   adapter, WinMaliDeviceOwnerToken(pEscape->hDevice),
                                   args->VmId, args->ChunkSize,
-                                  args->InitialChunkCount,
+                                  args->InitialChunkCount, args->MaxChunks,
                                   &realCtxVa, &realFirstVa, &record);
             if (NT_SUCCESS(heapSt)) {
                 KIRQL irql;

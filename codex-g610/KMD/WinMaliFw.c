@@ -50,6 +50,7 @@
 #define WINMALI_CS_EXTRACT_EVENT           (1u << 4)
 #define WINMALI_CS_IDLE_SYNC_WAIT          (1u << 8)
 #define WINMALI_CS_IDLE_EMPTY              (1u << 10)
+#define WINMALI_CS_TILER_OOM               (1u << 26)
 #define WINMALI_CS_REQ_MASK                (WINMALI_CS_STATE_MASK | WINMALI_CS_EXTRACT_EVENT \
                                               | WINMALI_CS_IDLE_SYNC_WAIT | WINMALI_CS_IDLE_EMPTY)
 
@@ -417,6 +418,11 @@ typedef struct _WINMALI_FWCTX {
     // referenced buffers) in the group's own address space. Serialized by
     // the escape dispatch (one GroupSubmit at a time).
     ULONG                      CurrentCsgAs;
+    /* VM whose tiler heap may still be referenced by the currently-started
+       CSG.  Zero denotes the permanent bring-up AS, which has no UMD heap.
+       This is deliberately distinct from CurrentCsgAs: AS slots are recycled
+       between transient WDDM contexts, while tiler heaps are owned by VmId. */
+    ULONG                      CurrentCsgVmId;
 
     // Endpoint parameters captured at bootstrap (constant for the device):
     // the shader-core mask and its popcount. Reused when the CSG slot is
@@ -1295,8 +1301,61 @@ WinMaliFwCsgWaitReqAck_(
 }
 
 static NTSTATUS
+WinMaliCsfServiceTilerOom_(_Inout_ PWINMALI_ADAPTER Adapter,
+                           _Inout_ WINMALI_FWCTX* Fw,
+                           _In_ ULONG VmId)
+{
+    volatile WINMALI_PANTHOR_FW_CS_INPUT_IFACE* csIn = Fw->Cs00Input;
+    volatile WINMALI_PANTHOR_FW_CS_OUTPUT_IFACE* csOut = Fw->Cs00Output;
+    ULONG req;
+    ULONG ack;
+    UINT64 heapAddress;
+    UINT64 newChunk = 0;
+    NTSTATUS status;
+
+    if (csIn == NULL || csOut == NULL || Fw->Csg0Input == NULL ||
+        Fw->Csg0Output == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    KeMemoryBarrier();
+    req = csIn->Req;
+    ack = csOut->Ack;
+    if (((req ^ ack) & WINMALI_CS_TILER_OOM) == 0) {
+        return STATUS_NOT_FOUND;
+    }
+
+    heapAddress = csOut->HeapAddress;
+    status = WinMaliTilerHeapGrow(Adapter, VmId, heapAddress, &newChunk);
+
+    /* A zero response is intentional when the heap reached max_chunks or an
+       allocation failed: firmware can reclaim completed fragments or invoke
+       Mesa's registered incremental-rendering exception handler.  In every
+       case we must acknowledge the event; leaving bit 26 mismatched parks the
+       command stream permanently. */
+    csIn->HeapStart = NT_SUCCESS(status) ? newChunk : 0;
+    csIn->HeapEnd = NT_SUCCESS(status) ? newChunk : 0;
+    Fw->Csg0Input->CsIrqAck = Fw->Csg0Output->CsIrqReq;
+    WinMaliCsfCsUpdateReqs_(Fw, csIn, ack, WINMALI_CS_TILER_OOM);
+    KeMemoryBarrier();
+
+    WinMaliCsfCsgToggleDoorbellReqs_(Fw, 1u);
+    WinMaliFwGlbToggleDoorbellMask_(Adapter, Fw, 1u);
+    WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(0), 1u);
+    WinMaliHwWrite32(&Adapter->Hw, WINMALI_REG_CSF_DOORBELL(1), 1u);
+
+    WINMALI_DIAG("CSF TILER_OOM serviced VM%u heap=0x%llx vt=%u/%u frag=%u chunk=0x%llx status=0x%08x",
+                 VmId, (ULONGLONG)heapAddress, csOut->HeapVtStart,
+                 csOut->HeapVtEnd, csOut->HeapFragEnd,
+                 (ULONGLONG)newChunk, status);
+    return status;
+}
+
+static NTSTATUS
 WinMaliFwWaitSeqno_(
     _Inout_ PWINMALI_ADAPTER Adapter,
+    _Inout_ WINMALI_FWCTX* Fw,
+    _In_ ULONG VmId,
     _In_ volatile WINMALI_PANTHOR_SYNCOBJ64* Sync,
     _In_ UINT64 Target,
     _In_ ULONG TimeoutMs,
@@ -1315,6 +1374,7 @@ WinMaliFwWaitSeqno_(
         ULONG i;
         for (i = 0; i < TimeoutMs; ++i) {
             ++sampleCount;
+            (VOID)WinMaliCsfServiceTilerOom_(Adapter, Fw, VmId);
             KeMemoryBarrier();
             if (Sync->Seqno >= Target) {
                 if (Samples != NULL) {
@@ -1330,6 +1390,7 @@ WinMaliFwWaitSeqno_(
 
         for (i = 0; i < 50u; ++i) { /* at most 250 us */
             ++sampleCount;
+            (VOID)WinMaliCsfServiceTilerOom_(Adapter, Fw, VmId);
             KeMemoryBarrier();
             if (Sync->Seqno >= Target) {
                 InterlockedIncrement64(&Adapter->CsfFirmwareFastPollHits);
@@ -1346,6 +1407,7 @@ WinMaliFwWaitSeqno_(
             ULONGLONG now;
 
             ++sampleCount;
+            (VOID)WinMaliCsfServiceTilerOom_(Adapter, Fw, VmId);
             KeMemoryBarrier();
             if (Sync->Seqno >= Target) {
                 if (Samples != NULL) {
@@ -1686,9 +1748,13 @@ WinMaliCsfTerminateCsg_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX*
                                      1000u, &acked);
     WINMALI_TRACE("CSF: TerminateCsg (was AS=%u) ack=0x%08x st=0x%08x",
                   Fw->CurrentCsgAs, acked, status);
-    /* Whatever the ack, treat the slot as no longer started - the caller
-       reprograms it fresh next. */
-    Fw->CsgStarted = FALSE;
+    /* Only an acknowledged TERMINATE transfers ownership back to the host.
+       Keeping CsgStarted set on timeout makes every retry issue TERMINATE
+       again instead of falsely treating the slot (and its tiler heap) as
+       quiescent. */
+    if (NT_SUCCESS(status)) {
+        Fw->CsgStarted = FALSE;
+    }
     return status;
 }
 
@@ -1881,6 +1947,7 @@ WinMaliCsfBootstrap_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX* Fw
     /* Bind + start CSG slot 0 in the bring-up AS via the SAME programming path
        every UMD group bind uses (WinMaliCsfProgramAndStartCsg_). */
     Fw->CsgStarted = FALSE;
+    Fw->CurrentCsgVmId = 0u;
     status = WinMaliCsfProgramAndStartCsg_(Adapter, Fw, Adapter->GpuMmuBringupAs);
     if (!NT_SUCCESS(status)) {
         WINMALI_WARN("CSF bootstrap: CSG0 program+start failed 0x%08x", status);
@@ -2092,9 +2159,11 @@ WinMaliCsfWakeCsgIfIdle_(_Inout_ PWINMALI_ADAPTER Adapter, _Inout_ WINMALI_FWCTX
 static NTSTATUS
 WinMaliCsfRebindCsgAs_(_Inout_ PWINMALI_ADAPTER Adapter,
                        _Inout_ WINMALI_FWCTX*   Fw,
-                       _In_ ULONG               AsSlot)
+                       _In_ ULONG               AsSlot,
+                       _In_ ULONG               VmId)
 {
     NTSTATUS status;
+    ULONG previousVmId;
 
     if (AsSlot >= WINMALI_AS_SLOT_MAX) {
         return STATUS_SUCCESS;   /* sentinel: caller wants no rebind */
@@ -2117,16 +2186,33 @@ WinMaliCsfRebindCsgAs_(_Inout_ PWINMALI_ADAPTER Adapter,
      * submit is cheap insurance that the slot is provably bound to THIS group's
      * VM before we run its stream. Correctness over the skip's micro-opt. */
 
+    /* Remember the heap owner before terminating.  A terminal stream sync is
+       not a tiler-heap ownership barrier: firmware may retain a grown chunk in
+       the persistent heap context after WAIT(all) completes.  STATE_TERMINATE
+       acknowledgement is the first point at which the old CSG is guaranteed
+       unable to dereference that heap. */
+    previousVmId = Fw->CurrentCsgVmId;
+
     /* Tear the current group off the slot (if any), then program + start the
        slot fresh for the target AS. */
     status = WinMaliCsfTerminateCsg_(Adapter, Fw);
     if (!NT_SUCCESS(status)) {
         WINMALI_WARN("CSF: bind AS %u->%u: terminate failed 0x%08x",
                      Fw->CurrentCsgAs, AsSlot, status);
-        /* Fall through and try to start anyway - the slot is marked stopped. */
+        /* An unacknowledged slot may still execute the old address space.
+           Neither touch its heap nor program a new CSG configuration over it. */
+        return status;
+    }
+
+    Fw->CurrentCsgVmId = 0u;
+    if (previousVmId != 0u) {
+        WinMaliTilerHeapReclaimCompleted(Adapter, previousVmId);
     }
 
     status = WinMaliCsfProgramAndStartCsg_(Adapter, Fw, AsSlot);
+    if (NT_SUCCESS(status)) {
+        Fw->CurrentCsgVmId = VmId;
+    }
     WINMALI_ROUTINE("CSF: bind CSG -> AS %u (start st=0x%08x)", AsSlot, status);
     return status;
 }
@@ -2183,6 +2269,7 @@ WinMaliCsfSubmitStreamCall_(
     _In_ ULONG               StreamSizeBytes,
     _In_ ULONG               LatestFlush,
     _In_ ULONG               CsgAsSlot,
+    _In_ ULONG               VmId,
     _In_ ULONG               TimeoutMs)
 {
     UINT64             addrReg;
@@ -2213,7 +2300,7 @@ WinMaliCsfSubmitStreamCall_(
     /* Bind the CSG to the requested address space (a UMD group's VM, or the
      * bring-up AS for the NOP self-test). If the rebind fails to ack, don't
      * run the stream in the wrong AS - bail so the caller can fall back. */
-    status = WinMaliCsfRebindCsgAs_(Adapter, Fw, CsgAsSlot);
+    status = WinMaliCsfRebindCsgAs_(Adapter, Fw, CsgAsSlot, VmId);
     if (!NT_SUCCESS(status)) {
         WINMALI_WARN("CSF submit: CSG AS rebind to %u failed 0x%08x", CsgAsSlot, status);
         return status;
@@ -2414,7 +2501,8 @@ WinMaliCsfSubmitStreamCall_(
         }
     }
 
-    status = WinMaliFwWaitSeqno_(Adapter, sync, jobSeq, TimeoutMs, &i);
+    status = WinMaliFwWaitSeqno_(Adapter, Fw, VmId, sync, jobSeq,
+                                 TimeoutMs, &i);
     if (NT_SUCCESS(status)) {
             /* SUCCESS by seqno - but the seqno only proves the caller CS
                reached its post-WAIT SYNC_ADD. An ASYNC fault (shader core,
@@ -2599,6 +2687,7 @@ WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG TimeoutMs)
             (ULONG)sizeof(WinMaliShaderNop),
             0u,
             Adapter->GpuMmuBringupAs,   /* NOP self-test runs in the bring-up AS */
+            0u,                         /* no UMD VM / tiler heap */
             TimeoutMs);
         KeReleaseMutex(&fw->SubmitLock, FALSE);
         return st;
@@ -2620,6 +2709,7 @@ WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG TimeoutMs)
 static NTSTATUS
 WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
+                                     _In_ ULONG   VmId,
                                      _In_ UINT64  StreamGpuVa,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
@@ -2666,14 +2756,15 @@ WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
 
     st = WinMaliCsfSubmitStreamCall_(
              Adapter, fw, StreamGpuVa, StreamSizeBytes, LatestFlush,
-             GroupAsSlot, TimeoutMs);
+             GroupAsSlot, VmId, TimeoutMs);
     submitDone100ns = KeQueryInterruptTime();
     if (!NT_SUCCESS(st)) {
         WINMALI_WARN("CSF: group stream submit failed 0x%08x (as=%u) - resetting "
                      "slot to bring-up AS; next submit retries", st, GroupAsSlot);
     }
     if (!NT_SUCCESS(st) || ParkAfterSubmit) {
-        parkSt = WinMaliCsfRebindCsgAs_(Adapter, fw, Adapter->GpuMmuBringupAs);
+        parkSt = WinMaliCsfRebindCsgAs_(Adapter, fw,
+                                        Adapter->GpuMmuBringupAs, 0u);
         if (OutParked != NULL && NT_SUCCESS(parkSt)) {
             *OutParked = TRUE;
         }
@@ -2707,19 +2798,21 @@ WinMaliCsfSubmitGroupStreamInternal_(_Inout_ PWINMALI_ADAPTER Adapter,
 NTSTATUS
 WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                             _In_ ULONG   GroupAsSlot,
+                            _In_ ULONG   VmId,
                             _In_ UINT64  StreamGpuVa,
                             _In_ ULONG   StreamSizeBytes,
                             _In_ ULONG   LatestFlush,
                             _In_ ULONG   TimeoutMs)
 {
     return WinMaliCsfSubmitGroupStreamInternal_(
-        Adapter, GroupAsSlot, StreamGpuVa, StreamSizeBytes, LatestFlush,
+        Adapter, GroupAsSlot, VmId, StreamGpuVa, StreamSizeBytes, LatestFlush,
         TimeoutMs, FALSE, NULL);
 }
 
 NTSTATUS
 WinMaliCsfSubmitTransientGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
                                      _In_ ULONG   GroupAsSlot,
+                                     _In_ ULONG   VmId,
                                      _In_ UINT64  StreamGpuVa,
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
@@ -2730,7 +2823,7 @@ WinMaliCsfSubmitTransientGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
         return STATUS_INVALID_PARAMETER;
     }
     return WinMaliCsfSubmitGroupStreamInternal_(
-        Adapter, GroupAsSlot, StreamGpuVa, StreamSizeBytes, LatestFlush,
+        Adapter, GroupAsSlot, VmId, StreamGpuVa, StreamSizeBytes, LatestFlush,
         TimeoutMs, TRUE, OutParked);
 }
 
@@ -2757,7 +2850,7 @@ WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter)
         WinMaliCsfRecoverFaultedAs_(Adapter, faultedAs);
     }
     restartStatus = WinMaliCsfRebindCsgAs_(
-        Adapter, fw, Adapter->GpuMmuBringupAs);
+        Adapter, fw, Adapter->GpuMmuBringupAs, 0u);
     KeReleaseMutex(&fw->SubmitLock, FALSE);
 
     WINMALI_TRACE("CSF reset: oldAS=%u terminate=0x%08x restart=0x%08x",

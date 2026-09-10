@@ -76,11 +76,30 @@ WinMaliKmdQueryAdapterInfo(
         DXGK_DRIVERCAPS* caps  = (DXGK_DRIVERCAPS*)pQueryAdapterInfo->pOutputData;
         SIZE_T           outSz = pQueryAdapterInfo->OutputDataSize;
         SIZE_T           lim   = (outSz < sizeof(*caps)) ? outSz : sizeof(*caps);
+        PWINMALI_ADAPTER  adapter;
+        SIZE_T            apertureCommitLimit;
 
         if (caps == NULL || outSz == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
         RtlZeroMemory(caps, outSz);
+
+        /* QUERYSEGMENT3/4 below publish segment 1 as a CPU-visible aperture
+           and give it a non-zero CommitLimit.  DRIVERCAPS carries the
+           adapter-wide aperture commit limit used by VidMm telemetry.  The
+           old zero here was an invalid contract: after resize pressure,
+           dxgmms2's commit telemetry divided by that value and bugchecked
+           with STATUS_INTEGER_DIVIDE_BY_ZERO in
+           VIDMM_COMMIT_TELEMETRY::LogMemoryState.
+
+           QueryAdapterInfo can run before MmuInit has allocated the runtime
+           segment, so use the configured aperture capacity as the fallback;
+           once the adapter is initialized, prefer the actual segment size so
+           this value remains consistent with QUERYSEGMENT3/4. */
+        adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+        apertureCommitLimit = WINMALI_DMA_SEGMENT_BYTES;
+        if (adapter != NULL && adapter->DmaSegmentBytes != 0)
+            apertureCommitLimit = adapter->DmaSegmentBytes;
 
 #define WM_SET(field, val)                                                       \
         do {                                                                     \
@@ -100,7 +119,9 @@ WinMaliKmdQueryAdapterInfo(
             caps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
         }
         WM_SET(MaxAllocationListSlotId, 7);
-        WM_SET(ApertureSegmentCommitLimit, 0);
+        WM_SET(ApertureSegmentCommitLimit, apertureCommitLimit);
+        DbgPrint("[WinMali]    QAI[DRIVERCAPS] aperture_commit_limit=%Iu bytes\n",
+                 apertureCommitLimit);
         WM_SET(SupportNonVGA, TRUE);
         WM_SET(SupportSmoothRotation, TRUE);
         WM_SET(SupportPerEngineTDR, 1);
@@ -469,8 +490,14 @@ WinMaliKmdQueryAdapterInfo(
             segs[0].Flags.CacheCoherent             = 1;
             segs[0].Flags.CpuVisible                = 1;
             segs[0].Flags.ApplicationTarget         = 1;
-            segs[0].Flags.NonLocalBudgetGroup       = 1;
-            segs[0].Flags.LocalBudgetGroup          = 0;
+            /* RK3588 is UMA: physical system memory is the GPU's only
+               memory pool and therefore belongs to the LOCAL budget group.
+               NON_LOCAL represents the slower system-memory pool of a
+               discrete/NUMA adapter.  Reversing these flags leaves VidMm's
+               local-group budget denominator at zero; its failed-commit
+               telemetry then faults while calculating a percentage. */
+            segs[0].Flags.LocalBudgetGroup          = 1;
+            segs[0].Flags.NonLocalBudgetGroup       = 0;
             segs[0].BaseAddress.QuadPart            = WINMALI_SYSMEM_GPU_BASE;
             segs[0].CpuTranslatedAddress.QuadPart   = 0;   /* Aperture: dxgk pins pages on demand */
             segs[0].Size                            = adapter->DmaSegmentBytes;
@@ -478,7 +505,7 @@ WinMaliKmdQueryAdapterInfo(
             segs[0].pBankRangeTable                 = NULL;
             segs[0].CommitLimit                     = adapter->DmaSegmentBytes;
             segs[0].SystemMemoryEndAddress          = 0;
-            DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 fill] OK (1 aperture seg, %lu MiB)\n",
+            DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 fill] OK (1 UMA aperture seg, %lu MiB, budget=local)\n",
                      (ULONG)(adapter->DmaSegmentBytes >> 20));
         } else {
             DbgPrint("[WinMali]    QAI[QUERYSEGMENT3 probe] NbSegment=%u\n", kNumSegs);
@@ -516,6 +543,12 @@ WinMaliKmdQueryAdapterInfo(
         qo->PagingBufferSegmentId       = WINMALI_SEGMENT_ID_SYSMEM;
         qo->PagingBufferSize            = 64 * 1024;
         qo->PagingBufferPrivateDataSize = 0;
+        /* QUERYSEGMENT4 uses a byte-addressed descriptor array.  The
+           miniport must tell VidMm how far to advance between descriptors
+           on both the probe and fill calls.  Leaving this zero makes the
+           segment table structurally invalid even when descriptor 0 itself
+           contains valid Size and CommitLimit values. */
+        qo->SegmentDescriptorStride     = sizeof(DXGK_SEGMENTDESCRIPTOR4);
 
         segs = (DXGK_SEGMENTDESCRIPTOR4*)qo->pSegmentDescriptor;  /* BYTE* in header */
         if (segs != NULL) {
@@ -525,18 +558,22 @@ WinMaliKmdQueryAdapterInfo(
             segs[0].Flags.CacheCoherent             = 1;
             segs[0].Flags.CpuVisible                = 1;
             segs[0].Flags.ApplicationTarget         = 1;
-            segs[0].Flags.NonLocalBudgetGroup       = 1;
-            segs[0].Flags.LocalBudgetGroup          = 0;
+            /* Keep QUERYSEGMENT4's budget topology identical to the
+               QUERYSEGMENT3 response above. */
+            segs[0].Flags.LocalBudgetGroup          = 1;
+            segs[0].Flags.NonLocalBudgetGroup       = 0;
             segs[0].BaseAddress.QuadPart            = WINMALI_SYSMEM_GPU_BASE;
             segs[0].CpuTranslatedAddress.QuadPart   = 0;
             segs[0].Size                            = adapter->DmaSegmentBytes;
             segs[0].CommitLimit                     = adapter->DmaSegmentBytes;
             segs[0].SystemMemoryEndAddress          = 0;
             segs[0].NumInvalidMemoryRanges          = 0;
-            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 fill] OK (1 aperture seg, %lu MiB)\n",
-                     (ULONG)(adapter->DmaSegmentBytes >> 20));
+            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 fill] OK (1 UMA aperture seg, %lu MiB, budget=local, stride=%Iu)\n",
+                     (ULONG)(adapter->DmaSegmentBytes >> 20),
+                     qo->SegmentDescriptorStride);
         } else {
-            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 probe] NbSegment=%u\n", kNumSegs);
+            DbgPrint("[WinMali]    QAI[QUERYSEGMENT4 probe] NbSegment=%u stride=%Iu\n",
+                     kNumSegs, qo->SegmentDescriptorStride);
         }
         return STATUS_SUCCESS;
     }

@@ -14,6 +14,7 @@
         .\Tools\build.ps1 -SkipMesa                # KMD + UMD, no mesa
         .\Tools\build.ps1 -DriverLogProfile Focused # concise bring-up logs
         .\Tools\build.ps1 -DriverLogProfile Lifecycle # load/start/stop only
+        .\Tools\build.ps1 -DriverLogProfile NoLogging # compile out all driver logging
         .\Tools\build.ps1 -DriverLogProfile Glyph     # text/dual-source trace
         .\Tools\build.ps1 -DriverLogProfile ShaderCapture # one-run shader capture
         .\Tools\build.ps1 -DriverLogProfile Reject    # final glyph draw rejection state
@@ -23,6 +24,8 @@
         .\Tools\build.ps1 -DriverLogProfile FragWProbe # exact glyph FRAG_W bypass
         .\Tools\build.ps1 -DriverLogProfile LdVarProbe # exact glyph generic LD_VAR fallback
         .\Tools\build.ps1 -DriverLogProfile IdvsProbe  # exact glyph IDVS handoff trace
+        .\Tools\build.ps1 -DriverLogProfile PresentProbe # bounded DXGI present/redirection trace
+        .\Tools\build.ps1 -DriverLogProfile HandleLifecycle # allocation handle lifetime trace
         .\Tools\build.ps1 -Rebuild
 
     Exits non-zero if any step fails so CI can chain.
@@ -54,6 +57,8 @@
     scheduler/fence transitions, synchronization, and DXGI presentation logs.
     Lifecycle suppresses all KMD and Mesa/UMD output except KMD driver load,
     StartDevice, StopDevice, RemoveDevice, and unload messages.
+    NoLogging compiles out KMD and Mesa/UMD logging, does not create the KMD
+    file-log worker, and emits neither debugger nor C:\gpu.log output.
     Glyph keeps KMD lifecycle messages and only the UMD/Mesa events needed to
     trace D3D dual-source glyph blending. Those lines use [WinMaliText].
     ShaderCapture keeps KMD lifecycle messages and writes a compact, correlated
@@ -108,7 +113,7 @@ param(
     [ValidateSet("quiet","minimal","normal","detailed","diagnostic")]
     [string]$LogLevel = "minimal",
 
-    [ValidateSet("Verbose","Focused","Lifecycle","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe")]
+    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","HandleLifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     [switch]$InfVerif,

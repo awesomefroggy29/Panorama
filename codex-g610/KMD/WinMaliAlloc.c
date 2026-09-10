@@ -61,8 +61,284 @@ WinMaliAlignUpSz_(SIZE_T v, SIZE_T a)
     return (a == 0) ? v : (((v + a - 1) / a) * a);
 }
 
-/* Decode the documented per-allocation private data supplied again for a
-   device open. No pointer into the transient blob is retained. */
+static VOID
+WinMaliRegisterAllocation_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _Inout_ PWINMALI_KMD_ALLOCATION Allocation,
+    _In_reads_bytes_opt_(PrivateSize) const VOID* PrivateData,
+    _In_ UINT PrivateSize)
+{
+    KIRQL oldIrql;
+
+    Allocation->CreateProcessId = PsGetCurrentProcessId();
+    Allocation->CreateThreadId = PsGetCurrentThreadId();
+    if (PrivateData != NULL && PrivateSize != 0 &&
+        PrivateSize <= WINMALI_ALLOC_IDENTITY_MAX) {
+        RtlCopyMemory(Allocation->PrivateIdentity, PrivateData, PrivateSize);
+        Allocation->PrivateIdentitySize = PrivateSize;
+    }
+
+    KeAcquireSpinLock(&Adapter->AllocationRegistryLock, &oldIrql);
+    Allocation->RegistryId = ++Adapter->AllocationRegistryNextId;
+    InsertTailList(&Adapter->AllocationRegistryHead,
+                   &Allocation->RegistryEntry);
+    Allocation->RegistryLinked = TRUE;
+    KeReleaseSpinLock(&Adapter->AllocationRegistryLock, oldIrql);
+}
+
+static VOID
+WinMaliUnregisterAllocation_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _Inout_ PWINMALI_KMD_ALLOCATION Allocation)
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&Adapter->AllocationRegistryLock, &oldIrql);
+    if (Allocation->RegistryLinked) {
+        RemoveEntryList(&Allocation->RegistryEntry);
+        InitializeListHead(&Allocation->RegistryEntry);
+        Allocation->RegistryLinked = FALSE;
+    }
+    KeReleaseSpinLock(&Adapter->AllocationRegistryLock, oldIrql);
+}
+
+/* Hold and return the exact object previously associated with this runtime
+   handle.  On its first open, dxgkrnl has not exposed that association to us,
+   so bind the oldest unbound allocation created by the same caller with an
+   identical complete private blob.  CreateAllocation/OpenAllocation ordering
+   is preserved for multi-allocation calls, and later opens use the learned
+   runtime handle rather than repeating the inference. */
+static PWINMALI_KMD_ALLOCATION
+WinMaliResolveRegisteredAllocation_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ D3DKMT_HANDLE RuntimeHandle,
+    _In_reads_bytes_opt_(PrivateSize) const VOID* PrivateData,
+    _In_ UINT PrivateSize,
+    _Out_ PBOOLEAN LearnedAssociation)
+{
+    UCHAR identity[WINMALI_ALLOC_IDENTITY_MAX];
+    HANDLE processId = PsGetCurrentProcessId();
+    HANDLE threadId = PsGetCurrentThreadId();
+    PWINMALI_KMD_ALLOCATION sameThread = NULL;
+    PWINMALI_KMD_ALLOCATION result = NULL;
+    PLIST_ENTRY entry;
+    KIRQL oldIrql;
+    BOOLEAN identityValid;
+
+    *LearnedAssociation = FALSE;
+    if (RuntimeHandle == 0) {
+        return NULL;
+    }
+    identityValid = PrivateData != NULL && PrivateSize != 0 &&
+                    PrivateSize <= sizeof(identity);
+    if (identityValid) {
+        RtlCopyMemory(identity, PrivateData, PrivateSize);
+    }
+
+    KeAcquireSpinLock(&Adapter->AllocationRegistryLock, &oldIrql);
+    for (entry = Adapter->AllocationRegistryHead.Flink;
+         entry != &Adapter->AllocationRegistryHead;
+         entry = entry->Flink) {
+        PWINMALI_KMD_ALLOCATION candidate = CONTAINING_RECORD(
+            entry, WINMALI_KMD_ALLOCATION, RegistryEntry);
+
+        if (candidate->Magic != WINMALI_KMD_ALLOC_MAGIC ||
+            !candidate->RegistryLinked) {
+            continue;
+        }
+        if (candidate->RuntimeHandle == RuntimeHandle &&
+            candidate->RuntimeHandleProcessId == processId) {
+            result = candidate;
+            break;
+        }
+        if (!identityValid || candidate->RuntimeHandle != 0 ||
+            candidate->PrivateIdentitySize != PrivateSize ||
+            RtlCompareMemory(candidate->PrivateIdentity, identity,
+                             PrivateSize) != PrivateSize) {
+            continue;
+        }
+        if (sameThread == NULL &&
+            candidate->CreateProcessId == processId &&
+            candidate->CreateThreadId == threadId) {
+            sameThread = candidate;
+        }
+    }
+
+    if (result == NULL) {
+        result = sameThread;
+        if (result != NULL) {
+            result->RuntimeHandle = RuntimeHandle;
+            result->RuntimeHandleProcessId = processId;
+            *LearnedAssociation = TRUE;
+        }
+    }
+    if (result != NULL) {
+        InterlockedIncrement(&result->ReferenceCount);
+    }
+    KeReleaseSpinLock(&Adapter->AllocationRegistryLock, oldIrql);
+    return result;
+}
+
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+static ULONG
+WinMaliPrivateHash_(_In_reads_bytes_opt_(Size) const VOID* Data, _In_ UINT Size)
+{
+    const UCHAR* bytes = (const UCHAR*)Data;
+    ULONG hash = 2166136261u;
+    UINT i;
+
+    if (bytes == NULL || Size == 0) {
+        return 0;
+    }
+    for (i = 0; i < Size; ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static ULONGLONG
+WinMaliLifecycleRecordCreate_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ PWINMALI_KMD_ALLOCATION Allocation,
+    _In_ ULONG AllocationPrivateHash,
+    _In_ UINT AllocationPrivateSize,
+    _In_ ULONG ResourcePrivateHash,
+    _In_ UINT ResourcePrivateSize)
+{
+    KIRQL oldIrql;
+    ULONG slot;
+    WINMALI_ALLOC_LIFECYCLE_RECORD copy;
+
+    KeAcquireSpinLock(&Adapter->AllocLifecycleLock, &oldIrql);
+    slot = Adapter->AllocLifecycleCursor++ % WINMALI_ALLOC_LIFECYCLE_SLOTS;
+    RtlZeroMemory(&Adapter->AllocLifecycle[slot],
+                  sizeof(Adapter->AllocLifecycle[slot]));
+    Adapter->AllocLifecycle[slot].Id = ++Adapter->AllocLifecycleNextId;
+    Adapter->AllocLifecycle[slot].Allocation = Allocation;
+    Adapter->AllocLifecycle[slot].AllocationPrivateHash =
+        AllocationPrivateHash;
+    Adapter->AllocLifecycle[slot].AllocationPrivateSize =
+        AllocationPrivateSize;
+    Adapter->AllocLifecycle[slot].ResourcePrivateHash = ResourcePrivateHash;
+    Adapter->AllocLifecycle[slot].ResourcePrivateSize = ResourcePrivateSize;
+    Adapter->AllocLifecycle[slot].Size = Allocation->Size;
+    Adapter->AllocLifecycle[slot].Width = Allocation->Width;
+    Adapter->AllocLifecycle[slot].Height = Allocation->Height;
+    Adapter->AllocLifecycle[slot].Pitch = Allocation->Pitch;
+    Adapter->AllocLifecycle[slot].Format = Allocation->Format;
+    Adapter->AllocLifecycle[slot].Usage = Allocation->Usage;
+    Adapter->AllocLifecycle[slot].CreateProcessId = PsGetCurrentProcessId();
+    Adapter->AllocLifecycle[slot].CreateThreadId = PsGetCurrentThreadId();
+    copy = Adapter->AllocLifecycle[slot];
+    KeReleaseSpinLock(&Adapter->AllocLifecycleLock, oldIrql);
+
+    WINMALI_DIAG("[WinMaliHandleLifecycle] Create id=%llu ka=%p pid=%p tid=%p "
+                 "allocHash=%08x/%u resourceHash=%08x/%u size=0x%Ix "
+                 "%ux%u pitch=%u fmt=%u usage=0x%x",
+                 copy.Id, copy.Allocation, copy.CreateProcessId,
+                 copy.CreateThreadId, copy.AllocationPrivateHash,
+                 copy.AllocationPrivateSize, copy.ResourcePrivateHash,
+                 copy.ResourcePrivateSize, copy.Size, copy.Width, copy.Height,
+                 copy.Pitch, copy.Format, copy.Usage);
+    return copy.Id;
+}
+
+static VOID
+WinMaliLifecycleRecordDestroy_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ PWINMALI_KMD_ALLOCATION Allocation)
+{
+    KIRQL oldIrql;
+    ULONG i;
+    WINMALI_ALLOC_LIFECYCLE_RECORD copy;
+    BOOLEAN found = FALSE;
+
+    RtlZeroMemory(&copy, sizeof(copy));
+    KeAcquireSpinLock(&Adapter->AllocLifecycleLock, &oldIrql);
+    for (i = 0; i < WINMALI_ALLOC_LIFECYCLE_SLOTS; ++i) {
+        if (Adapter->AllocLifecycle[i].Allocation == Allocation &&
+            Adapter->AllocLifecycle[i].Id == Allocation->LifecycleId) {
+            Adapter->AllocLifecycle[i].Destroyed = TRUE;
+            Adapter->AllocLifecycle[i].DestroyProcessId =
+                PsGetCurrentProcessId();
+            Adapter->AllocLifecycle[i].DestroyThreadId =
+                PsGetCurrentThreadId();
+            copy = Adapter->AllocLifecycle[i];
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->AllocLifecycleLock, oldIrql);
+
+    WINMALI_DIAG("[WinMaliHandleLifecycle] Destroy id=%llu ka=%p found=%u "
+                 "pid=%p tid=%p refsBefore=%ld",
+                 Allocation->LifecycleId, Allocation, found,
+                 found ? copy.DestroyProcessId : PsGetCurrentProcessId(),
+                 found ? copy.DestroyThreadId : PsGetCurrentThreadId(),
+                 Allocation->ReferenceCount);
+}
+
+static BOOLEAN
+WinMaliLifecycleFindPrivate_(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ ULONG AllocationPrivateHash,
+    _In_ UINT AllocationPrivateSize,
+    _In_ ULONG ResourcePrivateHash,
+    _In_ UINT ResourcePrivateSize,
+    _Out_ PWINMALI_ALLOC_LIFECYCLE_RECORD Match,
+    _Out_ PULONG MatchBasis)
+{
+    KIRQL oldIrql;
+    ULONG i;
+    ULONG bestBasis = 0;
+    BOOLEAN found = FALSE;
+
+    RtlZeroMemory(Match, sizeof(*Match));
+    *MatchBasis = 0;
+    KeAcquireSpinLock(&Adapter->AllocLifecycleLock, &oldIrql);
+    for (i = 0; i < WINMALI_ALLOC_LIFECYCLE_SLOTS; ++i) {
+        PWINMALI_ALLOC_LIFECYCLE_RECORD record =
+            &Adapter->AllocLifecycle[i];
+        BOOLEAN allocationMatches =
+            AllocationPrivateSize != 0 &&
+            record->AllocationPrivateSize == AllocationPrivateSize &&
+            record->AllocationPrivateHash == AllocationPrivateHash;
+        BOOLEAN resourceMatches =
+            ResourcePrivateSize != 0 &&
+            record->ResourcePrivateSize == ResourcePrivateSize &&
+            record->ResourcePrivateHash == ResourcePrivateHash;
+        ULONG basis;
+
+        basis = allocationMatches ? 2u : (resourceMatches ? 1u : 0u);
+
+        if (basis != 0 &&
+            (basis > bestBasis ||
+             (basis == bestBasis && (!found || record->Id > Match->Id)))) {
+            *Match = *record;
+            bestBasis = basis;
+            found = TRUE;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->AllocLifecycleLock, oldIrql);
+    *MatchBasis = bestBasis;
+    return found;
+}
+#endif
+
+/* The WMAl blob is shared by Device.cpp's opaque BO allocator (dimensions
+   zero) and Resource.cpp's surface allocator. Its magic identifies the ABI,
+   not a presentation surface. Keep create and open classification identical. */
+static UINT
+WinMaliUsageFromBridgePrivate_(const WINMALI_ALLOCATION_PRIVATE* Private)
+{
+    return (Private->Width != 0 && Private->Height != 0)
+        ? WINMALI_ALLOC_USAGE_RENDER_TARGET : 0;
+}
+
+/* Decode the allocation metadata supplied again for a device open. This is
+   sufficient for GPUVA rendering even when dxgkrnl does not expose the
+   non-device-specific allocation object through GetHandleData. */
 static NTSTATUS
 WinMaliInitOpenFromPrivate_(
     _In_reads_bytes_(PrivateSize) const VOID* PrivateData,
@@ -93,7 +369,7 @@ WinMaliInitOpenFromPrivate_(
         Open->Size = WinMaliAlignUpSz_(Open->Size, PAGE_SIZE);
         Open->Alignment = PAGE_SIZE;
         Open->Format = bbPriv->Format;
-        Open->Usage = WINMALI_ALLOC_USAGE_RENDER_TARGET;
+        Open->Usage = WinMaliUsageFromBridgePrivate_(bbPriv);
         return STATUS_SUCCESS;
     }
 
@@ -155,6 +431,10 @@ WinMaliKmdCreateAllocation(
         SIZE_T                  bytes;
         UINT                    pitch;
         UINT                    bpp;
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        ULONG                   allocationPrivateHash;
+        ULONG                   resourcePrivateHash;
+#endif
 
         /* DXGI backbuffer / shared-surface allocs from the D3D11 UMD carry
            WINMALI_ALLOCATION_PRIVATE ('WMAl', Shared/WinMaliEscape.h), not
@@ -219,6 +499,7 @@ WinMaliKmdCreateAllocation(
                 PWINMALI_KMD_ALLOCATION prev =
                     (PWINMALI_KMD_ALLOCATION)pCreateAllocation->pAllocationInfo[i].hAllocation;
                 if (prev != NULL && prev->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+                    WinMaliUnregisterAllocation_(adapter, prev);
                     prev->Magic = 0;
                     ExFreePoolWithTag(prev, WINMALI_POOL_TAG);
                     pCreateAllocation->pAllocationInfo[i].hAllocation = NULL;
@@ -238,7 +519,7 @@ WinMaliKmdCreateAllocation(
             ka->Height = bbPriv->Height;
             ka->Pitch  = pitch;
             ka->Format = bbPriv->Format;   /* DXGI_FORMAT (informational) */
-            ka->Usage  = WINMALI_ALLOC_USAGE_RENDER_TARGET;
+            ka->Usage  = WinMaliUsageFromBridgePrivate_(bbPriv);
         } else if (priv != NULL && priv->Magic == WINMALI_ALLOC_PRIV_MAGIC) {
             ka->Width  = priv->Width;
             ka->Height = priv->Height;
@@ -261,21 +542,50 @@ WinMaliKmdCreateAllocation(
         info->SupportedWriteSegmentSet = (1u << (WINMALI_SEGMENT_ID_SYSMEM - 1));
         info->EvictionSegmentSet       = 0;
         info->PhysicalAdapterIndex     = 0;
-        info->Flags.Value              = 0;
-        info->Flags.CpuVisible         = 1;
-        info->Flags.Cached             = 0;
-        /* This is a GpuMmu allocation: the UMD maps it with
-           pfnMapGpuVirtualAddressCb and submits its GPU virtual address via
-           SubmitCommandVirtual.  AccessedPhysically is reserved for
-           allocations which the rendering engine addresses by physical
-           allocation-list entries, so it must remain clear here. */
+        /* Flags and FlagsWddm2 alias the same union storage. Initialize it
+           once through the WDDM2 view; clearing it after setting CpuVisible
+           makes the UMD's bootstrap CPU lock fail. */
+        info->FlagsWddm2.Value         = 0;
+        info->FlagsWddm2.CpuVisible    = 1;
+        info->FlagsWddm2.Cached        = 0;
+        /* Present is a physical-access path in this render-only adapter:
+           WinMaliKmdPresent consumes the allocation-list source/destination
+           and copies through the VidMm aperture MDL.  AccessedPhysically is
+           therefore required on render targets, primaries, and the standard
+           staging/shadow surface dxgkrnl supplies as a blt-present target.
+           It belongs to the WDDM2 flags field (not the legacy Flags field);
+           without it VidMm places the allocation in implicit system memory,
+           never emits MAP_APERTURE_SEGMENT, and Present has no MDL to copy. */
+        if ((ka->Usage & (WINMALI_ALLOC_USAGE_RENDER_TARGET |
+                          WINMALI_ALLOC_USAGE_PRIMARY |
+                          WINMALI_ALLOC_USAGE_STAGING)) != 0) {
+            info->FlagsWddm2.AccessedPhysically = 1;
+        }
         info->AllocationPriority       = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
         info->hAllocation              = (HANDLE)ka;
 
-        WINMALI_DIAG("Flow CreateAllocation[%u]: ka=%p resource=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x flags=0x%x private=%s",
+        WinMaliRegisterAllocation_(adapter, ka, info->pPrivateDriverData,
+                                   info->PrivateDriverDataSize);
+
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        allocationPrivateHash = WinMaliPrivateHash_(
+            info->pPrivateDriverData, info->PrivateDriverDataSize);
+        resourcePrivateHash = WinMaliPrivateHash_(
+            pCreateAllocation->pPrivateDriverData,
+            pCreateAllocation->PrivateDriverDataSize);
+        ka->AllocationPrivateHash = allocationPrivateHash;
+        ka->ResourcePrivateHash = resourcePrivateHash;
+        ka->LifecycleId = WinMaliLifecycleRecordCreate_(
+            adapter, ka, allocationPrivateHash,
+            info->PrivateDriverDataSize, resourcePrivateHash,
+            pCreateAllocation->PrivateDriverDataSize);
+#endif
+
+        WINMALI_DIAG("Flow CreateAllocation[%u]: ka=%p resource=%p sz=0x%Ix px=%ux%u@%u pitch=%u fmt=%u usage=0x%x flags=0x%x flagsWddm2=0x%x cpuVisible=%u private=%s",
                      i, ka, pCreateAllocation->hResource, ka->Size, ka->Width,
                      ka->Height, ka->Alignment, ka->Pitch, ka->Format,
-                     ka->Usage, info->Flags.Value,
+                     ka->Usage, info->Flags.Value, info->FlagsWddm2.Value,
+                     info->FlagsWddm2.CpuVisible,
                      bbPriv != NULL ? "WinMali/DXGI" :
                      (priv != NULL ? "legacy" : "runtime/raw"));
     }
@@ -311,6 +621,14 @@ WinMaliKmdDestroyAllocation(
             WINMALI_WARN("DestroyAllocation[%u]: ka=%p bad magic 0x%x", i, ka, ka->Magic);
             continue;
         }
+        if (ka->Adapter != NULL) {
+            WinMaliUnregisterAllocation_(ka->Adapter, ka);
+        }
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        if (ka->Adapter != NULL) {
+            WinMaliLifecycleRecordDestroy_(ka->Adapter, ka);
+        }
+#endif
         {
             LONG refs = InterlockedDecrement(&ka->ReferenceCount);
             WINMALI_DIAG("Flow DestroyAllocation[%u]: ka=%p sz=0x%Ix refs=%ld",
@@ -338,6 +656,8 @@ WinMaliKmdOpenAllocation(
     PWINMALI_ADAPTER adapter = NULL;
     UINT i;
     NTSTATUS status = STATUS_SUCCESS;
+    static volatile LONG handleProbeCount;
+    LONG handleProbe = InterlockedIncrement(&handleProbeCount);
 
     if (pOpenAllocation == NULL || pOpenAllocation->pOpenAllocation == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -360,9 +680,18 @@ WinMaliKmdOpenAllocation(
         DXGK_OPENALLOCATIONINFO* oi = &pOpenAllocation->pOpenAllocation[i];
         PWINMALI_KMD_ALLOCATION  ka = NULL;
         PWINMALI_KMD_OPEN_ALLOCATION open = NULL;
+        BOOLEAN                   registryReferenceHeld = FALSE;
+        BOOLEAN                   learnedAssociation = FALSE;
         D3DKMT_HANDLE             parent = 0;
         ULONG                     allocPrivMagic = 0;
         ULONG                     resourcePrivMagic = 0;
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        ULONG                     allocPrivHash;
+        ULONG                     resourcePrivHash;
+        WINMALI_ALLOC_LIFECYCLE_RECORD lifecycleMatch;
+        BOOLEAN                   lifecycleFound;
+        ULONG                     lifecycleMatchBasis;
+#endif
 
         if (oi->pPrivateDriverData != NULL &&
             oi->PrivateDriverDataSize >= sizeof(allocPrivMagic)) {
@@ -375,6 +704,16 @@ WinMaliKmdOpenAllocation(
                           pOpenAllocation->pPrivateDriverData,
                           sizeof(resourcePrivMagic));
         }
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        allocPrivHash = WinMaliPrivateHash_(oi->pPrivateDriverData,
+                                            oi->PrivateDriverDataSize);
+        resourcePrivHash = WinMaliPrivateHash_(
+            pOpenAllocation->pPrivateDriverData,
+            pOpenAllocation->PrivateDriverSize);
+        lifecycleFound = FALSE;
+        lifecycleMatchBasis = 0;
+        RtlZeroMemory(&lifecycleMatch, sizeof(lifecycleMatch));
+#endif
         if (adapter != NULL &&
             adapter->DxgkInterface.DxgkCbGetHandleParent != NULL &&
             oi->hAllocation != 0) {
@@ -392,19 +731,82 @@ WinMaliKmdOpenAllocation(
                       pOpenAllocation->PrivateDriverSize,
                       resourcePrivMagic);
 
-        /* Resolve the optional adapter/global allocation object first. The
-           device-specific cookie returned below is always a distinct open
-           object, whether or not dxgkrnl exposes that global object here. */
+        /* Resolve the non-device-specific allocation object created by
+           DxgkDdiCreateAllocation.  hDeviceSpecificAllocation does not exist
+           until this routine returns, so DeviceSpecific must remain clear
+           here.  This is the handle-data contract documented for
+           DxgkDdiOpenAllocation. */
         if (adapter != NULL &&
             adapter->DxgkInterface.DxgkCbGetHandleData != NULL &&
             oi->hAllocation != 0) {
             DXGKARGCB_GETHANDLEDATA ghd;
+            PVOID rawHandleData;
             RtlZeroMemory(&ghd, sizeof(ghd));
             ghd.hObject = oi->hAllocation;
             ghd.Type    = DXGK_HANDLE_ALLOCATION;
-            ka = (PWINMALI_KMD_ALLOCATION)
-                adapter->DxgkInterface.DxgkCbGetHandleData(&ghd);
+            ghd.Flags.DeviceSpecific = 0;
+            rawHandleData = adapter->DxgkInterface.DxgkCbGetHandleData(&ghd);
+            if (handleProbe <= 64) {
+                WINMALI_DIAG("[WinMaliHandleProbe] Open hAlloc=0x%x namespace=global raw=%p",
+                             (ULONG)oi->hAllocation, rawHandleData);
+            }
+            ka = (PWINMALI_KMD_ALLOCATION)rawHandleData;
+            if (handleProbe <= 64) {
+                WINMALI_DIAG("[WinMaliHandleProbe] Open hAlloc=0x%x accepted=%u magic=0x%x",
+                             (ULONG)oi->hAllocation,
+                             ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC,
+                             ka != NULL ? ka->Magic : 0u);
+            }
         }
+
+        if (ka == NULL || ka->Magic != WINMALI_KMD_ALLOC_MAGIC) {
+            ka = WinMaliResolveRegisteredAllocation_(
+                adapter, oi->hAllocation, oi->pPrivateDriverData,
+                oi->PrivateDriverDataSize, &learnedAssociation);
+            if (ka != NULL) {
+                registryReferenceHeld = TRUE;
+                WINMALI_DIAG("[WinMaliAllocRegistry] Resolve index=%u ka=%p "
+                             "hAlloc=0x%x id=%llu learned=%u refs=%ld",
+                             i, ka, (ULONG)oi->hAllocation, ka->RegistryId,
+                             learnedAssociation, ka->ReferenceCount);
+            }
+        }
+
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+        if (ka == NULL || ka->Magic != WINMALI_KMD_ALLOC_MAGIC) {
+            lifecycleFound = WinMaliLifecycleFindPrivate_(
+                adapter, allocPrivHash, oi->PrivateDriverDataSize,
+                resourcePrivHash, pOpenAllocation->PrivateDriverSize,
+                &lifecycleMatch, &lifecycleMatchBasis);
+            WINMALI_DIAG("[WinMaliHandleLifecycle] OpenNull hAlloc=0x%x "
+                         "parent=0x%x pid=%p tid=%p allocHash=%08x/%u "
+                         "resourceHash=%08x/%u diagnosis=%s matchBy=%s matchId=%llu "
+                         "matchKa=%p createPid=%p createTid=%p size=0x%Ix "
+                         "%ux%u pitch=%u fmt=%u usage=0x%x",
+                         (ULONG)oi->hAllocation, (ULONG)parent,
+                         PsGetCurrentProcessId(), PsGetCurrentThreadId(),
+                         allocPrivHash, oi->PrivateDriverDataSize,
+                         resourcePrivHash, pOpenAllocation->PrivateDriverSize,
+                         !lifecycleFound ? "no-match" :
+                            (lifecycleMatch.Destroyed ? "destroyed-match" :
+                                                        "live-match"),
+                         lifecycleMatchBasis == 2 ? "allocation-private" :
+                            (lifecycleMatchBasis == 1 ? "resource-private" :
+                                                        "none"),
+                         lifecycleMatch.Id, lifecycleMatch.Allocation,
+                         lifecycleMatch.CreateProcessId,
+                         lifecycleMatch.CreateThreadId, lifecycleMatch.Size,
+                         lifecycleMatch.Width, lifecycleMatch.Height,
+                         lifecycleMatch.Pitch, lifecycleMatch.Format,
+                         lifecycleMatch.Usage);
+        } else {
+            WINMALI_DIAG("[WinMaliHandleLifecycle] OpenResolved hAlloc=0x%x "
+                         "ka=%p id=%llu pid=%p tid=%p refsBefore=%ld",
+                         (ULONG)oi->hAllocation, ka, ka->LifecycleId,
+                         PsGetCurrentProcessId(), PsGetCurrentThreadId(),
+                         ka->ReferenceCount);
+        }
+#endif
 
         WINMALI_TRACE("OpenAllocation[%u]: GetHandleData returned ka=%p",
                       i, ka);
@@ -412,6 +814,11 @@ WinMaliKmdOpenAllocation(
         open = (PWINMALI_KMD_OPEN_ALLOCATION)ExAllocatePoolWithTag(
             NonPagedPoolNx, sizeof(*open), WINMALI_POOL_TAG);
         if (open == NULL) {
+            if (registryReferenceHeld &&
+                InterlockedDecrement(&ka->ReferenceCount) == 0) {
+                ka->Magic = 0;
+                ExFreePoolWithTag(ka, WINMALI_POOL_TAG);
+            }
             status = STATUS_INSUFFICIENT_RESOURCES;
             goto Rollback;
         }
@@ -431,22 +838,24 @@ WinMaliKmdOpenAllocation(
             open->Pitch = ka->Pitch;
             open->Format = ka->Format;
             open->Usage = ka->Usage;
-            InterlockedIncrement(&ka->ReferenceCount);
+            if (!registryReferenceHeld) {
+                InterlockedIncrement(&ka->ReferenceCount);
+            }
         } else {
-            /* The OpenAllocation blob is the documented device-open
-               description. It is sufficient to build device state without
-               a private handle table when the create handle is not visible
-               through DxgkCbGetHandleData. */
             status = WinMaliInitOpenFromPrivate_(
                 oi->pPrivateDriverData, oi->PrivateDriverDataSize, open);
             if (!NT_SUCCESS(status)) {
-                WINMALI_ERROR("OpenAllocation[%u]: unresolved hAlloc=0x%x and "
-                              "invalid private data st=0x%08x",
+                WINMALI_ERROR("OpenAllocation[%u]: global lookup failed "
+                              "hAlloc=0x%x and private metadata is invalid "
+                              "st=0x%08x",
                               i, (ULONG)oi->hAllocation, status);
                 open->Magic = 0;
                 ExFreePoolWithTag(open, WINMALI_POOL_TAG);
                 goto Rollback;
             }
+            WINMALI_WARN("OpenAllocation[%u]: global lookup unavailable; "
+                         "using metadata-only GPUVA open hAlloc=0x%x usage=0x%x",
+                         i, (ULONG)oi->hAllocation, open->Usage);
         }
 
         oi->hDeviceSpecificAllocation = (HANDLE)open;

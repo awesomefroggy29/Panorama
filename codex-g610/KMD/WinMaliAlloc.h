@@ -25,10 +25,20 @@ typedef WINMALI_ALLOC_PRIV* PWINMALI_ALLOC_PRIV;
 /* ---------------- WINMALI_KMD_ALLOCATION - per-alloc kernel state -------- */
 
 #define WINMALI_KMD_ALLOC_MAGIC      'AllW'
+#define WINMALI_ALLOC_IDENTITY_MAX   64u
 
 typedef struct _WINMALI_KMD_ALLOCATION {
     ULONG               Magic;        /* 'AllW' */
     struct _WINMALI_ADAPTER* Adapter;
+    LIST_ENTRY          RegistryEntry;
+    BOOLEAN             RegistryLinked;
+    D3DKMT_HANDLE       RuntimeHandle;
+    HANDLE              RuntimeHandleProcessId;
+    ULONGLONG           RegistryId;
+    HANDLE              CreateProcessId;
+    HANDLE              CreateThreadId;
+    UINT                PrivateIdentitySize;
+    UCHAR               PrivateIdentity[WINMALI_ALLOC_IDENTITY_MAX];
     HANDLE              hResource;    /* dxgk's hResource or NULL */
     SIZE_T              Size;         /* page-aligned bytes */
     UINT                Alignment;
@@ -43,6 +53,11 @@ typedef struct _WINMALI_KMD_ALLOCATION {
     UINT64              GpuVa;
     PHYSICAL_ADDRESS    PhysicalBase;
     LONG                ReferenceCount; /* create owner + device opens */
+#if defined(WINMALI_HANDLE_LIFECYCLE_PROBE)
+    ULONGLONG           LifecycleId;
+    ULONG               AllocationPrivateHash;
+    ULONG               ResourcePrivateHash;
+#endif
     /* Aperture residency, stashed by BuildPagingBuffer MAP_APERTURE_SEGMENT
        and cleared at UNMAP. The MDL is VidMm's - it is only valid while the
        allocation is mapped (present blts and BoFromAllocation both require
@@ -73,8 +88,8 @@ typedef struct _WINMALI_KMD_OPEN_ALLOCATION {
     UINT                        Format;
     UINT                        Usage;
     BOOLEAN                     ReadOnly;
-    /* Optional global state. Correct Open/Close ownership never depends on
-       this pointer; WDDM 2.x GPUVA mapping supplies render residency. */
+    /* Non-device-specific allocation state returned by CreateAllocation.
+       OpenAllocation owns one reference until CloseAllocation. */
     PWINMALI_KMD_ALLOCATION     Global;
 } WINMALI_KMD_OPEN_ALLOCATION, *PWINMALI_KMD_OPEN_ALLOCATION;
 
@@ -89,8 +104,8 @@ typedef struct _WINMALI_KMD_OPEN_ALLOCATION {
 typedef struct _WINMALI_BLT_DESC {
     ULONG                    Magic;      /* WINMALI_BLT_DESC_MAGIC */
     ULONG                    SubRectCnt;
-    PWINMALI_KMD_OPEN_ALLOCATION Src;    /* rendered back buffer */
-    PWINMALI_KMD_OPEN_ALLOCATION Dst;    /* primary / cross-adapter */
+    PWINMALI_KMD_ALLOCATION  Src;        /* referenced rendered back buffer */
+    PWINMALI_KMD_ALLOCATION  Dst;        /* referenced present target */
     LONG                     SrcLeft, SrcTop;
     LONG                     DstLeft, DstTop, DstRight, DstBottom;
 } WINMALI_BLT_DESC, *PWINMALI_BLT_DESC;
