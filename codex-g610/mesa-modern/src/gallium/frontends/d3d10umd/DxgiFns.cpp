@@ -104,6 +104,7 @@ WinMaliPresentProbeHash(struct pipe_context *pipe,
 }
 #endif
 
+#if defined(WINMALI_SHADER_CAPTURE)
 static bool
 WinMaliCaptureTargetProcess(void)
 {
@@ -126,6 +127,7 @@ WinMaliCaptureTargetProcess(void)
 #endif
           ;
 }
+#endif
 
 
 /*
@@ -200,7 +202,10 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
     * Capture a bounded set of resource identities, with two samples per
     * identity so that an initially-empty swapchain buffer does not hide its
     * later contents.  This is diagnostic-only and uses the ordinary
-    * synchronized Gallium map path. */
+    * synchronized Gallium map path.  File capture belongs exclusively to the
+    * ShaderCapture profile; ordinary logging/probe profiles must never insert
+    * a synchronous readback into Present. */
+#if defined(WINMALI_SHADER_CAPTURE)
    {
       struct PresentCaptureSlot {
          struct pipe_resource *resource;
@@ -239,6 +244,7 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
          WinMaliDiagnosticCaptureResource(device->pipe, src, stage);
       }
    }
+#endif
 
    /* Redirected present: when hDstResource is non-zero the runtime wants us to
     * copy the source into that destination surface (the DWM-off / cross-adapter

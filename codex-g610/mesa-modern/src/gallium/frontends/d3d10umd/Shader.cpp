@@ -387,6 +387,7 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
       ShaderResourceView *view =
             CastShaderResourceView(phShaderResourceViews[i]);
       struct pipe_sampler_view *sampler_view = view ? view->handle : NULL;
+#if defined(WINMALI_SHADER_CAPTURE)
       if (shader_type == MESA_SHADER_FRAGMENT && view && sampler_view &&
           sampler_view->texture) {
          struct pipe_resource *texture = sampler_view->texture;
@@ -417,6 +418,7 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
          }
 #endif
       }
+#endif
       if (shader_type == MESA_SHADER_FRAGMENT && view && sampler_view &&
           !view->textureBindLogged) {
          view->textureBindLogged = true;

@@ -288,6 +288,7 @@ WinMaliLogSmallReadback(const struct pipe_resource *resource,
                (unsigned long long)laneSum[3]);
 }
 
+#if defined(WINMALI_SHADER_CAPTURE)
 static void
 WinMaliDiagnosticProcessName(char *name, size_t nameSize)
 {
@@ -363,12 +364,21 @@ WinMaliDiagnosticWriteBmp(const char *process, const char *stage,
    CloseHandle(file);
    return ok;
 }
+#endif
 
 bool
 WinMaliDiagnosticCaptureResource(struct pipe_context *pipe,
                                  struct pipe_resource *resource,
                                  const char *stage)
 {
+#if !defined(WINMALI_SHADER_CAPTURE)
+   /* A hard compile-time backstop: no non-capture profile may accidentally
+    * turn a future call site into a GPU readback or BMP write. */
+   (void)pipe;
+   (void)resource;
+   (void)stage;
+   return false;
+#else
    if (!pipe || !resource || !stage || resource->target == PIPE_BUFFER ||
        resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
        !resource->width0 || !resource->height0 || resource->depth0 != 1)
@@ -475,6 +485,7 @@ WinMaliDiagnosticCaptureResource(struct pipe_context *pipe,
                stage, resource);
 #endif
    return true;
+#endif
 }
 
 #if defined(WINMALI_SHADER_CAPTURE)

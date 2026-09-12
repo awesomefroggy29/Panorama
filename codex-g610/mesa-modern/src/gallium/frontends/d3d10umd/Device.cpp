@@ -883,10 +883,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
 
 
 #if defined(_WIN32) && defined(HAVE_WINMALI_WDDM_KMOD)
-   /* WinMali does not implement the D3D9 shared-hardware interoperability
-    * required by DXGI's shared-resource redirection path. Request the
-    * PresentDXGI path with CPU-accessible swap-chain resources instead.
-    * NO_REDIRECTION is a success status; device creation is complete. */
+   /* Returning S_OK alone did not make DXGI provide a redirected destination:
+    * the runtime omitted the KMD present while never calling BltDXGI. Keep the
+    * working no-redirection path until the complete cross-adapter contract is
+    * implemented and verified. */
    DebugPrintf("[WinMaliUmdDiag] CreateDevice EXIT hr=0x%08lx presentation=no-redirection\n",
                (unsigned long)DXGI_STATUS_NO_REDIRECTION);
    return DXGI_STATUS_NO_REDIRECTION;
