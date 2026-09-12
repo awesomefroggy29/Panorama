@@ -93,6 +93,17 @@
 #define WINMALI_CSF_BRINGUP_SHADER_GPU_VA  0x420000ull
 #define WINMALI_CSF_BRINGUP_SYNC_GPU_VA    0x421000ull
 
+/* The bootstrap shader page is mapped RW/EX in the permanent bring-up AS.
+   Keep the original NOP at offset zero and place the present-copy program,
+   descriptors, parameters and bounded callee stream in disjoint aligned
+   regions of the same page. SubmitLock protects all mutable regions. */
+#define WINMALI_PRESENT_SHADER_OFFSET       0x100u
+#define WINMALI_PRESENT_SPD_OFFSET          0x140u
+#define WINMALI_PRESENT_TSD_OFFSET          0x180u
+#define WINMALI_PRESENT_FAU_OFFSET          0x1c0u
+#define WINMALI_PRESENT_STREAM_OFFSET       0x200u
+#define WINMALI_PRESENT_STREAM_SLOTS        18u
+
 //
 // Per-Mesa v10.xml the SPD lives at the start of the descriptor page;
 // the Local Storage struct must be 64 B aligned; the FAU table only needs
@@ -145,6 +156,21 @@ typedef struct _WINMALI_VALHALL_LOCAL_STORAGE {
 } WINMALI_VALHALL_LOCAL_STORAGE;
 C_ASSERT(sizeof(WINMALI_VALHALL_LOCAL_STORAGE) == 32);
 #pragma pack(pop)
+
+C_ASSERT((WINMALI_PRESENT_SHADER_OFFSET & 7u) == 0u);
+C_ASSERT(WINMALI_PRESENT_SHADER_OFFSET +
+         sizeof(WinMaliShaderPresentCopy16) <= WINMALI_PRESENT_SPD_OFFSET);
+C_ASSERT((WINMALI_PRESENT_SPD_OFFSET & 31u) == 0u);
+C_ASSERT(WINMALI_PRESENT_SPD_OFFSET +
+         sizeof(WINMALI_VALHALL_SPD) <= WINMALI_PRESENT_TSD_OFFSET);
+C_ASSERT((WINMALI_PRESENT_TSD_OFFSET & 63u) == 0u);
+C_ASSERT(WINMALI_PRESENT_TSD_OFFSET +
+         sizeof(WINMALI_VALHALL_LOCAL_STORAGE) <= WINMALI_PRESENT_FAU_OFFSET);
+C_ASSERT((WINMALI_PRESENT_FAU_OFFSET & 15u) == 0u);
+C_ASSERT(WINMALI_PRESENT_FAU_OFFSET + (2u * sizeof(UINT64)) <=
+         WINMALI_PRESENT_STREAM_OFFSET);
+C_ASSERT(WINMALI_PRESENT_STREAM_OFFSET +
+         (WINMALI_PRESENT_STREAM_SLOTS * sizeof(UINT64)) <= PAGE_SIZE);
 
 #define WINMALI_VALHALL_DESC_TYPE_SHADER     8u
 #define WINMALI_VALHALL_SHADER_STAGE_COMPUTE 1u
@@ -2825,6 +2851,185 @@ WinMaliCsfSubmitTransientGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
     return WinMaliCsfSubmitGroupStreamInternal_(
         Adapter, GroupAsSlot, VmId, StreamGpuVa, StreamSizeBytes, LatestFlush,
         TimeoutMs, TRUE, OutParked);
+}
+
+/* Submit a KMD-owned compute copy in the permanent aperture address space.
+   This deliberately lives beside the CSF implementation: preparing mutable
+   FAU/stream data must be covered by the same SubmitLock that serializes the
+   single firmware CSG slot. */
+NTSTATUS
+WinMaliCsfPresentCopy(_Inout_ PWINMALI_ADAPTER Adapter,
+                      _In_ UINT64 SourceGpuVa,
+                      _In_ UINT64 DestinationGpuVa,
+                      _In_ UINT64 CopyBytes,
+                      _In_ ULONG TimeoutMs,
+                      _Out_ PBOOLEAN CpuFallbackSafe)
+{
+    WINMALI_FWCTX* fw;
+    PUCHAR page;
+    WINMALI_VALHALL_SPD* spd;
+    WINMALI_VALHALL_LOCAL_STORAGE* tsd;
+    UINT64* fau;
+    UINT64* stream;
+    UINT64 shaderGpuVa;
+    UINT64 spdGpuVa;
+    UINT64 tsdGpuVa;
+    UINT64 fauGpuVa;
+    UINT64 encodedFau;
+    UINT64 streamGpuVa;
+    UINT64 workgroupCount;
+    ULONG sbWaitMask;
+    NTSTATUS status;
+    NTSTATUS recoveryStatus;
+
+    if (CpuFallbackSafe == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* No GPU work has been launched yet, so all validation failures are safe
+       for the caller's established CPU row-copy fallback. */
+    *CpuFallbackSafe = TRUE;
+    if (Adapter == NULL || Adapter->FwCtx == NULL || SourceGpuVa == 0 ||
+        DestinationGpuVa == 0 || CopyBytes == 0 ||
+        (SourceGpuVa & 0xfull) != 0 ||
+        (DestinationGpuVa & 0xfull) != 0 || (CopyBytes & 0xffull) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* The shader copies 16 bytes per invocation. A 16x1x1 local workgroup
+       therefore copies 256 bytes. This reduces a 960x720 BGRA present from
+       172800 one-thread workgroups to 10800 normal workgroups. */
+    workgroupCount = CopyBytes >> 8;
+    /* JOB_SIZE_X is a 32-bit CS register. */
+    if (workgroupCount == 0 || workgroupCount > MAXULONG) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+
+    fw = (WINMALI_FWCTX*)Adapter->FwCtx;
+    if (!fw->CsfBootValid || fw->HostShaderVa == NULL ||
+        (Adapter->AdapterFlags & WINMALI_ADAPTER_FLAG_CSF_JOBS) == 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    KeWaitForSingleObject(&fw->SubmitLock, Executive, KernelMode, FALSE, NULL);
+
+    page = (PUCHAR)fw->HostShaderVa;
+    spd = (WINMALI_VALHALL_SPD*)(page + WINMALI_PRESENT_SPD_OFFSET);
+    tsd = (WINMALI_VALHALL_LOCAL_STORAGE*)(page + WINMALI_PRESENT_TSD_OFFSET);
+    fau = (UINT64*)(page + WINMALI_PRESENT_FAU_OFFSET);
+    stream = (UINT64*)(page + WINMALI_PRESENT_STREAM_OFFSET);
+    shaderGpuVa = WINMALI_CSF_BRINGUP_SHADER_GPU_VA +
+                  WINMALI_PRESENT_SHADER_OFFSET;
+    spdGpuVa = WINMALI_CSF_BRINGUP_SHADER_GPU_VA + WINMALI_PRESENT_SPD_OFFSET;
+    tsdGpuVa = WINMALI_CSF_BRINGUP_SHADER_GPU_VA + WINMALI_PRESENT_TSD_OFFSET;
+    fauGpuVa = WINMALI_CSF_BRINGUP_SHADER_GPU_VA + WINMALI_PRESENT_FAU_OFFSET;
+    streamGpuVa = WINMALI_CSF_BRINGUP_SHADER_GPU_VA +
+                  WINMALI_PRESENT_STREAM_OFFSET;
+
+    RtlCopyMemory(page + WINMALI_PRESENT_SHADER_OFFSET,
+                  WinMaliShaderPresentCopy16,
+                  sizeof(WinMaliShaderPresentCopy16));
+    RtlZeroMemory(spd, sizeof(*spd));
+    /* Shader descriptor: Compute, 32 work registers. Preload FAU vec2 u0/u1
+       into r48-r51 and the compute global X ID into r60. */
+    spd->Word0_TypeStageFlags =
+        WINMALI_VALHALL_DESC_TYPE_SHADER |
+        (WINMALI_VALHALL_SHADER_STAGE_COMPUTE << 4) |
+        (2u << 30);
+    spd->Word1_Preload = 0x0003u | (1u << 12);
+    spd->Binary = shaderGpuVa;
+
+    RtlZeroMemory(tsd, sizeof(*tsd));
+    tsd->WlsWord = WINMALI_LOCAL_STORAGE_NO_WORKGROUP_MEM;
+    fau[0] = SourceGpuVa;
+    fau[1] = DestinationGpuVa;
+    /* A CSF shader-register FAU value is not a bare pointer.  Mesa encodes
+       the number of 64-bit FAU entries in bits 56..63.  The copy program
+       consumes u0 and u1, hence two entries.  Since that high-byte count
+       makes the value wider than MOVE48, program r8:r9 with two MOVE32s just
+       like cs_move64_to() does for a non-48-bit immediate. */
+    encodedFau = fauGpuVa | (2ull << 56);
+
+    if (fw->SbSlotCount == 0u) {
+        sbWaitMask = 1u;
+    } else if (fw->SbSlotCount >= 16u) {
+        sbWaitMask = 0xffffu;
+    } else {
+        sbWaitMask = (1u << fw->SbSlotCount) - 1u;
+    }
+
+    RtlZeroMemory(stream,
+                  WINMALI_PRESENT_STREAM_SLOTS * sizeof(stream[0]));
+    /* Compute SR layout used by Mesa/pan_csf.c. REQ_RESOURCE.compute is
+       required before RUN_COMPUTE; cs_run_compute() records this requirement
+       and every Mesa CSF queue emits it. Without it the endpoint is never
+       granted and RUN_COMPUTE can remain pending without raising an MMU or
+       shader fault.
+
+       r0=SRT, r8=FAU, r16=SPD, r24=TSD, r33=packed local size,
+       r34..36=job offsets and r37..39=workgroup-grid sizes. The fields in
+       COMPUTE_SIZE_WORKGROUP are stored minus one, so 16x1x1 packs as 15. */
+    stream[0]  = (34ull << 56) | 1ull; /* REQ_RESOURCE.compute */
+    stream[1]  = (1ull << 56) | (0ull  << 48); /* SRT = NULL */
+    stream[2]  = (2ull << 56) | (8ull  << 48) |
+                 (encodedFau & 0xffffffffull);
+    stream[3]  = (2ull << 56) | (9ull  << 48) |
+                 ((encodedFau >> 32) & 0xffffffffull);
+    stream[4]  = (1ull << 56) | (16ull << 48) | spdGpuVa;
+    stream[5]  = (1ull << 56) | (24ull << 48) | tsdGpuVa;
+    stream[6]  = (2ull << 56) | (33ull << 48) | 15ull; /* WG 16x1x1 */
+    stream[7]  = (2ull << 56) | (34ull << 48); /* offset X */
+    stream[8]  = (2ull << 56) | (35ull << 48); /* offset Y */
+    stream[9]  = (2ull << 56) | (36ull << 48); /* offset Z */
+    stream[10] = (2ull << 56) | (37ull << 48) | workgroupCount;
+    stream[11] = (2ull << 56) | (38ull << 48) | 1ull;
+    stream[12] = (2ull << 56) | (39ull << 48) | 1ull;
+    /* RUN_COMPUTE.x_axis. 32 workgroups per task is 512 shader invocations,
+       matching Mesa's task-sizing model while remaining conservative for
+       G610/G615. */
+    stream[13] = (4ull << 56) | 32ull;
+    stream[14] = (3ull << 56) | ((UINT64)sbWaitMask << 16);
+    stream[15] = (2ull << 56) | (40ull << 48); /* latest-flush id = 0 */
+    /* Clean L2 + LSC after the writes and signal scoreboard slot zero. */
+    stream[16] = (36ull << 56) | (40ull << 40) | 0x11ull;
+    stream[17] = (3ull << 56) | (1ull << 16);
+    KeMemoryBarrier();
+
+    /* From this point until either completion or a successful CSG restart,
+       the CPU must not touch the destination. A host wait timeout does not
+       imply that the firmware stopped the dispatch. */
+    *CpuFallbackSafe = FALSE;
+    status = WinMaliCsfSubmitStreamCall_(
+        Adapter, fw, streamGpuVa,
+        WINMALI_PRESENT_STREAM_SLOTS * sizeof(stream[0]), 0u,
+        Adapter->GpuMmuBringupAs, 0u, TimeoutMs);
+    if (NT_SUCCESS(status)) {
+        *CpuFallbackSafe = TRUE;
+    } else {
+        /* PresentCopy calls the low-level submit helper directly, so it must
+           perform the same terminate/rebind recovery as ordinary group-stream
+           submissions. This prevents a timed-out copy from completing late,
+           consuming the following sequence number and wedging every later
+           render submission. */
+        recoveryStatus = WinMaliCsfRebindCsgAs_(
+            Adapter, fw, Adapter->GpuMmuBringupAs, 0u);
+        if (NT_SUCCESS(recoveryStatus)) {
+            UINT64 observedSeq =
+                ((volatile WINMALI_PANTHOR_SYNCOBJ64*)fw->HostSyncVa)->Seqno;
+
+            /* The aborted dispatch may never execute the trampoline's final
+               SYNC_ADD64. Once termination is acknowledged there is no work
+               left that can update this counter, so make the next expected
+               value relative to the value hardware actually reached. */
+            fw->KqJobSeq = observedSeq;
+            *CpuFallbackSafe = TRUE;
+            WINMALI_WARN("[WinMaliGpuPresent] failed status=0x%08x; CSG recovered at seq=%llu, CPU fallback safe",
+                         status, (ULONGLONG)observedSeq);
+        } else {
+            WINMALI_ERROR("[WinMaliGpuPresent] failed status=0x%08x; CSG recovery failed 0x%08x, CPU fallback unsafe",
+                          status, recoveryStatus);
+        }
+    }
+    KeReleaseMutex(&fw->SubmitLock, FALSE);
+    return status;
 }
 
 /* Scheduler/TDR entry point. The scheduler has already quiesced its worker,

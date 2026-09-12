@@ -116,6 +116,7 @@
     <!-- PresentProbe must retain the UMD DebugLog escape path so its bounded
          DXGI trace reaches C:\gpu.log. -->
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'PresentProbe'">WINMALI_LOG_FOCUSED=1;WINMALI_PRESENT_PROBE=1;</WinMaliLogDefine>
+    <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'GpuPresent'">WINMALI_LOG_FOCUSED=1;WINMALI_PRESENT_PROBE=1;WINMALI_GPU_PRESENT=1;</WinMaliLogDefine>
     <WinMaliLogDefine Condition="'$(WinMaliLogProfile)' == 'HandleLifecycle'">WINMALI_LOG_FOCUSED=1;WINMALI_HANDLE_LIFECYCLE_PROBE=1;</WinMaliLogDefine>
   </PropertyGroup>
 

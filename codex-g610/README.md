@@ -1,3 +1,3 @@
-# Panorama
+# rk3588-GPU
 
-A gpu driver being worked on specifically for the Mali g610 gpu.
+TODO ima just rewrite this when i add other models i guess.

@@ -1288,12 +1288,13 @@ WinMaliKmdQueryCurrentFence(
 /* ------------------------------------------------------------------------ */
 
 /* Present phase-2: execute a WINMALI_BLT_DESC recorded by DxgkDdiPresent.
-   CPU copy from the rendered backbuffer allocation into the present target
-   (DWM redirection / cross-adapter surface), row by row, honoring both
-   pitches and the dst rect. Runs at PASSIVE_LEVEL (SubmitCommand comes from
-   a dxgk worker); both allocations are resident here because VidMm makes
-   present's allocation list resident before submitting the DMA buffer.
-   Any inconsistency drops the frame with a warning - never the fence. */
+   GpuPresent builds use a KMD-owned Valhall compute copy for the strict,
+   common full-surface case. Other layouts retain the proven CPU row-copy
+   path. A failed GPU submission may fall back only after the CSG is known
+   stopped. Runs at PASSIVE_LEVEL after older
+   rendering has completed; VidMm keeps both allocations resident until this
+   queued present is retired. Any inconsistency drops the frame with a warning
+   - never the fence. */
 static VOID
 WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
 {
@@ -1301,9 +1302,14 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
     PWINMALI_KMD_ALLOCATION dst = d->Dst;
     PUCHAR srcBase, dstBase;
     SIZE_T srcBytes, dstBytes;
+    SIZE_T rowBytes;
     ULONG  srcPitch, dstPitch;
-    LONG   width, height, r;
+    LONG   width, height, r, rowsCopied = 0;
     const ULONG bpp = 4;   /* swapchain / GDI surfaces are 32bpp linear */
+#if defined(WINMALI_GPU_PRESENT)
+    static volatile LONG gpuPresentLogCount = 0;
+    LONG gpuPresentLogIndex;
+#endif
 
     if (src == NULL || dst == NULL ||
         src->Magic != WINMALI_KMD_ALLOC_MAGIC ||
@@ -1325,17 +1331,6 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
         return;
     }
 
-    srcBase = (PUCHAR)MmGetSystemAddressForMdlSafe(src->ApertureMdl,
-                                                   NormalPagePriority | MdlMappingNoExecute);
-    dstBase = (PUCHAR)MmGetSystemAddressForMdlSafe(dst->ApertureMdl,
-                                                   NormalPagePriority | MdlMappingNoExecute);
-    if (srcBase == NULL || dstBase == NULL) {
-        WINMALI_WARN("PresentBlt: MDL map failed (src=%p dst=%p) - frame dropped",
-                     srcBase, dstBase);
-        return;
-    }
-    srcBase += (SIZE_T)src->ApertureMdlOffset << PAGE_SHIFT;
-    dstBase += (SIZE_T)dst->ApertureMdlOffset << PAGE_SHIFT;
     srcBytes = (SIZE_T)src->AperturePageCount << PAGE_SHIFT;
     dstBytes = (SIZE_T)dst->AperturePageCount << PAGE_SHIFT;
 
@@ -1362,12 +1357,110 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
         }
     }
 
-    for (r = 0; r < height; ++r) {
+    rowBytes = (SIZE_T)width * bpp;
+
+#if defined(WINMALI_GPU_PRESENT)
+    /* The aperture mappings installed by BuildPagingBuffer are visible in the
+       permanent bring-up address space. Restrict the first implementation to
+       a complete tightly-packed surface, so one linear dispatch is exactly
+       equivalent to the CPU memcpy and cannot cross row padding. */
+    gpuPresentLogIndex = InterlockedIncrement(&gpuPresentLogCount);
+    if (src->Adapter != NULL && src->Adapter == dst->Adapter &&
+        src->GpuVa != 0 && dst->GpuVa != 0 &&
+        d->SrcLeft == 0 && d->SrcTop == 0 &&
+        d->DstLeft == 0 && d->DstTop == 0 &&
+        rowBytes == srcPitch && rowBytes == dstPitch &&
+        (src->Width == 0 || (ULONG)width == src->Width) &&
+        (dst->Width == 0 || (ULONG)width == dst->Width) &&
+        (src->Height == 0 || (ULONG)height == src->Height) &&
+        (dst->Height == 0 || (ULONG)height == dst->Height) &&
+        rowBytes <= ((SIZE_T)-1) / (SIZE_T)height) {
+        SIZE_T copyBytes = rowBytes * (SIZE_T)height;
+
+        if (copyBytes <= srcBytes && copyBytes <= dstBytes &&
+            (src->GpuVa & 0xfull) == 0 &&
+            (dst->GpuVa & 0xfull) == 0 && (copyBytes & 0xffull) == 0) {
+            BOOLEAN cpuFallbackSafe = TRUE;
+            NTSTATUS gpuStatus = WinMaliCsfPresentCopy(
+                src->Adapter, src->GpuVa, dst->GpuVa, (UINT64)copyBytes, 500u,
+                &cpuFallbackSafe);
+
+            if (NT_SUCCESS(gpuStatus)) {
+                if (gpuPresentLogIndex <= 64) {
+                    WINMALI_DIAG("[WinMaliGpuPresent] path=gpu-full size=%ldx%ld bytes=%Iu srcVa=0x%llx dstVa=0x%llx",
+                                 width, height, copyBytes,
+                                 (ULONGLONG)src->GpuVa,
+                                 (ULONGLONG)dst->GpuVa);
+                }
+#if defined(WINMALI_PRESENT_PROBE)
+                WINMALI_DIAG("[WinMaliPresentOrder] WorkerGpuCopy size=%ldx%ld src=%p dst=%p",
+                             width, height, src, dst);
+#endif
+                return;
+            }
+
+            if (!cpuFallbackSafe) {
+                WINMALI_ERROR("[WinMaliGpuPresent] frame dropped: failed GPU copy remains in an indeterminate state status=0x%08x size=%ldx%ld",
+                              gpuStatus, width, height);
+                return;
+            }
+
+            if (gpuPresentLogIndex <= 64) {
+                WINMALI_DIAG("[WinMaliGpuPresent] path=cpu-fallback reason=submit status=0x%08x size=%ldx%ld",
+                             gpuStatus, width, height);
+            }
+        } else if (gpuPresentLogIndex <= 64) {
+            WINMALI_DIAG("[WinMaliGpuPresent] path=cpu-fallback reason=range size=%ldx%ld bytes=%Iu srcBytes=%Iu dstBytes=%Iu",
+                         width, height, copyBytes, srcBytes, dstBytes);
+        }
+    } else if (gpuPresentLogIndex <= 64) {
+        WINMALI_DIAG("[WinMaliGpuPresent] path=cpu-fallback reason=layout size=%ldx%ld pitch=%u/%u alloc=%ux%u/%ux%u rect=%d,%d/%d,%d",
+                     width, height, srcPitch, dstPitch,
+                     src->Width, src->Height, dst->Width, dst->Height,
+                     d->SrcLeft, d->SrcTop, d->DstLeft, d->DstTop);
+    }
+#endif
+
+    srcBase = (PUCHAR)MmGetSystemAddressForMdlSafe(src->ApertureMdl,
+                                                   NormalPagePriority | MdlMappingNoExecute);
+    dstBase = (PUCHAR)MmGetSystemAddressForMdlSafe(dst->ApertureMdl,
+                                                   NormalPagePriority | MdlMappingNoExecute);
+    if (srcBase == NULL || dstBase == NULL) {
+        WINMALI_WARN("PresentBlt: MDL map failed (src=%p dst=%p) - frame dropped",
+                     srcBase, dstBase);
+        return;
+    }
+
+    /* The rendered source was last written by Mali and is about to be read
+       through a cached CPU mapping. Keep this synchronization local to the
+       present allocations; the successful GPU path above never maps them. */
+    KeFlushIoBuffers(src->ApertureMdl, TRUE, TRUE);
+
+    srcBase += (SIZE_T)src->ApertureMdlOffset << PAGE_SHIFT;
+    dstBase += (SIZE_T)dst->ApertureMdlOffset << PAGE_SHIFT;
+
+    /* The overwhelmingly common swap-chain present is a complete, tightly
+       packed surface with identical source and destination pitches.  Copy it
+       as one range rather than entering RtlCopyMemory once per scanline. */
+    if (d->SrcLeft == 0 && d->DstLeft == 0 &&
+        rowBytes == srcPitch && rowBytes == dstPitch &&
+        rowBytes <= ((SIZE_T)-1) / (SIZE_T)height) {
+        SIZE_T srcOff = (SIZE_T)d->SrcTop * srcPitch;
+        SIZE_T dstOff = (SIZE_T)d->DstTop * dstPitch;
+        SIZE_T copyBytes = rowBytes * (SIZE_T)height;
+
+        if (srcOff <= srcBytes && copyBytes <= srcBytes - srcOff &&
+            dstOff <= dstBytes && copyBytes <= dstBytes - dstOff) {
+            RtlCopyMemory(dstBase + dstOff, srcBase + srcOff, copyBytes);
+            rowsCopied = height;
+        }
+    }
+
+    for (r = rowsCopied; r < height; ++r) {
         SIZE_T srcOff = (SIZE_T)(d->SrcTop + r) * srcPitch +
                         (SIZE_T)d->SrcLeft * bpp;
         SIZE_T dstOff = (SIZE_T)(d->DstTop + r) * dstPitch +
                         (SIZE_T)d->DstLeft * bpp;
-        SIZE_T rowBytes = (SIZE_T)width * bpp;
 
         if (srcOff + rowBytes > srcBytes || dstOff + rowBytes > dstBytes) {
             WINMALI_WARN("PresentBlt: clipped at row %ld/%ld (src %Iu+%Iu/%Iu dst %Iu+%Iu/%Iu)",
@@ -1375,6 +1468,15 @@ WinMaliPresentExecuteBlt_(_In_ const WINMALI_BLT_DESC* d)
             break;
         }
         RtlCopyMemory(dstBase + dstOff, srcBase + srcOff, rowBytes);
+        ++rowsCopied;
+    }
+
+    /* Publish the CPU-written destination to the non-coherent Mali/DWM
+       consumer before the present fence can be completed.  Without this,
+       alternating swap-chain buffers can retain stale cache lines until an
+       unrelated DWM update happens to force another coherency transition. */
+    if (rowsCopied != 0) {
+        KeFlushIoBuffers(dst->ApertureMdl, FALSE, TRUE);
     }
 
     /* Confirm the copy actually ran (vs the silent drops above) so on-screen

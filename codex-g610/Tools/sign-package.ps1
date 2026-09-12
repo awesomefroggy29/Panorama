@@ -35,8 +35,15 @@ if (-not (Test-Path $thumbFile)) {
   throw "No test cert recorded. Run Tools\new-test-cert.ps1 first."
 }
 $thumb = (Get-Content $thumbFile -Raw).Trim()
-if (-not (Get-Item "Cert:\CurrentUser\My\$thumb" -ErrorAction SilentlyContinue)) {
+$cert = Get-Item "Cert:\CurrentUser\My\$thumb" -ErrorAction SilentlyContinue
+if (-not $cert) {
   throw "Cert thumbprint $thumb not found in Cert:\CurrentUser\My."
+}
+if (-not $cert.HasPrivateKey) {
+  throw "Cert thumbprint $thumb has no accessible private key. Run Tools\new-test-cert.ps1."
+}
+if ($cert.NotBefore -gt (Get-Date) -or $cert.NotAfter -le (Get-Date)) {
+  throw "Cert thumbprint $thumb is outside its validity period ($($cert.NotBefore) - $($cert.NotAfter))."
 }
 
 # Locate Inf2Cat + signtool. Prefer the SDK version tied to the WDK install.
@@ -72,10 +79,11 @@ $sysPath = Join-Path $packageDirFull "WinMaliKmd.sys"
 if (-not (Test-Path $sysPath)) {
   throw "Driver package contains no $sysPath"
 }
-& $SignTool sign /fd SHA256 /sha1 $thumb $sysPath 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-  & $SignTool sign /fd SHA256 /sha1 $thumb $sysPath
-  throw "signtool failed on $sysPath"
+$sysSignOut = & $SignTool sign /fd SHA256 /sha1 $thumb $sysPath 2>&1
+$sysSignExit = $LASTEXITCODE
+if ($sysSignExit -ne 0) {
+  $sysSignOut | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+  throw "signtool failed on $sysPath (exit $sysSignExit)"
 }
 
 $osArg = ($OsTargets -join ",")
@@ -89,13 +97,32 @@ if (-not (Test-Path $catPath)) {
   $inf2catOut | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
   throw "Inf2Cat ran but produced no $catPath"
 }
-
-# Sign the completed catalog last.
-& $SignTool sign /fd SHA256 /sha1 $thumb $catPath 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-  & $SignTool sign /fd SHA256 /sha1 $thumb $catPath
-  throw "signtool failed on $catPath"
+$catInfo = Get-Item -LiteralPath $catPath
+$catPrefix = [System.IO.File]::ReadAllBytes($catPath) | Select-Object -First 1
+if ($catInfo.Length -eq 0 -or $catPrefix -ne 0x30) {
+  throw "Inf2Cat produced an invalid catalog (length=$($catInfo.Length), firstByte=$catPrefix)."
 }
 
-$leaf = (Get-AuthenticodeSignature $catPath).SignerCertificate.Subject
+# Sign the completed catalog last.
+$unsignedCatBackup = "$catPath.unsigned"
+Copy-Item -LiteralPath $catPath -Destination $unsignedCatBackup -Force
+$catSignOut = & $SignTool sign /fd SHA256 /sha1 $thumb $catPath 2>&1
+$signExit = $LASTEXITCODE
+if ($signExit -ne 0) {
+  # Some signing failures may leave the destination partially written.  Keep
+  # Inf2Cat's valid output intact so a failed build never emits a zeroed CAT.
+  Copy-Item -LiteralPath $unsignedCatBackup -Destination $catPath -Force
+  Remove-Item -LiteralPath $unsignedCatBackup -Force
+  $catSignOut | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+  throw "signtool failed on $catPath (exit $signExit)"
+}
+
+$catalogSignature = Get-AuthenticodeSignature -LiteralPath $catPath
+if (-not $catalogSignature.SignerCertificate) {
+  Copy-Item -LiteralPath $unsignedCatBackup -Destination $catPath -Force
+  Remove-Item -LiteralPath $unsignedCatBackup -Force
+  throw "signtool returned success but $catPath contains no detectable signer."
+}
+Remove-Item -LiteralPath $unsignedCatBackup -Force
+$leaf = $catalogSignature.SignerCertificate.Subject
 Write-Host "  signed: $(Split-Path $catPath -Leaf) + WinMaliKmd.sys  ($leaf)" -ForegroundColor DarkGray

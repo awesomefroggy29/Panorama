@@ -25,6 +25,7 @@
         .\Tools\build.ps1 -DriverLogProfile LdVarProbe # exact glyph generic LD_VAR fallback
         .\Tools\build.ps1 -DriverLogProfile IdvsProbe  # exact glyph IDVS handoff trace
         .\Tools\build.ps1 -DriverLogProfile PresentProbe # bounded DXGI present/redirection trace
+        .\Tools\build.ps1 -DriverLogProfile GpuPresent # Valhall full-surface present copy
         .\Tools\build.ps1 -DriverLogProfile HandleLifecycle # allocation handle lifetime trace
         .\Tools\build.ps1 -Rebuild
 
@@ -88,7 +89,12 @@
     secondary-varying programs, the linked VS/FS varying layouts, packed
     fragment varying descriptors, fragment SRT entry, CSF program addresses,
     and draw flag for that exact glyph pipeline. It does not alter rendering.
-
+    PresentProbe records bounded present-path hashes and lifecycle data but
+    performs no BMP or other capture-file writes. ShaderCapture is the only
+    driver profile which enables automatic capture files.
+    GpuPresent enables the KMD-owned Valhall compute-copy fast path for
+    complete, tightly packed present surfaces, with bounded path logging and
+    automatic CPU fallback for unsupported layouts or failed submissions.
 .PARAMETER InfVerif
     Enable InfVerif. Off by default (frequent missing on dev boxes).
 
@@ -113,7 +119,7 @@ param(
     [ValidateSet("quiet","minimal","normal","detailed","diagnostic")]
     [string]$LogLevel = "minimal",
 
-    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","HandleLifecycle")]
+    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","GpuPresent","HandleLifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     [switch]$InfVerif,

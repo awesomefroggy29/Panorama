@@ -128,3 +128,21 @@ static const UCHAR WinMaliShaderLoadAddStore[] = {
     // STORE.i32.slot0.end @r4, r2^, offset:0
     0x42, 0x00, 0x00, 0x18, 0x02, 0x44, 0x61, 0x78
 };
+
+// ---------------------------------------------------------------------------
+// Program 6: PRESENT_COPY_16 (4 instructions, 32 bytes)
+// ---------------------------------------------------------------------------
+// Source is kept in Tools/gpu-present-copy.va and assembled with Mesa's v10
+// Valhall assembler. One compute invocation copies one aligned 16-byte block:
+//
+//   u0 = source GPU VA, u1 = destination GPU VA, r60 = global_id.x
+//
+// The KMD dispatches 16x1x1 workgroups only for a complete tightly-packed
+// range whose byte count is divisible by 256. Complicated rectangles retain
+// the existing exact CPU-copy path.
+static const UCHAR WinMaliShaderPresentCopy16[] = {
+    0x80, 0x3c, 0x47, 0x20, 0x00, 0xc0, 0xa3, 0x01,
+    0x40, 0x00, 0x00, 0x38, 0xf8, 0x84, 0x60, 0x08,
+    0x82, 0x3c, 0x47, 0x20, 0x00, 0xc2, 0xa3, 0x01,
+    0x42, 0x00, 0x00, 0x38, 0x08, 0x44, 0x61, 0x78
+};

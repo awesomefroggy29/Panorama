@@ -84,7 +84,9 @@ param(
     # IdvsProbe leaves rendering untouched and records the exact position /
     # secondary-varying program handoff plus the linked varying descriptors
     # and fragment resource-table entry for the captured XAML glyph pipeline.
-    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","HandleLifecycle")]
+    # PresentProbe retains bounded textual/hash diagnostics but never writes
+    # capture files. Only ShaderCapture enables automatic BMP/binary output.
+    [ValidateSet("Verbose","Focused","Lifecycle","NoLogging","Glyph","ShaderCapture","Reject","GlyphPipeline","AttributeProbe","LookupProbe","FragWProbe","LdVarProbe","IdvsProbe","PresentProbe","GpuPresent","HandleLifecycle")]
     [string]$DriverLogProfile = "Verbose",
 
     # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
@@ -596,6 +598,12 @@ elseif ($DriverLogProfile -eq "IdvsProbe") {
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_IDVS_HANDOFF_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
 }
 elseif ($DriverLogProfile -eq "PresentProbe") {
+    $env:CFLAGS   = "$env:CFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+    $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
+}
+elseif ($DriverLogProfile -eq "GpuPresent") {
+    # The compute-copy implementation is KMD-only. Keep the UMD's bounded
+    # present trace enabled so one gpu.log correlates DXGI and KMD routing.
     $env:CFLAGS   = "$env:CFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
     $env:CXXFLAGS = "$env:CXXFLAGS -DWINMALI_PRESENT_PROBE=1 -DWINMALI_LOG_FOCUSED=1"
 }

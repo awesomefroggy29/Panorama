@@ -414,7 +414,16 @@ NTSTATUS WinMaliCsfSubmitTransientGroupStream(
                                      _In_ ULONG   StreamSizeBytes,
                                      _In_ ULONG   LatestFlush,
                                      _In_ ULONG   TimeoutMs,
-                                     _Out_ PBOOLEAN OutParked);
+    _Out_ PBOOLEAN OutParked);
+
+/* KMD-owned linear present fast path. Both addresses must refer to resident
+   aperture allocations mapped in the permanent bring-up address space. */
+NTSTATUS WinMaliCsfPresentCopy(_Inout_ PWINMALI_ADAPTER Adapter,
+                              _In_ UINT64 SourceGpuVa,
+                              _In_ UINT64 DestinationGpuVa,
+                              _In_ UINT64 CopyBytes,
+                              _In_ ULONG TimeoutMs,
+                              _Out_ PBOOLEAN CpuFallbackSafe);
 NTSTATUS WinMaliCsfResetRenderEngine(_Inout_ PWINMALI_ADAPTER Adapter);
 
 /* Cross-map the CSF ring/sync/shader pages into an escape-owned UMD group's
